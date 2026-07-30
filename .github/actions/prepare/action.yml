@@ -1,0 +1,214 @@
+name: Prepare OpenMetadata Terraform
+description: >-
+  Check out the upstream OpenMetadata Terraform module, inject the backend and
+  tfvars into examples/complete, assume the AWS role via OIDC, and run terraform init.
+
+inputs:
+  role-arn:
+    description: IAM role ARN to assume via GitHub OIDC
+    required: true
+  aws-region:
+    description: AWS region for the AWS CLI / provider
+    required: true
+  state-bucket:
+    description: S3 bucket holding Terraform state
+    required: true
+  state-key:
+    description: S3 key (path) for the state file
+    required: true
+  state-region:
+    description: Region of the state bucket / lock table
+    required: true
+  lock-table:
+    description: DynamoDB table used for state locking
+    required: true
+  module-repo:
+    description: GitHub repo of the OpenMetadata Terraform module
+    required: true
+  module-ref:
+    description: Git ref (tag/branch/sha) of the module to deploy
+    required: true
+  example-dir:
+    description: Path to the complete example after checkout
+    required: true
+  backend-file:
+    description: Path (in this repo) to backend.tf to inject
+    required: true
+  tfvars-file:
+    description: Path (in this repo) to the .auto.tfvars to inject for this environment
+    required: true
+  terraform-version:
+    description: Terraform version to install
+    required: false
+    default: "1.9.8"
+
+runs:
+  using: composite
+  steps:
+    - name: Check out OpenMetadata Terraform module (examples/complete)
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.module-repo }}
+        ref: ${{ inputs.module-ref }}
+        path: module
+
+    - name: Inject backend + tfvars into the complete example
+      shell: bash
+      run: |
+        set -euo pipefail
+        test -f "${{ inputs.backend-file }}" || { echo "::error::backend file not found: ${{ inputs.backend-file }}"; exit 1; }
+        test -f "${{ inputs.tfvars-file }}"  || { echo "::error::tfvars file not found: ${{ inputs.tfvars-file }}"; exit 1; }
+        cp "${{ inputs.backend-file }}" "${{ inputs.example-dir }}/backend.tf"
+        cp "${{ inputs.tfvars-file }}" "${{ inputs.example-dir }}/deploy.auto.tfvars"
+        echo "Injected ${{ inputs.backend-file }} and ${{ inputs.tfvars-file }} into ${{ inputs.example-dir }}"
+
+    # Three upstream inconsistencies in examples/complete must be patched before init:
+    #  1) ebs_csi_irsa/efs_csi_irsa reference
+    #     iam/aws//modules/iam-role-for-service-accounts-eks with NO version;
+    #     iam v6 removed that submodule -> "Unreadable module subdirectory".
+    #     Pin to v5 (its submodule only needs aws >= 4.0, so it's v6-compatible).
+    #  2) the example pins aws "~> 5.0", but the openmetadata module itself
+    #     requires aws "~> 6.0" (root + rds submodule versions.tf) -> the two
+    #     constraints can't both hold. Bump the example provider to v6.
+    #     Pinned to "~> 6.56.0" (patch releases only) rather than "~> 6.0":
+    #     no .terraform.lock.hcl is committed and the example is checked out
+    #     fresh every run, so an open constraint means every run silently floats
+    #     to whatever aws provider shipped most recently. 6.56.0 is the version
+    #     the last known-good plan of this stack ran on. Bump deliberately.
+    #  3) helm/kubernetes providers are unpinned, and the module and the example
+    #     disagree on which helm major they target:
+    #       - module 1.12.13's openmetadata-{deployment,dependencies} submodules
+    #         write `set = [{ name, value }]`. That is helm v3 syntax; in v2
+    #         `set` is a repeatable block, so pinning helm "~> 2.0" fails
+    #         validate with: An argument named "set" is not expected here.
+    #       - the example's `provider "helm"` uses a `kubernetes {}` block,
+    #         which is v2 syntax; helm v3 made it a nested *attribute*, so
+    #         under v3 it fails with: Blocks of type "kubernetes" are not
+    #         expected here.
+    #     The submodules are consumed from the registry and can't be edited, so
+    #     helm is pinned to "~> 3.0" (matching the module) and the example's
+    #     provider config is rewritten to the v3 attribute form.
+    #     kubernetes stays "~> 2.0" -- its own provider block is v2 syntax and
+    #     the module's kubernetes_* resources are v2-compatible.
+    #     versions.tf already has the module's single required_providers block,
+    #     and a module may have only one -- so we inject the pins INTO that
+    #     block (a separate file would be a "Duplicate required providers").
+    - name: Patch upstream example (provider + module version pins)
+      shell: bash
+      run: |
+        set -euo pipefail
+        ex="${{ inputs.example-dir }}"
+        for f in ebs_csi_driver.tf efs_csi_driver.tf; do
+          path="$ex/$f"
+          [ -f "$path" ] || continue
+          if grep -q 'iam-role-for-service-accounts-eks"' "$path" && ! grep -q 'version *= *"~> 5' "$path"; then
+            awk -v ver='  version = "~> 5.0"' '
+              {print}
+              index($0, "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks") {print ver}
+            ' "$path" > "$path.tmp" && mv "$path.tmp" "$path"
+            echo "Pinned iam module in $f"
+          fi
+        done
+        vf="$ex/versions.tf"
+        if [ -f "$vf" ] && grep -q 'version = "~> 5.0"' "$vf"; then
+          sed -i.bak 's/version = "~> 5.0"/version = "~> 6.56.0"/' "$vf" && rm -f "$vf.bak"
+          echo "Bumped example aws provider to ~> 6.56.0"
+        fi
+        # Inject helm/kubernetes pins into the EXISTING required_providers block
+        # (a module allows only one such block, so a separate file would fail).
+        if [ -f "$vf" ] && ! grep -q 'hashicorp/helm' "$vf"; then
+          awk '
+            { print }
+            /required_providers[[:space:]]*{/ && !done {
+              print "    helm = {"
+              print "      source  = \"hashicorp/helm\""
+              print "      version = \"~> 3.0\""
+              print "    }"
+              print "    kubernetes = {"
+              print "      source  = \"hashicorp/kubernetes\""
+              print "      version = \"~> 2.0\""
+              print "    }"
+              done = 1
+            }
+          ' "$vf" > "$vf.tmp" && mv "$vf.tmp" "$vf"
+          echo "Pinned helm ~> 3.0 / kubernetes ~> 2.0 in versions.tf"
+        fi
+        # helm v3 turned the provider's `kubernetes` block into a nested
+        # attribute, so rewrite `kubernetes {` -> `kubernetes = {` and the
+        # nested `exec {` -> `exec = {`. Scoped to the provider "helm" block:
+        # provider "kubernetes" is still v2 and keeps block syntax.
+        pf="$ex/providers.tf"
+        if [ -f "$pf" ] && ! grep -q 'kubernetes = {' "$pf"; then
+          awk '
+            /^provider "helm"/ { in_helm = 1 }
+            in_helm && /^[[:space:]]*kubernetes[[:space:]]*{/ { sub(/kubernetes[[:space:]]*{/, "kubernetes = {") }
+            in_helm && /^[[:space:]]*exec[[:space:]]*{/ { sub(/exec[[:space:]]*{/, "exec = {") }
+            in_helm && /^}/ { in_helm = 0 }
+            { print }
+          ' "$pf" > "$pf.tmp" && mv "$pf.tmp" "$pf"
+          echo "Rewrote provider \"helm\" kubernetes block to helm v3 attribute syntax"
+        fi
+
+    - name: Configure AWS credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+
+    # Pre-flight: prove the runner can actually reach the AWS APIs Terraform
+    # needs, before spending minutes on init/plan.
+    #
+    # Transport-level failures have been seen mid-plan -- STS returning HTTP 302,
+    # EC2 returning 400 "InvalidHttpRequest: Unable to parse request" -- for calls
+    # that carry no arguments, while the SAME call succeeded elsewhere in the same
+    # run. That is the network path corrupting requests/responses, not Terraform.
+    # Buried in hundreds of lines of plan output it reads like a config error, so
+    # probe here and fail with an unambiguous message instead.
+    - name: Pre-flight AWS API reachability
+      shell: bash
+      run: |
+        set -uo pipefail
+        region="${{ inputs.aws-region }}"
+
+        probe() {
+          label="$1"; shift
+          for attempt in 1 2 3; do
+            if out=$("$@" 2>&1); then
+              echo "ok: $label (attempt $attempt)"
+              return 0
+            fi
+            echo "fail: $label (attempt $attempt)"
+            printf '%s\n' "$out" | head -5
+            sleep 3
+          done
+          return 1
+        }
+
+        rc=0
+        probe "sts:GetCallerIdentity" \
+          aws sts get-caller-identity --region "$region" --output json || rc=1
+        probe "ec2:DescribeAvailabilityZones" \
+          aws ec2 describe-availability-zones --region "$region" --output json || rc=1
+
+        if [ "$rc" -ne 0 ]; then
+          echo "::error::AWS API calls from this runner are failing at the HTTP layer (see attempts above). This is a network/endpoint problem between the runner and AWS, not a Terraform config problem. Check the AWS Health Dashboard for ${region}, then re-run."
+          exit 1
+        fi
+        echo "AWS APIs reachable from this runner."
+
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+
+    - name: Terraform init (S3 backend + DynamoDB lock)
+      shell: bash
+      working-directory: ${{ inputs.example-dir }}
+      run: |
+        set -euo pipefail
+        terraform init -input=false \
+          -backend-config="bucket=${{ inputs.state-bucket }}" \
+          -backend-config="key=${{ inputs.state-key }}" \
+          -backend-config="region=${{ inputs.state-region }}" \
+          -backend-config="dynamodb_table=${{ inputs.lock-table }}" \
+          -backend-config="encrypt=true"

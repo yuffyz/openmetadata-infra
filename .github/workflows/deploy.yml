@@ -1,0 +1,167 @@
+name: openmetadata-infra
+
+# Deploys OpenMetadata on AWS (with VPC creation) using the upstream
+# open-metadata/terraform-aws-openmetadata module's examples/complete config.
+#
+# Pick an environment (dev / production) and an action (plan / apply / destroy).
+# Each environment has its own tfvars, its own state file, and its own approval
+# gate. `plan` is never gated; `apply`/`destroy` inherit the selected GitHub
+# Environment's protection rules (configure reviewers on "production"; leave
+# "dev" unprotected for friction-free create/tear-down).
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options:
+          - dev
+          - production
+        default: dev
+      action:
+        description: Terraform action to run
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+        default: plan
+
+concurrency:
+  group: openmetadata-infra-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # required for AWS OIDC
+  contents: read
+
+env:
+  # Terraform project lives in the openmetadata-infra/ subfolder of this repo
+  PROJECT_DIR: openmetadata-infra
+  MODULE_REPO: open-metadata/terraform-aws-openmetadata
+  MODULE_REF: ${{ vars.MODULE_REF || '1.12.13' }}
+  EXAMPLE_DIR: module/examples/complete
+  TF_VERSION: "1.9.8"
+  # Files injected into the example (paths relative to the repo root)
+  BACKEND_FILE: openmetadata-infra/backend.tf
+  # Per-environment config + isolated state key
+  TFVARS_FILE: openmetadata-infra/config/${{ github.event.inputs.environment }}.auto.tfvars
+  STATE_KEY: ${{ vars.TF_STATE_PREFIX || 'openmetadata' }}/${{ github.event.inputs.environment }}/terraform.tfstate
+
+jobs:
+  plan:
+    name: Plan (${{ github.event.inputs.environment }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out infra project
+        uses: actions/checkout@v4
+
+      - name: Prepare Terraform
+        uses: ./.github/actions/prepare
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key: ${{ env.STATE_KEY }}
+          state-region: ${{ vars.TF_STATE_REGION }}
+          lock-table: ${{ vars.TF_STATE_LOCK_TABLE }}
+          module-repo: ${{ env.MODULE_REPO }}
+          module-ref: ${{ env.MODULE_REF }}
+          example-dir: ${{ env.EXAMPLE_DIR }}
+          backend-file: ${{ env.BACKEND_FILE }}
+          tfvars-file: ${{ env.TFVARS_FILE }}
+          terraform-version: ${{ env.TF_VERSION }}
+
+      - name: Terraform fmt (advisory)
+        working-directory: ${{ env.EXAMPLE_DIR }}
+        run: terraform fmt -check -recursive || echo "::warning::Terraform files are not canonically formatted"
+
+      - name: Terraform validate
+        working-directory: ${{ env.EXAMPLE_DIR }}
+        run: terraform validate
+
+      - name: Terraform plan
+        working-directory: ${{ env.EXAMPLE_DIR }}
+        run: |
+          if [ "${{ github.event.inputs.action }}" = "destroy" ]; then
+            terraform plan -destroy -input=false -out=tfplan
+          else
+            terraform plan -input=false -out=tfplan
+          fi
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.event.inputs.environment }}
+          path: ${{ env.EXAMPLE_DIR }}/tfplan
+          retention-days: 5
+
+  apply:
+    name: Apply (${{ github.event.inputs.environment }})
+    if: ${{ github.event.inputs.action == 'apply' }}
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}   # dev = unprotected, production = reviewers
+    steps:
+      - name: Check out infra project
+        uses: actions/checkout@v4
+
+      - name: Prepare Terraform
+        uses: ./.github/actions/prepare
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key: ${{ env.STATE_KEY }}
+          state-region: ${{ vars.TF_STATE_REGION }}
+          lock-table: ${{ vars.TF_STATE_LOCK_TABLE }}
+          module-repo: ${{ env.MODULE_REPO }}
+          module-ref: ${{ env.MODULE_REF }}
+          example-dir: ${{ env.EXAMPLE_DIR }}
+          backend-file: ${{ env.BACKEND_FILE }}
+          tfvars-file: ${{ env.TFVARS_FILE }}
+          terraform-version: ${{ env.TF_VERSION }}
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.event.inputs.environment }}
+          path: ${{ env.EXAMPLE_DIR }}
+
+      - name: Terraform apply
+        working-directory: ${{ env.EXAMPLE_DIR }}
+        run: terraform apply -input=false tfplan
+
+      - name: Output kubeconfig command
+        working-directory: ${{ env.EXAMPLE_DIR }}
+        run: terraform output -raw update_kubeconfig
+
+  destroy:
+    name: Destroy (${{ github.event.inputs.environment }})
+    if: ${{ github.event.inputs.action == 'destroy' }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}   # same gate as apply
+    steps:
+      - name: Check out infra project
+        uses: actions/checkout@v4
+
+      - name: Prepare Terraform
+        uses: ./.github/actions/prepare
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key: ${{ env.STATE_KEY }}
+          state-region: ${{ vars.TF_STATE_REGION }}
+          lock-table: ${{ vars.TF_STATE_LOCK_TABLE }}
+          module-repo: ${{ env.MODULE_REPO }}
+          module-ref: ${{ env.MODULE_REF }}
+          example-dir: ${{ env.EXAMPLE_DIR }}
+          backend-file: ${{ env.BACKEND_FILE }}
+          tfvars-file: ${{ env.TFVARS_FILE }}
+          terraform-version: ${{ env.TF_VERSION }}
+
+      - name: Terraform destroy
+        working-directory: ${{ env.EXAMPLE_DIR }}
+        run: terraform destroy -input=false -auto-approve
