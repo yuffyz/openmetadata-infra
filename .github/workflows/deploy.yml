@@ -1,7 +1,7 @@
 name: openmetadata-infra
 
-# Deploys OpenMetadata on AWS (with VPC creation) using the upstream
-# open-metadata/terraform-aws-openmetadata module's examples/complete config.
+# Deploys OpenMetadata on AWS (with VPC creation) from the Terraform project
+# committed in this repo at terraform/.
 #
 # Pick an environment (dev / production) and an action (plan / apply / destroy).
 # Each environment has its own tfvars, its own state file, and its own approval
@@ -37,16 +37,15 @@ permissions:
   contents: read
 
 env:
-  # Terraform project lives in the openmetadata-infra/ subfolder of this repo
-  PROJECT_DIR: openmetadata-infra
-  MODULE_REPO: open-metadata/terraform-aws-openmetadata
-  MODULE_REF: ${{ vars.MODULE_REF || '1.12.13' }}
-  EXAMPLE_DIR: module/examples/complete
+  # Terraform root module, committed in this repo. Provider and module versions
+  # are pinned in terraform/versions.tf and the ebs/efs driver files, so no
+  # run-time patching is needed.
+  TF_DIR: terraform
   TF_VERSION: "1.9.8"
-  # Files injected into the example (paths relative to the repo root)
-  BACKEND_FILE: openmetadata-infra/backend.tf
+  # Files injected into TF_DIR (paths relative to the repo root)
+  BACKEND_FILE: backend.tf
   # Per-environment config + isolated state key
-  TFVARS_FILE: openmetadata-infra/config/${{ github.event.inputs.environment }}.auto.tfvars
+  TFVARS_FILE: config/${{ github.event.inputs.environment }}.auto.tfvars
   STATE_KEY: ${{ vars.TF_STATE_PREFIX || 'openmetadata' }}/${{ github.event.inputs.environment }}/terraform.tfstate
 
 jobs:
@@ -66,23 +65,21 @@ jobs:
           state-key: ${{ env.STATE_KEY }}
           state-region: ${{ vars.TF_STATE_REGION }}
           lock-table: ${{ vars.TF_STATE_LOCK_TABLE }}
-          module-repo: ${{ env.MODULE_REPO }}
-          module-ref: ${{ env.MODULE_REF }}
-          example-dir: ${{ env.EXAMPLE_DIR }}
+          terraform-dir: ${{ env.TF_DIR }}
           backend-file: ${{ env.BACKEND_FILE }}
           tfvars-file: ${{ env.TFVARS_FILE }}
           terraform-version: ${{ env.TF_VERSION }}
 
       - name: Terraform fmt (advisory)
-        working-directory: ${{ env.EXAMPLE_DIR }}
+        working-directory: ${{ env.TF_DIR }}
         run: terraform fmt -check -recursive || echo "::warning::Terraform files are not canonically formatted"
 
       - name: Terraform validate
-        working-directory: ${{ env.EXAMPLE_DIR }}
+        working-directory: ${{ env.TF_DIR }}
         run: terraform validate
 
       - name: Terraform plan
-        working-directory: ${{ env.EXAMPLE_DIR }}
+        working-directory: ${{ env.TF_DIR }}
         run: |
           if [ "${{ github.event.inputs.action }}" = "destroy" ]; then
             terraform plan -destroy -input=false -out=tfplan
@@ -94,7 +91,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tfplan-${{ github.event.inputs.environment }}
-          path: ${{ env.EXAMPLE_DIR }}/tfplan
+          path: ${{ env.TF_DIR }}/tfplan
           retention-days: 5
 
   apply:
@@ -116,9 +113,7 @@ jobs:
           state-key: ${{ env.STATE_KEY }}
           state-region: ${{ vars.TF_STATE_REGION }}
           lock-table: ${{ vars.TF_STATE_LOCK_TABLE }}
-          module-repo: ${{ env.MODULE_REPO }}
-          module-ref: ${{ env.MODULE_REF }}
-          example-dir: ${{ env.EXAMPLE_DIR }}
+          terraform-dir: ${{ env.TF_DIR }}
           backend-file: ${{ env.BACKEND_FILE }}
           tfvars-file: ${{ env.TFVARS_FILE }}
           terraform-version: ${{ env.TF_VERSION }}
@@ -127,14 +122,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: tfplan-${{ github.event.inputs.environment }}
-          path: ${{ env.EXAMPLE_DIR }}
+          path: ${{ env.TF_DIR }}
 
       - name: Terraform apply
-        working-directory: ${{ env.EXAMPLE_DIR }}
+        working-directory: ${{ env.TF_DIR }}
         run: terraform apply -input=false tfplan
 
       - name: Output kubeconfig command
-        working-directory: ${{ env.EXAMPLE_DIR }}
+        working-directory: ${{ env.TF_DIR }}
         run: terraform output -raw update_kubeconfig
 
   destroy:
@@ -155,13 +150,11 @@ jobs:
           state-key: ${{ env.STATE_KEY }}
           state-region: ${{ vars.TF_STATE_REGION }}
           lock-table: ${{ vars.TF_STATE_LOCK_TABLE }}
-          module-repo: ${{ env.MODULE_REPO }}
-          module-ref: ${{ env.MODULE_REF }}
-          example-dir: ${{ env.EXAMPLE_DIR }}
+          terraform-dir: ${{ env.TF_DIR }}
           backend-file: ${{ env.BACKEND_FILE }}
           tfvars-file: ${{ env.TFVARS_FILE }}
           terraform-version: ${{ env.TF_VERSION }}
 
       - name: Terraform destroy
-        working-directory: ${{ env.EXAMPLE_DIR }}
+        working-directory: ${{ env.TF_DIR }}
         run: terraform destroy -input=false -auto-approve

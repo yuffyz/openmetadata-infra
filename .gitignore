@@ -13,3 +13,5 @@ module/
 # Local overrides / secrets
 *.auto.tfvars.local
 .env
+
+dev/openmetadata-infra/terraform/.terraform

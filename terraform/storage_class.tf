@@ -1,6 +1,6 @@
 # Encrypted storage class
 
-resource "kubernetes_storage_class" "encrypted_gp3" {
+resource "kubernetes_storage_class_v1" "encrypted_gp3" {
   metadata {
     annotations = {
       "storageclass.kubernetes.io/is-default-class" = "true"

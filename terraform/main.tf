@@ -21,7 +21,7 @@ module "app" {
   depends_on = [
     aws_eks_cluster.openmetadata,
     aws_kms_alias.this,
-    kubernetes_namespace.app,
+    kubernetes_namespace_v1.app,
     kubernetes_secret_v1.env_from_secret,
     module.vpc
   ]
