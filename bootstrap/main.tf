@@ -13,8 +13,6 @@ provider "aws" {
   region = var.region
 }
 
-data "aws_caller_identity" "me" {}
-
 # ---------------------------------------------------------------------------
 # OIDC identity provider for GitHub Actions
 # (Only one per account for this URL. If it already exists, set
@@ -52,18 +50,16 @@ locals {
 # ---------------------------------------------------------------------------
 # Remote state backend (optional)
 #
-# The deploy workflow's S3 backend needs both of these to already exist.
-# `terraform init` only reads state from S3, so a missing lock table is not
-# caught there -- it surfaces on the first command that takes a lock:
-#   Error acquiring the state lock ... ResourceNotFoundException
+# The deploy workflow's S3 backend needs this bucket to already exist. Locking
+# is S3-native (`use_lockfile = true`): Terraform holds the lock with a
+# "<key>.tflock" object in the same bucket, so there is no DynamoDB table and
+# nothing else to provision.
 #
-# Both default to false so re-applying this bootstrap can never collide with
-# state resources you created by hand. Flip the one you still need.
+# Defaults to false so re-applying this bootstrap can never collide with a
+# bucket you created by hand -- Terraform cannot adopt a bucket it didn't create.
 #
-# One table serves every environment: the S3 backend's LockID is
-# "<bucket>/<key>", and each environment already has its own key
-# (<prefix>/<environment>/terraform.tfstate). Per-environment lock tables are
-# unnecessary.
+# One bucket serves every environment: each already has its own key
+# (<prefix>/<environment>/terraform.tfstate), and therefore its own lock object.
 # ---------------------------------------------------------------------------
 resource "aws_s3_bucket" "state" {
   count  = var.create_state_bucket ? 1 : 0
@@ -104,25 +100,6 @@ resource "aws_s3_bucket_public_access_block" "state" {
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
-}
-
-resource "aws_dynamodb_table" "lock" {
-  count        = var.create_lock_table ? 1 : 0
-  name         = var.lock_table
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "LockID"
-
-  attribute {
-    name = "LockID"
-    type = "S"
-  }
-
-  lifecycle {
-    precondition {
-      condition     = var.lock_table != ""
-      error_message = "lock_table must be set when create_lock_table is true."
-    }
-  }
 }
 
 # ---------------------------------------------------------------------------
@@ -171,7 +148,11 @@ resource "aws_iam_role_policy_attachment" "managed" {
 }
 
 # Explicit remote-state access, so the role still works if you swap in a
-# tighter permissions policy that doesn't already grant S3/DynamoDB.
+# tighter permissions policy that doesn't already grant S3.
+#
+# These same actions cover S3 native locking: the lock is a "<key>.tflock"
+# object under the state prefix, so PutObject/GetObject/DeleteObject on
+# "<bucket>/*" is all it needs. No DynamoDB permissions are required.
 data "aws_iam_policy_document" "state" {
   count = var.state_bucket == "" ? 0 : 1
 
@@ -180,16 +161,6 @@ data "aws_iam_policy_document" "state" {
     effect    = "Allow"
     actions   = ["s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
     resources = ["arn:aws:s3:::${var.state_bucket}", "arn:aws:s3:::${var.state_bucket}/*"]
-  }
-
-  dynamic "statement" {
-    for_each = var.lock_table == "" ? [] : [1]
-    content {
-      sid       = "DynamoLock"
-      effect    = "Allow"
-      actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:DescribeTable"]
-      resources = ["arn:aws:dynamodb:${var.region}:${data.aws_caller_identity.me.account_id}:table/${var.lock_table}"]
-    }
   }
 }
 

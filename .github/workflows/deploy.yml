@@ -41,7 +41,8 @@ env:
   # are pinned in terraform/versions.tf and the ebs/efs driver files, so no
   # run-time patching is needed.
   TF_DIR: terraform
-  TF_VERSION: "1.9.8"
+  # >= 1.10 required for S3 native state locking (use_lockfile)
+  TF_VERSION: "1.15.8"
   # Files injected into TF_DIR (paths relative to the repo root)
   BACKEND_FILE: backend.tf
   # Per-environment config + isolated state key
@@ -64,7 +65,6 @@ jobs:
           state-bucket: ${{ vars.TF_STATE_BUCKET }}
           state-key: ${{ env.STATE_KEY }}
           state-region: ${{ vars.TF_STATE_REGION }}
-          lock-table: ${{ vars.TF_STATE_LOCK_TABLE }}
           terraform-dir: ${{ env.TF_DIR }}
           backend-file: ${{ env.BACKEND_FILE }}
           tfvars-file: ${{ env.TFVARS_FILE }}
@@ -112,7 +112,6 @@ jobs:
           state-bucket: ${{ vars.TF_STATE_BUCKET }}
           state-key: ${{ env.STATE_KEY }}
           state-region: ${{ vars.TF_STATE_REGION }}
-          lock-table: ${{ vars.TF_STATE_LOCK_TABLE }}
           terraform-dir: ${{ env.TF_DIR }}
           backend-file: ${{ env.BACKEND_FILE }}
           tfvars-file: ${{ env.TFVARS_FILE }}
@@ -149,7 +148,6 @@ jobs:
           state-bucket: ${{ vars.TF_STATE_BUCKET }}
           state-key: ${{ env.STATE_KEY }}
           state-region: ${{ vars.TF_STATE_REGION }}
-          lock-table: ${{ vars.TF_STATE_LOCK_TABLE }}
           terraform-dir: ${{ env.TF_DIR }}
           backend-file: ${{ env.BACKEND_FILE }}
           tfvars-file: ${{ env.TFVARS_FILE }}
