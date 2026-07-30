@@ -140,5 +140,5 @@ variable "opensearch" {
 variable "region" {
   description = "AWS region in which the resources will be deployed"
   type        = string
-  default     = "eu-west-1"
+  default     = "us-east-1"
 }
