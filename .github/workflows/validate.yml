@@ -1,0 +1,127 @@
+name: validate
+
+# Cloud-free checks on pull requests: confirms the injected config still
+# formats and validates against the pinned module. No AWS credentials needed.
+
+on:
+  pull_request:
+    paths:
+      - "openmetadata-infra/config/**"
+      - "openmetadata-infra/backend.tf"
+      - ".github/**"
+  push:
+    branches: [main]
+    paths:
+      - "openmetadata-infra/config/**"
+      - "openmetadata-infra/backend.tf"
+      - ".github/**"
+
+permissions:
+  contents: read
+
+env:
+  PROJECT_DIR: openmetadata-infra
+  MODULE_REPO: open-metadata/terraform-aws-openmetadata
+  MODULE_REF: ${{ vars.MODULE_REF || '1.12.13' }}
+  EXAMPLE_DIR: module/examples/complete
+  TF_VERSION: "1.9.8"
+
+jobs:
+  validate:
+    name: fmt + validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out infra project
+        uses: actions/checkout@v4
+
+      - name: Check out OpenMetadata Terraform module
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.MODULE_REPO }}
+          ref: ${{ env.MODULE_REF }}
+          path: module
+
+      - name: Inject backend + tfvars (dev as representative)
+        run: |
+          set -euo pipefail
+          cp "${PROJECT_DIR}/backend.tf" "${EXAMPLE_DIR}/backend.tf"
+          cp "${PROJECT_DIR}/config/dev.auto.tfvars" "${EXAMPLE_DIR}/deploy.auto.tfvars"
+
+      - name: Patch upstream example (provider + module version pins)
+        run: |
+          set -euo pipefail
+          for f in ebs_csi_driver.tf efs_csi_driver.tf; do
+            path="${EXAMPLE_DIR}/$f"
+            [ -f "$path" ] || continue
+            if grep -q 'iam-role-for-service-accounts-eks"' "$path" && ! grep -q 'version *= *"~> 5' "$path"; then
+              awk -v ver='  version = "~> 5.0"' '
+                {print}
+                index($0, "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks") {print ver}
+              ' "$path" > "$path.tmp" && mv "$path.tmp" "$path"
+              echo "Pinned iam module in $f"
+            fi
+          done
+          vf="${EXAMPLE_DIR}/versions.tf"
+          # Pinned to a patch range, not "~> 6.0": no lock file is committed and
+          # the example is checked out fresh each run, so an open constraint lets
+          # every run float to the newest aws provider release.
+          if [ -f "$vf" ] && grep -q 'version = "~> 5.0"' "$vf"; then
+            sed -i.bak 's/version = "~> 5.0"/version = "~> 6.56.0"/' "$vf" && rm -f "$vf.bak"
+            echo "Bumped example aws provider to ~> 6.56.0"
+          fi
+          # Inject helm/kubernetes pins into the EXISTING required_providers block
+          # (a module allows only one such block, so a separate file would fail).
+          # helm must be v3: the module's openmetadata-{deployment,dependencies}
+          # submodules use `set = [{ name, value }]`, which v2 rejects.
+          if [ -f "$vf" ] && ! grep -q 'hashicorp/helm' "$vf"; then
+            awk '
+              { print }
+              /required_providers[[:space:]]*{/ && !done {
+                print "    helm = {"
+                print "      source  = \"hashicorp/helm\""
+                print "      version = \"~> 3.0\""
+                print "    }"
+                print "    kubernetes = {"
+                print "      source  = \"hashicorp/kubernetes\""
+                print "      version = \"~> 2.0\""
+                print "    }"
+                done = 1
+              }
+            ' "$vf" > "$vf.tmp" && mv "$vf.tmp" "$vf"
+            echo "Pinned helm ~> 3.0 / kubernetes ~> 2.0 in versions.tf"
+          fi
+          # helm v3 turned the provider's `kubernetes` block into a nested
+          # attribute, so rewrite `kubernetes {` -> `kubernetes = {` and the
+          # nested `exec {` -> `exec = {`. Scoped to the provider "helm" block:
+          # provider "kubernetes" is still v2 and keeps block syntax.
+          pf="${EXAMPLE_DIR}/providers.tf"
+          if [ -f "$pf" ] && ! grep -q 'kubernetes = {' "$pf"; then
+            awk '
+              /^provider "helm"/ { in_helm = 1 }
+              in_helm && /^[[:space:]]*kubernetes[[:space:]]*{/ { sub(/kubernetes[[:space:]]*{/, "kubernetes = {") }
+              in_helm && /^[[:space:]]*exec[[:space:]]*{/ { sub(/exec[[:space:]]*{/, "exec = {") }
+              in_helm && /^}/ { in_helm = 0 }
+              { print }
+            ' "$pf" > "$pf.tmp" && mv "$pf.tmp" "$pf"
+            echo "Rewrote provider \"helm\" kubernetes block to helm v3 attribute syntax"
+          fi
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Check env tfvars parse (advisory)
+        run: terraform fmt -check -recursive "${PROJECT_DIR}/config" || echo "::warning::config/*.auto.tfvars not canonically formatted (run 'terraform fmt ${PROJECT_DIR}/config')"
+
+      - name: Terraform fmt (advisory)
+        working-directory: ${{ env.EXAMPLE_DIR }}
+        run: terraform fmt -check -recursive || echo "::warning::Terraform files are not canonically formatted"
+
+      - name: Terraform init (no backend)
+        working-directory: ${{ env.EXAMPLE_DIR }}
+        run: terraform init -backend=false -input=false
+
+      - name: Terraform validate
+        working-directory: ${{ env.EXAMPLE_DIR }}
+        run: terraform validate

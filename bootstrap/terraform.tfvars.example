@@ -1,0 +1,20 @@
+github_org   = "your-org"
+github_repo  = "kiban"          # the repo that hosts the workflows, not the subfolder
+region       = "us-east-1"
+
+# Must match the state resources the workflow uses (the TF_STATE_BUCKET /
+# TF_STATE_LOCK_TABLE repo variables). Optional.
+state_bucket = "dkc-tfstate"
+lock_table   = "terraform-locks"
+
+# Let this bootstrap create those state resources instead of making them by
+# hand. Leave false for anything that already exists -- Terraform cannot adopt
+# a bucket or table it did not create.
+# create_state_bucket = true
+# create_lock_table   = true
+
+# If GitHub OIDC is already configured in this AWS account, reuse it:
+# create_oidc_provider = false
+
+# To allow the whole repo (any branch/PR/environment) instead of the tight default:
+# subject_claims = ["repo:your-org/kiban:*"]

@@ -1,0 +1,15 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+tfplan
+*.tfplan
+
+# The upstream module is checked out at deploy time, never committed
+module/
+
+# Local overrides / secrets
+*.auto.tfvars.local
+.env
