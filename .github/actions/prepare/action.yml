@@ -17,10 +17,7 @@ inputs:
     description: S3 key (path) for the state file
     required: true
   state-region:
-    description: Region of the state bucket / lock table
-    required: true
-  lock-table:
-    description: DynamoDB table used for state locking
+    description: Region of the state bucket
     required: true
   terraform-dir:
     description: Path (in this repo) to the Terraform root module to deploy
@@ -32,9 +29,9 @@ inputs:
     description: Path (in this repo) to the .auto.tfvars to inject for this environment
     required: true
   terraform-version:
-    description: Terraform version to install
+    description: Terraform version to install (>= 1.10 for S3 native locking)
     required: false
-    default: "1.9.8"
+    default: "1.15.8"
 
 runs:
   using: composite
@@ -110,7 +107,9 @@ runs:
       with:
         terraform_version: ${{ inputs.terraform-version }}
 
-    - name: Terraform init (S3 backend + DynamoDB lock)
+    # Locking is S3-native (`use_lockfile = true` in backend.tf) -- no DynamoDB
+    # table, so nothing beyond the bucket needs to exist.
+    - name: Terraform init (S3 backend, S3 native locking)
       shell: bash
       working-directory: ${{ inputs.terraform-dir }}
       run: |
@@ -119,5 +118,4 @@ runs:
           -backend-config="bucket=${{ inputs.state-bucket }}" \
           -backend-config="key=${{ inputs.state-key }}" \
           -backend-config="region=${{ inputs.state-region }}" \
-          -backend-config="dynamodb_table=${{ inputs.lock-table }}" \
           -backend-config="encrypt=true"

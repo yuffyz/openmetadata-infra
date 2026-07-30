@@ -59,7 +59,7 @@ openmetadata-infra/                     # repo root
 ├─ config/
 │  ├─ dev.auto.tfvars                # teardown-safe, cheaper, "-dev" names
 │  └─ production.auto.tfvars         # production-safe defaults
-└─ .terraform-version                # 1.9.8, matches TF_VERSION in the workflows
+└─ .terraform-version                # 1.15.8, matches TF_VERSION in the workflows
 ```
 
 At deploy time the `prepare` action copies `backend.tf` → `terraform/backend.tf`
@@ -74,21 +74,25 @@ the project, update `TF_DIR` in both workflows.
 ## One-time setup
 
 ### 1. State storage (in the target AWS account)
-- An **S3 bucket** for Terraform state (versioning on).
-- A **DynamoDB table** with primary key `LockID` (string) for state locking.
+- An **S3 bucket** for Terraform state (versioning on). That's it.
+
+Locking is **S3-native** (`use_lockfile = true` in [`backend.tf`](backend.tf)):
+Terraform takes the lock by writing a `<key>.tflock` object next to the state
+using S3 conditional writes. There is **no DynamoDB table** — no table to
+create, no `dynamodb:*` permissions, and no second resource to keep in sync.
 
 State is separated per environment automatically via the key
-`<prefix>/<environment>/terraform.tfstate`, so one bucket + table serves both —
-**including the lock table**, whose `LockID` is `<bucket>/<key>`. Don't create
-one table per environment.
+`<prefix>/<environment>/terraform.tfstate`, so one bucket serves both, and each
+environment gets its own independent lock object.
 
-Either create them by hand, or let [`bootstrap/`](bootstrap/) own them with
-`create_state_bucket = true` / `create_lock_table = true`.
+Either create the bucket by hand, or let [`bootstrap/`](bootstrap/) own it with
+`create_state_bucket = true`.
 
-> ⚠️ Both must exist before the workflow runs. `terraform init` only reads state
-> from S3, so a **missing lock table isn't caught at init** — it fails later, on
-> the first command that takes a lock, with `Error acquiring the state lock …
-> ResourceNotFoundException`.
+> ⚠️ The bucket must exist before the workflow runs, and S3 native locking
+> requires **Terraform >= 1.10** (this repo pins `1.15.8` in
+> `.terraform-version` and both workflows). `terraform/versions.tf` declares
+> `required_version = ">= 1.10"`, so an older CLI fails fast with a clear
+> message rather than a confusing backend error.
 
 ### 2. GitHub OIDC → AWS IAM role
 Create an IAM OIDC identity provider for `token.actions.githubusercontent.com`
@@ -110,12 +114,12 @@ role_arn)"`. See [bootstrap/README.md](bootstrap/README.md).
 |------|---------|---------|
 | `AWS_REGION` | `us-east-1` | Region for the AWS CLI/provider — **must match `region` in the env tfvars** |
 | `TF_STATE_BUCKET` | `dkc-tfstate` | State bucket |
-| `TF_STATE_REGION` | `us-east-1` | Region of the bucket/lock table |
-| `TF_STATE_LOCK_TABLE` | `terraform-locks` | DynamoDB lock table |
+| `TF_STATE_REGION` | `us-east-1` | Region of the state bucket |
 | `TF_STATE_PREFIX` | `openmetadata` | *(optional)* state key prefix; the environment + `terraform.tfstate` are appended. Defaults to `openmetadata` |
 
 > The state **key** is derived (`<prefix>/<environment>/terraform.tfstate`) —
-> there is no `TF_STATE_KEY` variable. There is no `MODULE_REF` variable either:
+> there is no `TF_STATE_KEY` variable, and no `TF_STATE_LOCK_TABLE` variable
+> (locking is S3-native). There is no `MODULE_REF` variable either:
 > the deployed config lives in `terraform/`, and the registry module it consumes
 > is pinned in `terraform/main.tf`.
 

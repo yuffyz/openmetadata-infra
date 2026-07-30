@@ -8,8 +8,8 @@ authenticate to AWS without stored keys:
    this repo: branch `main` for `plan`, and the `dev` + `production` environments
    for `apply`/`destroy`.
 
-It can also create the **remote state backend** (S3 bucket + DynamoDB lock
-table) — off by default, see below.
+It can also create the **remote state bucket** — off by default, see below.
+There is no lock table: the deploy workflow uses S3 native locking.
 
 Run it once, with credentials that can create IAM resources. It uses **local
 state** — that's fine for a bootstrap; commit nothing sensitive.
@@ -27,36 +27,28 @@ Then wire the output into the repo:
 gh secret set AWS_ROLE_ARN --body "$(terraform output -raw role_arn)"
 ```
 
-## State backend (optional)
+## State bucket (optional)
 
-The deploy workflow's S3 backend needs the state bucket **and** the DynamoDB
-lock table to already exist. A missing lock table is easy to miss because
-`terraform init` doesn't touch DynamoDB — it only reads state from S3. The
-failure appears later, on the first command that takes a lock:
+The deploy workflow's S3 backend needs the state bucket to already exist — and
+that's the only prerequisite. Locking is **S3-native** (`use_lockfile = true` in
+`backend.tf`): Terraform takes the lock by writing a `<key>.tflock` object next
+to the state using S3 conditional writes. No DynamoDB table, nothing extra to
+create, and no separate IAM permissions.
 
-```
-Error: Error acquiring the state lock
-ResourceNotFoundException: Requested resource not found
-```
-
-Set either toggle to have this bootstrap own them instead of creating them by
+Set the toggle to have this bootstrap own the bucket instead of creating it by
 hand:
 
 ```hcl
 state_bucket        = "dkc-tfstate"
-lock_table          = "terraform-locks"
 create_state_bucket = true    # bucket: versioned, SSE, public access blocked
-create_lock_table   = true    # table: PAY_PER_REQUEST, hash key LockID (S)
 ```
 
-Both default to **false**, so re-applying this bootstrap never collides with
-resources you already made — Terraform cannot adopt a bucket or table it didn't
-create. Turn on only the one that's missing.
+It defaults to **false**, so re-applying this bootstrap never collides with a
+bucket you already made — Terraform cannot adopt a bucket it didn't create.
 
-**One table serves every environment.** The S3 backend's `LockID` is
-`<bucket>/<key>`, and each environment already gets its own key
-(`<prefix>/<environment>/terraform.tfstate`). A per-environment lock table (e.g.
-a `-dev` suffixed one) buys nothing and is easy to get half-configured.
+**One bucket serves every environment.** Each gets its own state key
+(`<prefix>/<environment>/terraform.tfstate`), and therefore its own independent
+lock object.
 
 ## Notes
 

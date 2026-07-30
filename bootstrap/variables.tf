@@ -1,5 +1,5 @@
 variable "region" {
-  description = "AWS region for the bootstrap provider (IAM is global; used for the DynamoDB ARN)."
+  description = "AWS region for the bootstrap provider (IAM is global; this sets where the state bucket is created)."
   type        = string
   default     = "us-east-1"
 }
@@ -60,20 +60,9 @@ variable "state_bucket" {
   default     = ""
 }
 
-variable "lock_table" {
-  description = "DynamoDB lock table name (for the explicit state-access policy, and the name used if create_lock_table is true). Empty to skip."
-  type        = string
-  default     = ""
-}
-
 variable "create_state_bucket" {
   description = "Create the state S3 bucket named by state_bucket. Leave false if it already exists (Terraform would fail on a bucket it doesn't own)."
   type        = bool
   default     = false
 }
 
-variable "create_lock_table" {
-  description = "Create the DynamoDB lock table named by lock_table. Leave false if it already exists."
-  type        = bool
-  default     = false
-}
