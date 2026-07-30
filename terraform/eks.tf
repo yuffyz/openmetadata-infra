@@ -1,6 +1,10 @@
 locals {
-  eks_cluster_name              = var.eks_cluster_name
-  eks_version                   = "1.31"
+  eks_cluster_name = var.eks_cluster_name
+  # Must be a version still under STANDARD support (see upgrade_policy below),
+  # otherwise CreateCluster fails with "only supported under extended support".
+  # 1.36 is the current EKS default; standard support runs to 2027-08-01.
+  # Check before bumping: aws eks describe-cluster-versions
+  eks_version                   = "1.36"
   eks_cidr                      = "10.100.0.0/24"
   eks_node_group_instance_types = ["t3.xlarge"]
   eks_nodes_disk_size           = 20
@@ -50,7 +54,9 @@ resource "aws_eks_node_group" "nodes" {
   subnet_ids      = local.subnet_ids
   disk_size       = local.eks_nodes_disk_size
   instance_types  = local.eks_node_group_instance_types
-  ami_type        = "AL2_x86_64"
+  # AL2 EKS-optimized AMIs stop at 1.32 -- there is no amazon-linux-2 image for
+  # 1.33+, so AL2023 is required alongside the version above.
+  ami_type = "AL2023_x86_64_STANDARD"
   scaling_config {
     desired_size = 2
     max_size     = 3
