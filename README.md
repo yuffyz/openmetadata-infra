@@ -1,11 +1,15 @@
 # openmetadata-infra
 
-Wraps the upstream `open-metadata/openmetadata/aws` Terraform module (the same
-module the "complete" example uses) and deploys it via GitHub Actions.
+Deploys OpenMetadata on AWS via GitHub Actions from the Terraform project
+committed in this repo at [`terraform/`](terraform/).
 
-The workflow checks out that module at a pinned ref, injects a remote-state
-backend and deployment `tfvars`, and runs Terraform. The example config is left
-authoritative, this repo only adds CI/CD, state, and configuration.
+That project is a vendored copy of the upstream
+`open-metadata/terraform-aws-openmetadata` `examples/complete` config, and it
+consumes the `open-metadata/openmetadata/aws` registry module (pinned to
+`1.12.13` in [`terraform/main.tf`](terraform/main.tf)). It is now **maintained
+here**: the workflow no longer checks out the upstream repo, and no config is
+rewritten at run time. Only two files are injected — the remote-state backend
+and the environment's `tfvars`.
 
 Deployments are **environment-scoped**: pick `dev` or `production` at run time.
 Each environment has its own tfvars, its own state file, and its own approval
@@ -20,8 +24,10 @@ touching production.
 A new **VPC** (public/private subnets, IGW, single NAT gateway) plus an EKS
 cluster + node group, KMS key, IAM roles, two RDS Postgres instances
 (OpenMetadata + Airflow), an OpenSearch domain, two EFS volumes, and the
-OpenMetadata application deployed via Helm. Full list in the
-[example README](https://github.com/open-metadata/terraform-aws-openmetadata/tree/main/examples/complete).
+OpenMetadata application deployed via Helm. A `plan` from a clean state is
+**91 resources** for `dev` (`azs_to_use = 2`) and **99** with the variable
+defaults (`azs_to_use = 3`) — the difference is two subnets and their route
+table associations per extra AZ.
 
 ## Environments
 
@@ -41,23 +47,29 @@ account/region** without RDS/OpenSearch/EKS name collisions.
 ## Layout
 
 ```
-<repo root>/                            # e.g. kiban/
+openmetadata-infra/                     # repo root
 ├─ .github/
-│  ├─ actions/prepare/action.yml     # composite: checkout module, inject cfg, OIDC, init
+│  ├─ actions/prepare/action.yml     # composite: inject cfg, OIDC, pre-flight, init
 │  └─ workflows/
 │     ├─ deploy.yml                  # manual: environment × (plan / apply / destroy)
 │     └─ validate.yml                # PR fmt + validate (no cloud creds)
-└─ openmetadata-infra/               # this Terraform project (PROJECT_DIR)
-   ├─ backend.tf                     # S3 backend block (values via -backend-config)
-   ├─ bootstrap/                     # one-time: GitHub OIDC provider + deploy role
-   └─ config/
-      ├─ dev.auto.tfvars             # teardown-safe, cheaper, "-dev" names
-      └─ production.auto.tfvars      # production-safe defaults
+├─ terraform/                        # the Terraform root module that gets deployed
+├─ backend.tf                        # S3 backend block (values via -backend-config)
+├─ bootstrap/                        # one-time: GitHub OIDC provider + deploy role
+├─ config/
+│  ├─ dev.auto.tfvars                # teardown-safe, cheaper, "-dev" names
+│  └─ production.auto.tfvars         # production-safe defaults
+└─ .terraform-version                # 1.9.8, matches TF_VERSION in the workflows
 ```
 
-> The workflows live at the **repo root** `.github/` and reference this project
-> via `PROJECT_DIR: openmetadata-infra`. To relocate/rename the project, update
-> that one value (and `BACKEND_FILE`/`TFVARS_FILE`) in the workflows.
+At deploy time the `prepare` action copies `backend.tf` → `terraform/backend.tf`
+and `config/<env>.auto.tfvars` → `terraform/deploy.auto.tfvars`, then runs
+`terraform init` in `terraform/`.
+
+`backend.tf` is injected rather than committed inside `terraform/` so the same
+directory stays usable locally with **local state** — a plain `terraform plan`
+needs no bucket and no credentials beyond an AWS identity. To relocate or rename
+the project, update `TF_DIR` in both workflows.
 
 ## One-time setup
 
@@ -101,10 +113,11 @@ role_arn)"`. See [bootstrap/README.md](bootstrap/README.md).
 | `TF_STATE_REGION` | `us-east-1` | Region of the bucket/lock table |
 | `TF_STATE_LOCK_TABLE` | `terraform-locks` | DynamoDB lock table |
 | `TF_STATE_PREFIX` | `openmetadata` | *(optional)* state key prefix; the environment + `terraform.tfstate` are appended. Defaults to `openmetadata` |
-| `MODULE_REF` | `1.12.13` | *(optional)* module tag/branch/sha to deploy; defaults to `1.12.13` |
 
 > The state **key** is derived (`<prefix>/<environment>/terraform.tfstate`) —
-> there is no `TF_STATE_KEY` variable anymore.
+> there is no `TF_STATE_KEY` variable. There is no `MODULE_REF` variable either:
+> the deployed config lives in `terraform/`, and the registry module it consumes
+> is pinned in `terraform/main.tf`.
 
 **Secrets:**
 
@@ -136,51 +149,61 @@ After a successful apply, the `update_kubeconfig` output prints the
 `environment=dev, action=destroy` to remove — no approvals, and the dev RDS
 settings let destroy complete cleanly.
 
+### Locally
+
+```bash
+cd terraform
+terraform init                                  # local state, no backend.tf present
+terraform plan -var-file=../config/dev.auto.tfvars
+```
+
+Without a `-var-file` the variable defaults apply, including
+`region = "us-east-1"`.
+
 ## Configuration notes
 
-- **Region** is set in two places that must agree: the `AWS_REGION` variable and
-  `region` in the selected env tfvars.
-- **Pinning:** the module ref defaults to `1.12.13`. Bump `MODULE_REF` to upgrade
-  (e.g. `1.13.1`); `plan` first to review the diff.
+- **Region** is set in three places that must agree: the `AWS_REGION` repository
+  variable, `region` in the selected env tfvars, and the `region` default in
+  `terraform/variables.tf`. All three are `us-east-1`. The tfvars value wins for
+  CI; the default only applies to local runs with no var-file.
+- **Pinning:** the OpenMetadata registry module is pinned to `1.12.13` in
+  `terraform/main.tf`, and `app_version` in each env's tfvars pins the deployed
+  application. Bump both together and `plan` first to review the diff.
+- **Provider versions are not locked.** `.terraform.lock.hcl` is gitignored, so
+  every CI run resolves the newest release matching the constraints in
+  `terraform/versions.tf` (`aws ~> 6.0`, `helm ~> 3.0`, `kubernetes ~> 3.0`,
+  `tls ~> 4.0`). To make runs reproducible, un-ignore the lock file and generate
+  it for both platforms — `linux_amd64` is required or CI init fails checksum
+  verification:
+  ```bash
+  terraform -chdir=terraform providers lock \
+    -platform=linux_amd64 -platform=darwin_arm64
+  ```
 - **Production destroy is intentionally hard.** `production.auto.tfvars` keeps the
   module's protective RDS defaults (`deletion_protection=true`,
   `skip_final_snapshot=false`), which block `terraform destroy`. Use the **dev**
   environment for disposable stacks; to tear down production you must first flip
   those flags and apply, then destroy.
-- **Not variable-controlled:** the EKS node group (2 × `t3.xlarge`) and the VPC
-  CIDR are hard-coded in the upstream example, so dev and production use the same
-  node size. Adjust the upstream example if you need smaller dev nodes.
-- **Upstream example patches (workaround).** Before `init`, the `prepare` action
-  (and `validate.yml`) patch two inconsistencies in the pinned `examples/complete`
-  — both present through at least `1.13.1`:
-  1. `ebs_csi_irsa` / `efs_csi_irsa` reference
-     `terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks`
-     with **no version**, so `init` resolves iam **v6**, where that submodule was
-     removed → *"Unreadable module subdirectory."* We inject `version = "~> 5.0"`
-     (its submodule only needs aws `>= 4.0`, so it stays v6-compatible).
-  2. The example's `versions.tf` pins **aws `~> 5.0`**, but the OpenMetadata
-     module itself requires **aws `~> 6.0`** (its root and `rds` `versions.tf`),
-     so provider resolution fails with *"no available releases match … ~> 5.0 …
-     ~> 6.0."* We bump the example provider to `~> 6.0`.
-  3. `helm` / `kubernetes` providers are **unpinned**, and the example and the
-     module target *different helm majors*:
-     - The module's `openmetadata-deployment` / `openmetadata-dependencies`
-       submodules write `set = [{ name, value }]` — **helm v3** syntax. Under
-       helm v2, where `set` is a repeatable block, validate fails with
-       *"An argument named 'set' is not expected here."*
-     - The example's `provider "helm"` uses a `kubernetes {}` **block** — helm
-       v2 syntax. Under helm v3, where it became a nested attribute, it fails
-       with *"Blocks of type 'kubernetes' are not expected here."*
+- **Not variable-controlled, but editable here.** The EKS node group
+  (2–3 × `t3.xlarge`, `eks.tf`) and the VPC CIDR (`172.72.0.0/16`, `vpc.tf`) are
+  hard-coded locals rather than variables, so dev and production share them.
+  Because the config is vendored, you can now change them directly instead of
+  patching upstream — but the value is shared across both environments.
 
-     The submodules come from the registry and can't be edited pre-`init`, so we
-     pin **helm `~> 3.0`** (matching the module) and rewrite the example's
-     provider config to the v3 form (`kubernetes = { … exec = { … } }`).
-     `kubernetes` stays `~> 2.0` — its own provider block is v2 syntax.
-     The pins are injected into the example's existing `required_providers`
-     block in `versions.tf` (a module may have only one such block, so a
-     separate file would fail with *"Duplicate required providers
-     configuration."*).
+## Divergence from the upstream example
 
-  Remove these patch steps once `MODULE_REF` points at an upstream release whose
-  example is self-consistent (pins the CSI modules, targets aws v6, and pins the
-  helm/kubernetes providers).
+The vendored config fixes inconsistencies that the upstream `examples/complete`
+still carries. CI used to patch these with `awk`/`sed` before `init`; those steps
+are gone, and the fixes are committed instead.
+
+| Change | Why |
+|---|---|
+| `aws` provider `~> 6.0` (was `~> 5.0`) | The OpenMetadata module itself requires `aws ~> 6.0`, so the example's `~> 5.0` pin could not be satisfied alongside it. |
+| `helm` provider `~> 3.0`, with `kubernetes = { … exec = { … } }` | The module's submodules use `set = [{ name, value }]`, which is helm v3 syntax. helm v3 also turned the provider's `kubernetes` block into a nested attribute. |
+| `kubernetes` provider `~> 3.0` | Upstream leaves it unpinned; v3 is current. |
+| `kubernetes_namespace_v1`, `kubernetes_storage_class_v1` | The unversioned resource names are deprecated in kubernetes provider v3. |
+| `terraform-aws-modules/iam/aws` `~> 6.0`, submodule `iam-role-for-service-accounts` | Upstream references `iam-role-for-service-accounts-eks` with **no version**; v6 removed that submodule path (*"Unreadable module subdirectory"*), and v5 uses `data.aws_region.current.name`, deprecated under aws v6. In v6 the module renamed `role_name` → `name` and the `iam_role_arn` output → `arn`. |
+| `use_name_prefix = false` on both IRSA modules | v6 defaults it to `true`, which would rename the roles to `ebs-csi-<suffix>` / `efs-csi-<suffix>`. |
+
+A `plan` from a clean state is clean — zero warnings, zero errors. If you
+re-sync from a newer upstream release, expect to re-apply these.
