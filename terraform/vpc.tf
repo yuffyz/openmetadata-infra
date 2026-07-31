@@ -24,4 +24,18 @@ module "vpc" {
   enable_nat_gateway   = true
   single_nat_gateway   = true
   enable_dhcp_options  = true
+
+  # Subnet discovery tags for the AWS Load Balancer Controller. Without
+  # kubernetes.io/role/elb on the public subnets an internet-facing load
+  # balancer either fails to provision or silently lands in the private
+  # subnets and is unreachable. Tagged unconditionally -- the tags are inert
+  # until a Service or Ingress actually asks for a load balancer.
+  public_subnet_tags = {
+    "kubernetes.io/role/elb"                          = "1"
+    "kubernetes.io/cluster/${local.eks_cluster_name}" = "shared"
+  }
+  private_subnet_tags = {
+    "kubernetes.io/role/internal-elb"                 = "1"
+    "kubernetes.io/cluster/${local.eks_cluster_name}" = "shared"
+  }
 }

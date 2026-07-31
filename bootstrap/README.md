@@ -8,8 +8,10 @@ authenticate to AWS without stored keys:
    this repo: branch `main` for `plan`, and the `dev` + `production` environments
    for `apply`/`destroy`.
 
-It can also create the **remote state bucket** — off by default, see below.
-There is no lock table: the deploy workflow uses S3 native locking.
+It also creates the **OpenSearch service-linked role** (on by default — the
+deploy fails without it, see below), and can create the **remote state bucket**
+(off by default). There is no lock table: the deploy workflow uses S3 native
+locking.
 
 Run it once, with credentials that can create IAM resources. It uses **local
 state** — that's fine for a bootstrap; commit nothing sensitive.
@@ -49,6 +51,38 @@ bucket you already made — Terraform cannot adopt a bucket it didn't create.
 **One bucket serves every environment.** Each gets its own state key
 (`<prefix>/<environment>/terraform.tfstate`), and therefore its own independent
 lock object.
+
+## OpenSearch service-linked role
+
+A VPC OpenSearch domain cannot be created until the account has
+`AWSServiceRoleForAmazonOpenSearchService`, which lets OpenSearch manage ENIs in
+your VPC. Without it, `apply` fails partway through with:
+
+```
+Error: creating OpenSearch Domain (openmetadata-dev): ValidationException:
+Before you can proceed, you must enable a service-linked role to give Amazon
+OpenSearch Service permissions to access your VPC.
+```
+
+This bootstrap creates it by default. It's account-wide and shared by every
+domain, which is why it belongs here rather than in the per-environment stack —
+a `dev` destroy must not delete a role `production`'s domain still needs.
+
+If the account already has it, set `create_opensearch_service_linked_role =
+false`. Terraform cannot adopt an existing service-linked role, and creating a
+duplicate fails with `InvalidInput: Service role name ... has been taken in this
+account`. Check with:
+
+```bash
+aws iam get-role --role-name AWSServiceRoleForAmazonOpenSearchService
+```
+
+The equivalent one-off, if you'd rather not run this bootstrap:
+
+```bash
+aws iam create-service-linked-role \
+  --aws-service-name opensearchservice.amazonaws.com
+```
 
 ## Notes
 

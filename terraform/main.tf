@@ -18,13 +18,39 @@ module "app" {
   subnet_ids       = local.subnet_ids
   vpc_id           = local.vpc_id
 
+  openmetadata_helm_values = local.app_helm_values
+
   depends_on = [
     aws_eks_cluster.openmetadata,
     aws_kms_alias.this,
     kubernetes_namespace_v1.app,
     kubernetes_secret_v1.env_from_secret,
-    module.vpc
+    module.vpc,
+    helm_release.aws_load_balancer_controller
   ]
+}
+
+# Helm set-overrides for the OpenMetadata chart.
+#
+# The NLB block is emitted only when app_expose_via_nlb is true, so production
+# stays on ClusterIP unless its own tfvars opt in -- this module block is shared
+# by every environment.
+#
+# Source ranges are applied as a controller *annotation* rather than
+# service.loadBalancerSourceRanges: the chart templates service.annotations
+# verbatim, so this does not depend on the chart exposing a dedicated field.
+# Enforced by the security group the controller attaches to the NLB.
+locals {
+  nlb_helm_values = var.app_expose_via_nlb ? {
+    "service.type" = "LoadBalancer"
+
+    "service.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-type"            = "external"
+    "service.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-nlb-target-type" = "ip"
+    "service.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-scheme"          = "internet-facing"
+    "service.annotations.service\\.beta\\.kubernetes\\.io/load-balancer-source-ranges"       = join("\\,", var.app_lb_allowed_cidrs)
+  } : {}
+
+  app_helm_values = merge(local.nlb_helm_values, var.app_extra_helm_values)
 }
 
 # Extra environment variables from Kubernets secret
