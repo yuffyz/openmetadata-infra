@@ -65,5 +65,12 @@ resource "aws_eks_node_group" "nodes" {
   update_config {
     max_unavailable = 1
   }
-  depends_on = [aws_eks_cluster.openmetadata]
+
+  # The CNI and kube-proxy must be present before instances boot, or they never
+  # reach Ready and the node group fails with NodeCreationFailure.
+  depends_on = [
+    aws_eks_cluster.openmetadata,
+    aws_eks_addon.vpc_cni,
+    aws_eks_addon.kube_proxy
+  ]
 }
