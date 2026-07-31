@@ -41,6 +41,12 @@ module "app" {
 # verbatim, so this does not depend on the chart exposing a dedicated field.
 # Enforced by the security group the controller attaches to the NLB.
 locals {
+  app_tls_enabled = var.app_expose_via_nlb && var.app_tls_domain_name != ""
+
+  # Deterministic NLB name so Terraform can read the load balancer back and
+  # point Route 53 at it (see nlb_tls.tf). 32 chars is the AWS limit.
+  app_nlb_name = substr("${var.eks_cluster_name}-omd", 0, 32)
+
   nlb_helm_values = var.app_expose_via_nlb ? {
     "service.type" = "LoadBalancer"
 
@@ -50,7 +56,17 @@ locals {
     "service.annotations.service\\.beta\\.kubernetes\\.io/load-balancer-source-ranges"       = join("\\,", var.app_lb_allowed_cidrs)
   } : {}
 
-  app_helm_values = merge(local.nlb_helm_values, var.app_extra_helm_values)
+  # TLS terminates on the NLB listener for the chart's service port. The name
+  # annotation is only set here because renaming an existing NLB forces the
+  # controller to replace it -- enabling TLS therefore changes the hostname,
+  # which is fine since DNS is what's used from then on.
+  tls_helm_values = local.app_tls_enabled ? {
+    "service.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-name"      = local.app_nlb_name
+    "service.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-ssl-cert"  = aws_acm_certificate_validation.app[0].certificate_arn
+    "service.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-ssl-ports" = "8585"
+  } : {}
+
+  app_helm_values = merge(local.nlb_helm_values, local.tls_helm_values, var.app_extra_helm_values)
 }
 
 # Extra environment variables from Kubernets secret

@@ -26,11 +26,16 @@ cluster + node group, KMS key, IAM roles, two RDS Postgres instances
 (OpenMetadata + Airflow), an OpenSearch domain, two EFS volumes, and the
 OpenMetadata application deployed via Helm.
 
-A `plan` from a clean state is **95 resources** for `dev` — 91 for the base
-stack plus 4 for the AWS Load Balancer Controller and its IRSA role, which
-`dev.auto.tfvars` enables (see [Accessing the UI](#accessing-the-ui)). With the
-variable defaults and no NLB it's **99**, because `azs_to_use` defaults to 3
-rather than dev's 2, adding a subnet and route table association per extra AZ.
+A `plan` from a clean state is **98 resources** for `dev` as configured: 91 for
+the base stack, 3 core EKS addons (`vpc-cni`, `kube-proxy`, `coredns`), and 4 for
+the AWS Load Balancer Controller and its IRSA role, which `dev.auto.tfvars`
+enables (see [Accessing the UI](#accessing-the-ui)). Adding
+`app_tls_domain_name` brings in about 5 more — certificate, validation, the
+alias record and the provisioning wait.
+
+With the variable defaults and no NLB it's higher again on subnets, because
+`azs_to_use` defaults to 3 rather than dev's 2 — a subnet and route table
+association per extra AZ.
 
 ## Environments
 
@@ -43,7 +48,7 @@ rather than dev's 2, adding a subnet and route table association per extra AZ.
 | State key | `<prefix>/dev/terraform.tfstate` | `<prefix>/production/terraform.tfstate` |
 | Approval | none (fast create/destroy) | required reviewers |
 | Teardown | `terraform destroy` just works | intentionally hard (protected) |
-| UI access | internet-facing NLB, IP-allowlisted, plain HTTP | **not configured** — `ClusterIP` + port-forward only |
+| UI access | internet-facing NLB, IP-allowlisted; HTTPS available via `app_tls_domain_name` | **not configured** — `ClusterIP` + port-forward only |
 
 The `-dev` naming lets a dev stack coexist with production **in the same
 account/region** without RDS/OpenSearch/EKS name collisions.
@@ -58,7 +63,9 @@ openmetadata-infra/                     # repo root
 │     ├─ deploy.yml                  # manual: environment × (plan / apply / destroy)
 │     └─ validate.yml                # PR fmt + validate (no cloud creds)
 ├─ terraform/                        # the Terraform root module that gets deployed
-│  └─ lb_controller.tf              # AWS Load Balancer Controller + IRSA (toggled)
+│  ├─ core_addons.tf                # vpc-cni / kube-proxy / coredns EKS addons
+│  ├─ lb_controller.tf              # AWS Load Balancer Controller + IRSA (toggled)
+│  └─ nlb_tls.tf                    # ACM cert + Route 53 alias for HTTPS (toggled)
 ├─ backend.tf                        # S3 backend block (values via -backend-config)
 ├─ bootstrap/                        # one-time: GitHub OIDC provider + deploy role
 ├─ config/
@@ -225,13 +232,72 @@ kubectl get svc -n openmetadata openmetadata \
 ```
 
 Then `http://<hostname>:8585`. Allow a couple of minutes after apply — Terraform
-returns when the Helm release succeeds, but the controller still has to
-provision the NLB and pass health checks, so the hostname is briefly empty and
-then briefly unresolvable.
+returns when the Helm release succeeds (the module sets `wait = false`), but the
+controller still has to provision the NLB and pass health checks, so the
+hostname is briefly empty and then briefly unresolvable.
+
+The hostname is also readable without cluster access, which is often quicker:
+
+```bash
+aws elbv2 describe-load-balancers --region us-east-1 \
+  --query "LoadBalancers[?Type=='network'&&Scheme=='internet-facing'].DNSName" --output text
+```
+
+`terraform output openmetadata_url` prints the right URL — or the right command
+to find it — for whichever exposure mode is configured.
 
 Initial login is `admin@open-metadata.org` / `admin`, from the module's
 `initial_admins = "[admin]"` and `principal_domain = "open-metadata.org"`.
-**Change it immediately** — see the warning below.
+**Change it over `port-forward`, not over the NLB** — until TLS is configured
+that password would otherwise cross the internet in cleartext, starting with
+the well-known default.
+
+### dev — HTTPS on the NLB
+
+Set both variables in `config/dev.auto.tfvars` and TLS terminates on the NLB
+listener with an ACM certificate:
+
+```hcl
+app_tls_domain_name       = "openmetadata.example.com"
+app_tls_route53_zone_name = "example.com"
+```
+
+The URL becomes `https://openmetadata.example.com:8585`. What Terraform creates
+(`terraform/nlb_tls.tf`), all conditional on those variables:
+
+| Resource | Purpose |
+|---|---|
+| `aws_acm_certificate` | DNS-validated cert for the FQDN |
+| `aws_route53_record.app_cert_validation` | Validation CNAMEs, `allow_overwrite` for cert rotation |
+| `aws_acm_certificate_validation` | Blocks until ACM reports ISSUED |
+| `time_sleep.wait_for_nlb` | 240s for the controller to provision the NLB |
+| `data.aws_lb` | Reads the NLB back by its pinned name |
+| `aws_route53_record.app` | Alias A record → NLB |
+
+The certificate reaches the chart as the
+`service.beta.kubernetes.io/aws-load-balancer-ssl-cert` annotation, paired with
+`ssl-ports: "8585"`. It references the **validation** resource, not the
+certificate, so the Service is never created with an unissued ARN.
+
+Three things to know before enabling it:
+
+- **The NLB is replaced.** TLS pins the load balancer to a deterministic name
+  (`<cluster>-omd`) so Terraform can find it, and renaming makes the controller
+  recreate it. The old `*.elb.amazonaws.com` hostname stops working — fine, since
+  the domain is what you use afterwards, but it is a brief outage.
+- **The port stays 8585**, so the URL is `https://<domain>:8585`, not 443. The
+  NLB listener mirrors the chart's Service port. Moving to 443 means setting
+  `app_extra_helm_values = { "service.port" = "443" }` — verify afterwards that
+  `kubectl get svc -n openmetadata openmetadata -o yaml` still shows
+  `targetPort: 8585`, since how this chart templates `targetPort` isn't
+  guaranteed.
+- **The first apply may need a re-run.** Because `wait = false`, Terraform can
+  reach the `data.aws_lb` lookup before the controller has finished. The 240s
+  sleep usually covers it; if not, apply fails with *no matching LB found* and
+  re-running completes it. Nothing is left half-built.
+
+The hosted zone must already exist and be **public** — this repo does not create
+it, and DNS validation needs it to be authoritative for the domain.
 
 ### Any environment — port-forward
 
@@ -251,12 +317,15 @@ version.
 |---|---|---|
 | `app_expose_via_nlb` | `false` | Install the LB Controller and switch the Service to `LoadBalancer` |
 | `app_lb_allowed_cidrs` | `[]` | CIDRs allowed to reach the NLB. **Required** when the toggle is on |
+| `app_tls_domain_name` | `""` | FQDN to serve over HTTPS. Empty leaves the NLB on plain HTTP |
+| `app_tls_route53_zone_name` | `""` | Public hosted zone owning that FQDN. **Required** with the above |
 | `lb_controller_chart_version` | `null` | Controller chart version; `null` tracks latest |
-| `app_extra_helm_values` | `{}` | Arbitrary Helm `set` overrides, merged over the NLB values |
+| `app_extra_helm_values` | `{}` | Arbitrary Helm `set` overrides, merged last |
 
-Two validation rules fail the plan rather than let an unsafe config through:
-an empty `app_lb_allowed_cidrs` while the toggle is on, and `0.0.0.0/0`
-anywhere in the list.
+Four validation rules fail the plan rather than let a broken or unsafe config
+through: an empty `app_lb_allowed_cidrs` while the NLB toggle is on, `0.0.0.0/0`
+anywhere in that list, a TLS domain without `app_expose_via_nlb`, and a TLS
+domain without a hosted zone.
 
 `module "app"` is **shared by both environments**, so exposure has to be a
 variable — hardcoding `service.type` would publish production on its next apply.
@@ -269,10 +338,11 @@ verbatim, so the annotation is guaranteed to reach the Service; relying on a
 dedicated chart field that may not exist would silently leave the NLB open.
 Enforcement needs a controller that manages NLB security groups (v2.6+).
 
-> ⚠️ **The dev NLB serves plain HTTP.** Credentials — including that default
-> admin password — cross the internet in the clear. It is IP-allowlisted, which
-> limits exposure but does not encrypt anything. Acceptable for a throwaway dev
-> stack; not acceptable for real data. See below.
+> ⚠️ **Without `app_tls_domain_name`, the NLB serves plain HTTP.** Credentials —
+> including that default admin password — cross the internet in the clear.
+> IP-allowlisting limits *who can connect*; it encrypts nothing, and browsers
+> correctly flag the login page as "Not secure". Configure TLS above, or use
+> `port-forward`, before typing a password you care about.
 
 ### Known gaps
 
@@ -285,40 +355,54 @@ Enforcement needs a controller that manages NLB security groups (v2.6+).
   ```bash
   terraform state show 'helm_release.aws_load_balancer_controller[0]' | grep '^ *version'
   ```
-- **No TLS, no DNS, no SSO** anywhere in the stack yet.
+- **Authentication is still the chart default** — a single `admin` account with a
+  well-known password. TLS protects the transport, not the auth model. SSO is the
+  remaining gap for any real use.
+- **No TLS on internal hops.** NLB→pod traffic is plain TCP inside the VPC, and
+  the OpenSearch/RDS connections use the module's defaults.
 
 ## Production exposure — what's still missing
 
 Production deliberately has **no** UI exposure configured: its tfvars omit
 `app_expose_via_nlb`, so the Service stays `ClusterIP` and the only access is
-`kubectl port-forward`. Copying dev's NLB setup would put an unencrypted login
-page on the internet, so production needs an ALB Ingress with TLS instead.
+`kubectl port-forward`. Nothing stops you enabling the NLB + TLS variables there
+— they are per-environment — and for an internal tool behind a tight allowlist
+that may be enough. What it still doesn't give you:
 
-The AWS Load Balancer Controller installed by `lb_controller.tf` already serves
-both NLB Services and ALB Ingresses, so it is reusable as-is. What's missing:
+1. **Standard ports.** The NLB listener mirrors the chart's Service port, so the
+   URL carries `:8585`. An ALB Ingress serves 443 with an HTTP→HTTPS redirect and
+   no port in the URL.
+2. **Authentication.** The chart's default is a single `admin` account with a
+   well-known password. This is the significant gap — TLS protects the transport,
+   not the auth model. OpenMetadata supports OIDC/SAML via
+   `openmetadata.config.authentication.*`; configure it and remove the default
+   admin. An ALB can also carry a Cognito or OIDC authenticate action, putting
+   login in front of the app entirely.
+3. **WAF and managed rules.** Attachable to an ALB, not to an NLB. This is also
+   where you stop maintaining `/32`s by hand — the dev allowlist is two dynamic
+   ISP addresses and will keep drifting.
+4. **Layer-7 anything** — path routing, header rules, request logging to S3,
+   per-route timeouts. An NLB is TCP only.
 
-1. **A domain and a hosted zone.** A Route 53 public hosted zone for the name
-   you'll serve (e.g. `openmetadata.example.com`). Not created by this repo.
-2. **An ACM certificate** in the cluster's region, DNS-validated against that
-   zone. `aws_acm_certificate` + `aws_acm_certificate_validation` +
-   `aws_route53_record` for the validation CNAME. Terraform must wait on
-   validation before the Ingress references the ARN.
-3. **Ingress values on the chart**, replacing dev's Service annotations —
-   `ingress.enabled`, `ingress.className: alb`, the host rule, and
-   `alb.ingress.kubernetes.io/*` annotations for `scheme: internet-facing`,
-   `target-type: ip`, `certificate-arn`, `listen-ports` (443), and an
-   HTTP→HTTPS redirect action. These go through `app_extra_helm_values`, so no
-   module change is required.
-4. **A DNS record** — an `aws_route53_record` alias to the ALB, or
-   `external-dns` in-cluster (the vendored iam v6 module has
-   `attach_external_dns_policy`, so its IRSA role is a few lines).
-5. **Authentication.** The chart's basic auth with a default admin is not
-   adequate for production. OpenMetadata supports OIDC/SAML SSO; configure it
-   through `openmetadata.config.authentication.*` and remove the default admin.
-   Alternatively front the ALB with Cognito or an OIDC authenticate action.
-6. **A tighter allowlist decision.** An ALB can use a security group or WAF
-   rather than IP ranges, which is the point at which you stop maintaining
-   `/32`s by hand.
+Moving to an ALB Ingress reuses most of what's already here. The AWS Load
+Balancer Controller in `lb_controller.tf` serves Ingresses as well as Services,
+and the ACM certificate plus Route 53 alias in `nlb_tls.tf` transfer directly.
+The change is swapping the Service annotations for chart Ingress values —
+`ingress.enabled`, `ingress.className: alb`, the host rule, and
+`alb.ingress.kubernetes.io/*` for `scheme`, `target-type: ip`,
+`certificate-arn`, `listen-ports` and the redirect action — all of which fit
+through `app_extra_helm_values` with no module change. The alias record would
+then point at the ALB instead of the NLB.
+
+Two further considerations for production specifically:
+
+- **Certificate scope.** One cert per FQDN today. A wildcard (`*.example.com`)
+  or SANs would cover Airflow and any future subdomain in one certificate.
+- **DNS ownership.** The alias record is created by reading the load balancer
+  back after the fact, which needs the 240s wait described above. `external-dns`
+  in-cluster removes that race and self-heals if the LB is replaced; the vendored
+  iam v6 module has `attach_external_dns_policy`, so its IRSA role is a few
+  lines.
 
 Also worth revisiting for production, unrelated to exposure:
 `enabled_cluster_log_types = []` disables EKS control-plane logging, and the
@@ -358,6 +442,16 @@ node group is the same 2 × `t3.xlarge` as dev.
   fails outright; check with `aws eks describe-cluster-versions` before bumping.
   AL2 EKS-optimized AMIs stop at 1.32, so 1.33+ requires
   `ami_type = "AL2023_x86_64_STANDARD"`. Currently 1.36 / AL2023.
+- **Core addons are managed, not bootstrapped.** The cluster keeps
+  `bootstrap_self_managed_addons = true`, but `vpc-cni`, `kube-proxy` and
+  `coredns` are also declared as `aws_eks_addon` with `OVERWRITE`, so EKS
+  resolves versions matching the cluster instead of leaving whatever bootstrap
+  installed. Without this, a large version jump can leave a CNI that never goes
+  Ready, and the node group fails with `NodeCreationFailure: Instances failed to
+  join the kubernetes cluster`. The node group depends on the CNI and kube-proxy;
+  CoreDNS depends on the node group, since a Deployment cannot become healthy
+  with no nodes. `bootstrap_self_managed_addons` is left alone deliberately — it
+  is create-time only, so changing it forces cluster replacement.
 - **Subnets carry ELB discovery tags** (`kubernetes.io/role/elb` on public,
   `kubernetes.io/role/internal-elb` on private, plus the cluster tag). Applied
   unconditionally — they're inert until something requests a load balancer, and
