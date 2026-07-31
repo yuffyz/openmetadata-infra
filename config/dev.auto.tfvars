@@ -33,6 +33,20 @@ app_lb_allowed_cidrs = [
   "163.116.255.50/32", # additional allowed client
 ]
 
+# HTTPS on the NLB. Set both to terminate TLS with an ACM certificate and get a
+# Route 53 alias record; leave them empty and the NLB stays plain HTTP (browsers
+# will flag the login page as "Not secure", correctly -- credentials would cross
+# the internet in the clear).
+#
+# The zone must be an existing PUBLIC Route 53 hosted zone in this account; the
+# certificate is DNS-validated against it. Enabling this
+
+ replaces the NLB, so
+# the raw *.elb.amazonaws.com hostname changes -- use the domain from then on.
+#
+app_tls_domain_name       = "openmetadata.fuji.com"
+app_tls_route53_zone_name = "fuji.com"
+
 # --- OpenMetadata database (teardown-safe) ---------------------------------
 db = {
   provisioner = "aws"

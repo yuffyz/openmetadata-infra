@@ -170,6 +170,28 @@ variable "app_lb_allowed_cidrs" {
   }
 }
 
+variable "app_tls_domain_name" {
+  description = "FQDN to serve the OpenMetadata UI over HTTPS, e.g. openmetadata.example.com. Empty leaves the NLB on plain HTTP. Requires app_expose_via_nlb."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.app_tls_domain_name == "" || var.app_expose_via_nlb
+    error_message = "app_tls_domain_name requires app_expose_via_nlb = true -- TLS terminates on the NLB, so there must be one."
+  }
+}
+
+variable "app_tls_route53_zone_name" {
+  description = "Public Route 53 hosted zone that owns app_tls_domain_name, e.g. example.com. Used for both ACM DNS validation and the alias record."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.app_tls_domain_name == "" || var.app_tls_route53_zone_name != ""
+    error_message = "app_tls_route53_zone_name must be set when app_tls_domain_name is set -- the certificate is DNS-validated and the record is created in that zone."
+  }
+}
+
 variable "lb_controller_chart_version" {
   description = "aws-load-balancer-controller Helm chart version. null tracks the latest release; pin it after the first successful apply (terraform state show 'helm_release.aws_load_balancer_controller[0]' | grep version)."
   type        = string
