@@ -142,3 +142,42 @@ variable "region" {
   type        = string
   default     = "us-east-1"
 }
+
+# --- OpenMetadata UI exposure -----------------------------------------------
+# Off by default: with this false the UI is reachable only via
+# `kubectl port-forward`, which is the safe default for an app served over
+# plain HTTP with a well-known initial admin account.
+
+variable "app_expose_via_nlb" {
+  description = "Expose the OpenMetadata UI through an internet-facing NLB provisioned by the AWS Load Balancer Controller. Installs the controller as a side effect. Requires app_lb_allowed_cidrs."
+  type        = bool
+  default     = false
+}
+
+variable "app_lb_allowed_cidrs" {
+  description = "CIDRs permitted to reach the NLB. Required when app_expose_via_nlb is true."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = !var.app_expose_via_nlb || length(var.app_lb_allowed_cidrs) > 0
+    error_message = "app_lb_allowed_cidrs must list at least one CIDR when app_expose_via_nlb is true. The UI is served over plain HTTP with a default admin account, so it must not be reachable from anywhere."
+  }
+
+  validation {
+    condition     = !contains(var.app_lb_allowed_cidrs, "0.0.0.0/0")
+    error_message = "0.0.0.0/0 is not accepted. OpenMetadata is served over plain HTTP here; put an ALB with an ACM certificate in front before exposing it to the internet at large."
+  }
+}
+
+variable "lb_controller_chart_version" {
+  description = "aws-load-balancer-controller Helm chart version. null tracks the latest release; pin it after the first successful apply (terraform state show 'helm_release.aws_load_balancer_controller[0]' | grep version)."
+  type        = string
+  default     = null
+}
+
+variable "app_extra_helm_values" {
+  description = "Additional Helm set-overrides for the OpenMetadata chart, merged on top of the NLB values."
+  type        = map(string)
+  default     = {}
+}

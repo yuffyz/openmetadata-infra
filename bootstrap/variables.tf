@@ -60,6 +60,12 @@ variable "state_bucket" {
   default     = ""
 }
 
+variable "create_opensearch_service_linked_role" {
+  description = "Create AWSServiceRoleForAmazonOpenSearchService, required for VPC OpenSearch domains. Set false if the account already has it -- Terraform cannot adopt an existing service-linked role."
+  type        = bool
+  default     = true
+}
+
 variable "create_state_bucket" {
   description = "Create the state S3 bucket named by state_bucket. Leave false if it already exists (Terraform would fail on a bucket it doesn't own)."
   type        = bool

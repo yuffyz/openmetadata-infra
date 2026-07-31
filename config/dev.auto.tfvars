@@ -15,6 +15,24 @@ eks_cluster_name = "open-metadata-dev"
 azs_to_use       = 2
 app_version      = "1.12.13"
 
+# --- OpenMetadata UI exposure ----------------------------------------------
+# Published on an internet-facing NLB, reachable only from the CIDRs below.
+# The UI is plain HTTP with a default admin account, so Terraform refuses both
+# 0.0.0.0/0 and an empty list -- keep this list tight.
+#
+# Adds roughly $0.55-0.70/day for the NLB, plus LCUs.
+#
+# Both entries are dynamic ISP addresses: if access starts hanging, re-check
+# with `curl ifconfig.me` from the affected network and update the /32.
+#
+# Without this, the UI is still reachable via:
+#   kubectl port-forward -n openmetadata svc/openmetadata 8585:8585
+app_expose_via_nlb = true
+app_lb_allowed_cidrs = [
+  "73.141.150.76/32",  # workstation egress (seen in CloudTrail)
+  "163.116.255.50/32", # additional allowed client
+]
+
 # --- OpenMetadata database (teardown-safe) ---------------------------------
 db = {
   provisioner = "aws"

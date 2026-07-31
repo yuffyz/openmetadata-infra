@@ -103,6 +103,30 @@ resource "aws_s3_bucket_public_access_block" "state" {
 }
 
 # ---------------------------------------------------------------------------
+# Service-linked role for OpenSearch
+#
+# A VPC OpenSearch domain needs AWSServiceRoleForAmazonOpenSearchService to
+# create ENIs in the VPC. Without it CreateDomain fails with:
+#   ValidationException: Before you can proceed, you must enable a
+#   service-linked role to give Amazon OpenSearch Service permissions to
+#   access your VPC.
+#
+# It is account-wide and shared by every domain, which is why it lives here and
+# not in the per-environment stack: destroying dev must not delete a role that
+# production's domain still depends on.
+#
+# Set create_opensearch_service_linked_role = false if the account already has
+# it (created by hand, by another stack, or by a pre-existing domain) --
+# Terraform cannot adopt it, and creating a duplicate fails with
+# "InvalidInput: Service role name ... has been taken in this account".
+# ---------------------------------------------------------------------------
+resource "aws_iam_service_linked_role" "opensearch" {
+  count            = var.create_opensearch_service_linked_role ? 1 : 0
+  aws_service_name = "opensearchservice.amazonaws.com"
+  description      = "Lets Amazon OpenSearch Service manage VPC ENIs for OpenMetadata domains"
+}
+
+# ---------------------------------------------------------------------------
 # IAM role with a trust policy scoped to this repo
 # ---------------------------------------------------------------------------
 data "aws_iam_policy_document" "trust" {

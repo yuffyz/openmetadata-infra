@@ -24,10 +24,13 @@ touching production.
 A new **VPC** (public/private subnets, IGW, single NAT gateway) plus an EKS
 cluster + node group, KMS key, IAM roles, two RDS Postgres instances
 (OpenMetadata + Airflow), an OpenSearch domain, two EFS volumes, and the
-OpenMetadata application deployed via Helm. A `plan` from a clean state is
-**91 resources** for `dev` (`azs_to_use = 2`) and **99** with the variable
-defaults (`azs_to_use = 3`) — the difference is two subnets and their route
-table associations per extra AZ.
+OpenMetadata application deployed via Helm.
+
+A `plan` from a clean state is **95 resources** for `dev` — 91 for the base
+stack plus 4 for the AWS Load Balancer Controller and its IRSA role, which
+`dev.auto.tfvars` enables (see [Accessing the UI](#accessing-the-ui)). With the
+variable defaults and no NLB it's **99**, because `azs_to_use` defaults to 3
+rather than dev's 2, adding a subnet and route table association per extra AZ.
 
 ## Environments
 
@@ -40,6 +43,7 @@ table associations per extra AZ.
 | State key | `<prefix>/dev/terraform.tfstate` | `<prefix>/production/terraform.tfstate` |
 | Approval | none (fast create/destroy) | required reviewers |
 | Teardown | `terraform destroy` just works | intentionally hard (protected) |
+| UI access | internet-facing NLB, IP-allowlisted, plain HTTP | **not configured** — `ClusterIP` + port-forward only |
 
 The `-dev` naming lets a dev stack coexist with production **in the same
 account/region** without RDS/OpenSearch/EKS name collisions.
@@ -54,6 +58,7 @@ openmetadata-infra/                     # repo root
 │     ├─ deploy.yml                  # manual: environment × (plan / apply / destroy)
 │     └─ validate.yml                # PR fmt + validate (no cloud creds)
 ├─ terraform/                        # the Terraform root module that gets deployed
+│  └─ lb_controller.tf              # AWS Load Balancer Controller + IRSA (toggled)
 ├─ backend.tf                        # S3 backend block (values via -backend-config)
 ├─ bootstrap/                        # one-time: GitHub OIDC provider + deploy role
 ├─ config/
@@ -129,7 +134,24 @@ role_arn)"`. See [bootstrap/README.md](bootstrap/README.md).
 |------|---------|
 | `AWS_ROLE_ARN` | ARN of the IAM role assumed via OIDC (repository-level, so `plan` can read it) |
 
-### 4. Approval gates (GitHub Environments)
+### 4. OpenSearch service-linked role
+A VPC OpenSearch domain can't be created until the account has
+`AWSServiceRoleForAmazonOpenSearchService`. Miss it and `apply` fails partway in
+with *"you must enable a service-linked role to give Amazon OpenSearch Service
+permissions to access your VPC"* — after the VPC, EKS and RDS are already built.
+
+[`bootstrap/`](bootstrap/) creates it by default
+(`create_opensearch_service_linked_role`). It's account-wide and one-time, so
+it's deliberately not in the per-environment stack — a `dev` destroy must not
+delete a role `production` still needs. The equivalent one-off:
+
+```bash
+aws iam create-service-linked-role --aws-service-name opensearchservice.amazonaws.com
+```
+
+Verify with `aws iam get-role --role-name AWSServiceRoleForAmazonOpenSearchService`.
+
+### 5. Approval gates (GitHub Environments)
 Under Settings → Environments:
 - **`production`** — add **required reviewers**. `apply`/`destroy` pause for approval.
 - **`dev`** — create it with **no** protection rules (or don't create it; it's
@@ -164,6 +186,144 @@ terraform plan -var-file=../config/dev.auto.tfvars
 Without a `-var-file` the variable defaults apply, including
 `region = "us-east-1"`.
 
+## Accessing the UI
+
+### Get cluster access first
+
+```bash
+aws --region us-east-1 eks update-kubeconfig --name open-metadata-dev
+```
+
+`eks.tf` sets `authentication_mode = "API"` with
+`bootstrap_cluster_creator_admin_permissions = true`, so cluster-admin goes to
+**the principal that created the cluster** — the GitHub Actions OIDC role, not
+you. There is no `aws-auth` ConfigMap to edit. Expect
+`error: You must be logged in to the server (Unauthorized)` until you add an
+access entry for your own identity:
+
+```bash
+CLUSTER=open-metadata-dev
+ME=$(aws sts get-caller-identity --query Arn --output text)
+
+aws eks create-access-entry --cluster-name $CLUSTER --principal-arn "$ME" --type STANDARD
+aws eks associate-access-policy --cluster-name $CLUSTER --principal-arn "$ME" \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+  --access-scope type=cluster
+```
+
+The API endpoint is public (`public_access_cidrs = ["0.0.0.0/0"]`), so this
+works from anywhere.
+
+### dev — internet-facing NLB
+
+`dev.auto.tfvars` sets `app_expose_via_nlb = true`, which installs the AWS Load
+Balancer Controller and turns the chart's Service into a `LoadBalancer`:
+
+```bash
+kubectl get svc -n openmetadata openmetadata \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+```
+
+Then `http://<hostname>:8585`. Allow a couple of minutes after apply — Terraform
+returns when the Helm release succeeds, but the controller still has to
+provision the NLB and pass health checks, so the hostname is briefly empty and
+then briefly unresolvable.
+
+Initial login is `admin@open-metadata.org` / `admin`, from the module's
+`initial_admins = "[admin]"` and `principal_domain = "open-metadata.org"`.
+**Change it immediately** — see the warning below.
+
+### Any environment — port-forward
+
+Works with no load balancer and no public exposure:
+
+```bash
+kubectl port-forward -n openmetadata svc/openmetadata 8585:8585   # UI on :8585
+```
+
+Airflow (ingestion) is a separate release in the same namespace; confirm the
+service name with `kubectl get svc -n openmetadata`, as it varies by chart
+version.
+
+### Exposure variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `app_expose_via_nlb` | `false` | Install the LB Controller and switch the Service to `LoadBalancer` |
+| `app_lb_allowed_cidrs` | `[]` | CIDRs allowed to reach the NLB. **Required** when the toggle is on |
+| `lb_controller_chart_version` | `null` | Controller chart version; `null` tracks latest |
+| `app_extra_helm_values` | `{}` | Arbitrary Helm `set` overrides, merged over the NLB values |
+
+Two validation rules fail the plan rather than let an unsafe config through:
+an empty `app_lb_allowed_cidrs` while the toggle is on, and `0.0.0.0/0`
+anywhere in the list.
+
+`module "app"` is **shared by both environments**, so exposure has to be a
+variable — hardcoding `service.type` would publish production on its next apply.
+That's why the toggle defaults to `false` and only dev opts in.
+
+Source ranges are applied as the controller annotation
+`service.beta.kubernetes.io/load-balancer-source-ranges`, not
+`service.loadBalancerSourceRanges`. The chart templates `service.annotations`
+verbatim, so the annotation is guaranteed to reach the Service; relying on a
+dedicated chart field that may not exist would silently leave the NLB open.
+Enforcement needs a controller that manages NLB security groups (v2.6+).
+
+> ⚠️ **The dev NLB serves plain HTTP.** Credentials — including that default
+> admin password — cross the internet in the clear. It is IP-allowlisted, which
+> limits exposure but does not encrypt anything. Acceptable for a throwaway dev
+> stack; not acceptable for real data. See below.
+
+### Known gaps
+
+- **Allowlisted IPs drift.** The dev entries are dynamic ISP addresses. When
+  access starts hanging with no useful error, re-check with `curl ifconfig.me`
+  from the affected network and update the `/32`.
+- **The controller chart version is unpinned.** Everything else in the repo is
+  pinned; this one floats to latest on every fresh `init`. Pin it after the
+  first successful apply:
+  ```bash
+  terraform state show 'helm_release.aws_load_balancer_controller[0]' | grep '^ *version'
+  ```
+- **No TLS, no DNS, no SSO** anywhere in the stack yet.
+
+## Production exposure — what's still missing
+
+Production deliberately has **no** UI exposure configured: its tfvars omit
+`app_expose_via_nlb`, so the Service stays `ClusterIP` and the only access is
+`kubectl port-forward`. Copying dev's NLB setup would put an unencrypted login
+page on the internet, so production needs an ALB Ingress with TLS instead.
+
+The AWS Load Balancer Controller installed by `lb_controller.tf` already serves
+both NLB Services and ALB Ingresses, so it is reusable as-is. What's missing:
+
+1. **A domain and a hosted zone.** A Route 53 public hosted zone for the name
+   you'll serve (e.g. `openmetadata.example.com`). Not created by this repo.
+2. **An ACM certificate** in the cluster's region, DNS-validated against that
+   zone. `aws_acm_certificate` + `aws_acm_certificate_validation` +
+   `aws_route53_record` for the validation CNAME. Terraform must wait on
+   validation before the Ingress references the ARN.
+3. **Ingress values on the chart**, replacing dev's Service annotations —
+   `ingress.enabled`, `ingress.className: alb`, the host rule, and
+   `alb.ingress.kubernetes.io/*` annotations for `scheme: internet-facing`,
+   `target-type: ip`, `certificate-arn`, `listen-ports` (443), and an
+   HTTP→HTTPS redirect action. These go through `app_extra_helm_values`, so no
+   module change is required.
+4. **A DNS record** — an `aws_route53_record` alias to the ALB, or
+   `external-dns` in-cluster (the vendored iam v6 module has
+   `attach_external_dns_policy`, so its IRSA role is a few lines).
+5. **Authentication.** The chart's basic auth with a default admin is not
+   adequate for production. OpenMetadata supports OIDC/SAML SSO; configure it
+   through `openmetadata.config.authentication.*` and remove the default admin.
+   Alternatively front the ALB with Cognito or an OIDC authenticate action.
+6. **A tighter allowlist decision.** An ALB can use a security group or WAF
+   rather than IP ranges, which is the point at which you stop maintaining
+   `/32`s by hand.
+
+Also worth revisiting for production, unrelated to exposure:
+`enabled_cluster_log_types = []` disables EKS control-plane logging, and the
+node group is the same 2 × `t3.xlarge` as dev.
+
 ## Configuration notes
 
 - **Region** is set in three places that must agree: the `AWS_REGION` repository
@@ -193,6 +353,17 @@ Without a `-var-file` the variable defaults apply, including
   hard-coded locals rather than variables, so dev and production share them.
   Because the config is vendored, you can now change them directly instead of
   patching upstream — but the value is shared across both environments.
+- **EKS version and AMI move together.** `eks_version` must be under STANDARD
+  support (`upgrade_policy { support_type = "STANDARD" }`) or `CreateCluster`
+  fails outright; check with `aws eks describe-cluster-versions` before bumping.
+  AL2 EKS-optimized AMIs stop at 1.32, so 1.33+ requires
+  `ami_type = "AL2023_x86_64_STANDARD"`. Currently 1.36 / AL2023.
+- **Subnets carry ELB discovery tags** (`kubernetes.io/role/elb` on public,
+  `kubernetes.io/role/internal-elb` on private, plus the cluster tag). Applied
+  unconditionally — they're inert until something requests a load balancer, and
+  without them an internet-facing LB either fails to provision or lands in the
+  private subnets and is unreachable. Note the cluster and node group run in
+  **private subnets only**.
 
 ## Divergence from the upstream example
 
