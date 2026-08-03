@@ -15,6 +15,23 @@ variable "github_repo" {
   default     = "kiban"
 }
 
+variable "github_org_id" {
+  description = "Numeric org ID, required only if the org/enterprise has immutable OIDC identifiers enabled (the `sub` claim then reads org@<id>/repo@<id>). Find it with: gh api orgs/<org> --jq .id"
+  type        = string
+  default     = ""
+}
+
+variable "github_repo_id" {
+  description = "Numeric repository ID, paired with github_org_id. Find it with: gh api repos/<org>/<repo> --jq .id"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = (var.github_org_id == "") == (var.github_repo_id == "")
+    error_message = "github_org_id and github_repo_id must be set together -- the immutable subject format embeds both."
+  }
+}
+
 variable "main_branch" {
   description = "Branch that plan runs from (workflow_dispatch)."
   type        = string

@@ -37,14 +37,39 @@ data "aws_iam_openid_connect_provider" "existing" {
 locals {
   oidc_arn = var.create_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : data.aws_iam_openid_connect_provider.existing[0].arn
 
+  # Repo paths that may appear in the token's `sub` claim.
+  #
+  # Normally "<org>/<repo>". But an org or enterprise with immutable OIDC
+  # identifiers enabled emits numeric IDs instead:
+  #   repo:my-org@180184251/my-repo@1317047516:ref:refs/heads/main
+  # The IDs survive renames, so the claim can't be spoofed by re-creating a repo
+  # under a reused name. A policy written against the plain form silently fails
+  # with "Not authorized to perform sts:AssumeRoleWithWebIdentity".
+  #
+  # Set github_org_id / github_repo_id to cover that form. Both forms are then
+  # allowed, so the role keeps working whether or not the policy is active, and
+  # through the transition. Find the IDs with:
+  #   gh api orgs/<org> --jq .id
+  #   gh api repos/<org>/<repo> --jq .id
+  repo_paths = compact([
+    "${var.github_org}/${var.github_repo}",
+    (var.github_org_id != "" && var.github_repo_id != "")
+    ? "${var.github_org}@${var.github_org_id}/${var.github_repo}@${var.github_repo_id}"
+    : "",
+  ])
+
   # Which GitHub identities may assume the role. Defaults cover the contexts
   # the deploy workflow actually runs in:
   #   - plan          -> workflow_dispatch on the main branch (ref:refs/heads/<main>)
   #   - apply/destroy -> each GitHub Environment              (environment:<env>)
-  subs = length(var.subject_claims) > 0 ? var.subject_claims : concat(
-    ["repo:${var.github_org}/${var.github_repo}:ref:refs/heads/${var.main_branch}"],
-    [for e in var.environment_names : "repo:${var.github_org}/${var.github_repo}:environment:${e}"],
-  )
+  generated_subs = flatten([
+    for p in local.repo_paths : concat(
+      ["repo:${p}:ref:refs/heads/${var.main_branch}"],
+      [for e in var.environment_names : "repo:${p}:environment:${e}"],
+    )
+  ])
+
+  subs = length(var.subject_claims) > 0 ? var.subject_claims : local.generated_subs
 }
 
 # ---------------------------------------------------------------------------

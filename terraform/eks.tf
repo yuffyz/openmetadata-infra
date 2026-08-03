@@ -68,9 +68,19 @@ resource "aws_eks_node_group" "nodes" {
 
   # The CNI and kube-proxy must be present before instances boot, or they never
   # reach Ready and the node group fails with NodeCreationFailure.
+  #
+  # module.vpc is listed explicitly: subnet_ids only references
+  # module.vpc.private_subnets, which is a dependency on the aws_subnet
+  # resources alone -- NOT on the NAT gateway or the private 0.0.0.0/0 route.
+  # Without this, Terraform may launch instances while the NAT is still
+  # provisioning (1-3 minutes). Nodes in a private subnet with no egress cannot
+  # reach the EKS API or pull from ECR, so they never join, and the node group
+  # fails with the same NodeCreationFailure -- intermittently, because it is a
+  # race against NAT availability.
   depends_on = [
     aws_eks_cluster.openmetadata,
     aws_eks_addon.vpc_cni,
-    aws_eks_addon.kube_proxy
+    aws_eks_addon.kube_proxy,
+    module.vpc
   ]
 }
