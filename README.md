@@ -182,6 +182,10 @@ After a successful apply, the `update_kubeconfig` output prints the
 `environment=dev, action=destroy` to remove — no approvals, and the dev RDS
 settings let destroy complete cleanly.
 
+> With `app_expose_via_nlb = true`, delete the LoadBalancer Service **before**
+> dispatching destroy — see [Destroying](#destroying--clean-up-the-load-balancer-first).
+> Skipping it costs a 20-minute timeout and a manual cleanup.
+
 ### Locally
 
 ```bash
@@ -192,6 +196,112 @@ terraform plan -var-file=../config/dev.auto.tfvars
 
 Without a `-var-file` the variable defaults apply, including
 `region = "us-east-1"`.
+
+## Destroying — clean up the load balancer first
+
+**The NLB is not a Terraform resource.** The AWS Load Balancer Controller creates
+it by reconciling the Service annotations, so Terraform can neither delete it nor
+wait for it. Delete the Service *while the controller is still running* and it
+tidies up after itself. Destroy a broken cluster and the load balancer is
+stranded — and because its ENIs hold public IPs in the public subnets, the
+subnets and internet gateway then refuse to delete:
+
+```
+Error: deleting EC2 Internet Gateway (igw-…): DependencyViolation:
+  Network vpc-… has some mapped public address(es). Please unmap those
+  public address(es) before detaching the gateway.
+Error: deleting EC2 Subnet (subnet-…): DependencyViolation:
+  The subnet 'subnet-…' has dependencies and cannot be deleted.
+Error: context deadline exceeded
+```
+
+Those appear only after the provider's **20-minute** delete timeout expires, so
+the run wastes 20 minutes before telling you. Note the private subnets delete
+fine — only the public ones are held, which is the signature of an
+internet-facing load balancer.
+
+This only bites when `app_expose_via_nlb = true`. With the default `false` there
+is no load balancer and destroy is unremarkable.
+
+### The graceful path (cluster still healthy)
+
+Run this before dispatching `destroy`:
+
+```bash
+aws --region us-east-1 eks update-kubeconfig --name open-metadata-dev
+
+kubectl delete svc -n openmetadata openmetadata      # controller deletes the NLB
+kubectl get svc -A --field-selector spec.type=LoadBalancer   # expect none
+
+# confirm it is really gone before proceeding
+aws elbv2 describe-load-balancers --region us-east-1 \
+  --query "LoadBalancers[?VpcId=='<vpc-id>'].LoadBalancerName" --output text
+```
+
+Give the controller 30–60 seconds; the ENIs disappear a little after the load
+balancer does.
+
+### The recovery path (cluster unhealthy or already gone)
+
+If the node group never became `ACTIVE`, no controller pod ever ran, so nothing
+reconciled the deletion and the graceful path is unavailable. Clean up in AWS
+directly, then re-run `destroy` — it is idempotent and picks up where it stopped.
+
+```bash
+VPC=<vpc-id>              # from the DependencyViolation error
+R="--region us-east-1"
+
+# what is holding the subnets
+aws elbv2 describe-load-balancers $R \
+  --query "LoadBalancers[?VpcId=='$VPC'].[LoadBalancerName,Scheme,LoadBalancerArn]" --output table
+aws elb describe-load-balancers $R \
+  --query "LoadBalancerDescriptions[?VPCId=='$VPC'].LoadBalancerName" --output text
+aws ec2 describe-network-interfaces $R --filters Name=vpc-id,Values=$VPC \
+  --query 'NetworkInterfaces[].[NetworkInterfaceId,Status,SubnetId,Description,Association.PublicIp]' \
+  --output table
+
+# remove it
+aws elbv2 delete-load-balancer $R --load-balancer-arn <arn>
+aws ec2 release-address $R --allocation-id <id>              # orphaned EIPs
+aws ec2 delete-network-interface $R --network-interface-id <eni>   # only if Status=available
+
+# controller-created security groups also block VPC deletion
+aws ec2 describe-security-groups $R --filters Name=vpc-id,Values=$VPC \
+  --query 'SecurityGroups[?GroupName!=`default`].[GroupId,GroupName]' --output table
+```
+
+### Other things that strand a destroy
+
+- **Kubernetes/Helm resources in state after the cluster is gone.** The
+  `kubernetes` and `helm` providers are configured from the cluster endpoint, so
+  once it is destroyed they fail with `dial tcp 127.0.0.1:80: connect: connection
+  refused` or `Unauthorized`. Those objects died with the cluster — drop them
+  from state:
+  ```bash
+  terraform state list | grep -E '^kubernetes_|helm_release' | xargs -n1 terraform state rm
+  ```
+- **A namespace stuck `Terminating`** makes a later apply fail with
+  `unable to create new content in namespace openmetadata because it is being
+  terminated`. Check for finalizers with
+  `kubectl get ns openmetadata -o jsonpath='{.status}'`.
+- **A Helm release live in the cluster but absent from state** fails apply with
+  `cannot re-use a name that is still in use`. Either
+  `helm -n kube-system uninstall <name>` or `terraform import` it.
+- **EFS mount targets** occasionally linger and produce the same
+  `DependencyViolation` on a private subnet.
+
+### Stale state lock
+
+A killed or cancelled run can leave the S3 lock object behind, and the next run
+fails with `Error acquiring the state lock … PreconditionFailed`. The error
+prints the lock ID and the operation that took it. With no run in flight:
+
+```bash
+terraform force-unlock <lock-id>
+```
+
+Check whether the holder is actually still running first — `Operation` and
+`Created` in the error tell you.
 
 ## Accessing the UI
 
