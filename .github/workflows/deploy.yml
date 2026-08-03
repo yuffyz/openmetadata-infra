@@ -134,6 +134,12 @@ jobs:
   destroy:
     name: Destroy (${{ github.event.inputs.environment }})
     if: ${{ github.event.inputs.action == 'destroy' }}
+    # Must wait for the plan job. The plan job runs for EVERY action (including
+    # destroy, where it produces the -destroy plan), and both jobs take the same
+    # S3 state lock. Without this they start together and the loser fails with:
+    #   Error acquiring the state lock ... PreconditionFailed
+    # Waiting also means a destroy only proceeds if its plan succeeded.
+    needs: plan
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.environment }}   # same gate as apply
     steps:
