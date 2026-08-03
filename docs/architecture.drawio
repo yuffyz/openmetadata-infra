@@ -1,0 +1,236 @@
+<mxfile host="app.diagrams.net" version="24.7.17" type="device">
+  <diagram id="openmetadata-dev-arch" name="OpenMetadata dev (us-east-1)">
+    <mxGraphModel dx="1600" dy="1200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1700" pageHeight="1250" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="OpenMetadata — dev environment (terraform/ + config/dev.auto.tfvars)" style="text;html=1;fontSize=20;fontStyle=1;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="-10" width="900" height="30" as="geometry" />
+        </mxCell>
+
+        <mxCell id="region" value="AWS account 146445314234 — us-east-1" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#232F3E;strokeWidth=2;dashed=1;verticalAlign=top;align=left;spacingLeft=10;spacingTop=6;fontSize=13;fontStyle=1;fontColor=#232F3E;" vertex="1" parent="1">
+          <mxGeometry x="460" y="110" width="1120" height="1100" as="geometry" />
+        </mxCell>
+
+        <mxCell id="vpc" value="VPC  172.72.0.0/16   (single NAT, 2 AZ — azs_to_use = 2)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#147EBA;strokeWidth=2;verticalAlign=top;align=left;spacingLeft=10;spacingTop=6;fontSize=12;fontStyle=1;fontColor=#147EBA;" vertex="1" parent="1">
+          <mxGeometry x="500" y="250" width="860" height="930" as="geometry" />
+        </mxCell>
+
+        <mxCell id="subpuba" value="Public subnet  172.72.3.0/24  (az-a)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F2FCF2;strokeColor=#7AA116;verticalAlign=top;align=left;spacingLeft=8;spacingTop=4;fontSize=11;fontColor=#4C7A0B;" vertex="1" parent="1">
+          <mxGeometry x="520" y="350" width="400" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="subpubb" value="Public subnet  172.72.4.0/24  (az-b)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F2FCF2;strokeColor=#7AA116;verticalAlign=top;align=left;spacingLeft=8;spacingTop=4;fontSize=11;fontColor=#4C7A0B;" vertex="1" parent="1">
+          <mxGeometry x="940" y="350" width="400" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="subpriva" value="Private subnet  172.72.0.0/24  (az-a)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F2F8FD;strokeColor=#147EBA;verticalAlign=top;align=left;spacingLeft=8;spacingTop=4;fontSize=11;fontColor=#0D5C8C;" vertex="1" parent="1">
+          <mxGeometry x="520" y="470" width="400" height="690" as="geometry" />
+        </mxCell>
+        <mxCell id="subprivb" value="Private subnet  172.72.1.0/24  (az-b)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F2F8FD;strokeColor=#147EBA;verticalAlign=top;align=left;spacingLeft=8;spacingTop=4;fontSize=11;fontColor=#0D5C8C;" vertex="1" parent="1">
+          <mxGeometry x="940" y="470" width="400" height="690" as="geometry" />
+        </mxCell>
+
+        <mxCell id="users" value="Operators / browsers&#10;allowlisted only:&#10;73.141.150.76/32&#10;163.116.255.50/32" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="40" y="290" width="180" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="gha" value="GitHub Actions&#10;deploy.yml (plan/apply/destroy)&#10;OIDC — no static keys" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="180" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="deployrole" value="IAM deploy role&#10;trust: repo + environment&#10;PowerUser + IAMFullAccess" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7E6;strokeColor=#D79B00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="250" y="40" width="180" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="s3state" value="S3 state bucket&#10;&lt;prefix&gt;/dev/terraform.tfstate&#10;lock: use_lockfile (.tflock)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF6EC;strokeColor=#7AA116;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="40" y="150" width="180" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="r53" value="Route 53 alias A&#10;(optional — app_tls_domain_name)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#9673A6;dashed=1;fontSize=10;fontColor=#6A4C93;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="30" width="190" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="acm" value="ACM certificate&#10;(optional — DNS validated)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#9673A6;dashed=1;fontSize=10;fontColor=#6A4C93;" vertex="1" parent="1">
+          <mxGeometry x="1380" y="30" width="190" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="cp" value="EKS control plane (AWS-managed)&#10;open-metadata-dev — v1.36&#10;auth mode API • public + private endpoint&#10;service CIDR 10.100.0.0/24" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2E6;strokeColor=#D45B07;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="500" y="145" width="330" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="addons" value="EKS addons (version-managed)&#10;vpc-cni • kube-proxy • coredns&#10;aws-ebs-csi-driver • aws-efs-csi-driver" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2E6;strokeColor=#D45B07;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="860" y="145" width="300" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="igw" value="Internet gateway" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF6EC;strokeColor=#7AA116;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="520" y="285" width="130" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="nlb" value="Internet-facing NLB  :8585   (created by the LB controller, not Terraform)&#10;target-type ip → pod IPs   •   source-ranges annotation   •   TLS listener when ACM cert set" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6F0FF;strokeColor=#3A5CCC;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="680" y="280" width="660" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="nat" value="NAT gateway + EIP&#10;(single — both AZs egress here)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF6EC;strokeColor=#7AA116;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="540" y="385" width="200" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="nlbenib" value="NLB ENI" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6F0FF;strokeColor=#3A5CCC;fontSize=10;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="960" y="385" width="120" height="45" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node1" value="EKS node 1 — t3.xlarge, AL2023, 20 GB gp3" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFBF0;strokeColor=#D45B07;verticalAlign=top;align=left;spacingLeft=8;spacingTop=4;fontSize=11;fontColor=#8A3B04;" vertex="1" parent="1">
+          <mxGeometry x="540" y="505" width="360" height="255" as="geometry" />
+        </mxCell>
+        <mxCell id="omd1" value="openmetadata&#10;(Helm release)&#10;:8585" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#D45B07;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="555" y="540" width="160" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="deps1" value="openmetadata-deps&#10;Airflow (scheduler, web)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#D45B07;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="725" y="540" width="160" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="lbc" value="aws-load-balancer-controller&#10;(IRSA)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#3A5CCC;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="555" y="612" width="160" height="52" as="geometry" />
+        </mxCell>
+        <mxCell id="csi1" value="EBS / EFS CSI controllers&#10;(IRSA)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#7AA116;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="725" y="612" width="160" height="52" as="geometry" />
+        </mxCell>
+        <mxCell id="sys1" value="metrics-server (Helm) • coredns • kube-proxy • vpc-cni" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="555" y="676" width="330" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="clustersg" value="cluster security group — attached to nodes; source of all datastore ingress" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF0F0;strokeColor=#B85450;fontSize=10;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="555" y="722" width="330" height="30" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node2" value="EKS node 2 — t3.xlarge, AL2023, 20 GB gp3" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFBF0;strokeColor=#D45B07;verticalAlign=top;align=left;spacingLeft=8;spacingTop=4;fontSize=11;fontColor=#8A3B04;" vertex="1" parent="1">
+          <mxGeometry x="960" y="505" width="360" height="255" as="geometry" />
+        </mxCell>
+        <mxCell id="pods2" value="openmetadata / Airflow pods&#10;(scheduled across both nodes)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#D45B07;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="975" y="540" width="330" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="ds2" value="DaemonSets: vpc-cni • kube-proxy • CSI node plugins" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="975" y="612" width="330" height="52" as="geometry" />
+        </mxCell>
+        <mxCell id="scaling" value="node group: desired 2 / min 2 / max 3&#10;private subnets only — no public IPs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#D45B07;fontSize=10;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="975" y="676" width="330" height="76" as="geometry" />
+        </mxCell>
+
+        <mxCell id="rds1" value="RDS PostgreSQL 16 — openmetadata-dev&#10;db.t4g.small • 20 GB gp3 • single-AZ&#10;no backups • skip_final_snapshot" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E6FF;strokeColor=#6A4C93;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="540" y="790" width="360" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="rds2" value="RDS PostgreSQL 16 — airflow-dev&#10;db.t4g.micro • 20 GB gp3 • single-AZ&#10;no backups • skip_final_snapshot" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E6FF;strokeColor=#6A4C93;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="960" y="790" width="360" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="oseni1" value="OpenSearch ENI (az-a)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E6FF;strokeColor=#6A4C93;fontSize=10;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="540" y="885" width="360" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="oseni2" value="OpenSearch ENI (az-b)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E6FF;strokeColor=#6A4C93;fontSize=10;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="960" y="885" width="360" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="efsmt1" value="EFS mount targets (az-a) — dags, logs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E6FF;strokeColor=#6A4C93;fontSize=10;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="540" y="950" width="360" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="efsmt2" value="EFS mount targets (az-b) — dags, logs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E6FF;strokeColor=#6A4C93;fontSize=10;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="960" y="950" width="360" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="sgs" value="Per-service security groups (RDS ×2, OpenSearch, EFS)&#10;ingress restricted to the EKS cluster security group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF0F0;strokeColor=#B85450;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="540" y="1020" width="780" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="cpeni" value="EKS control-plane ENIs live in these private subnets (private endpoint access)" style="text;html=1;fontSize=10;align=center;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="540" y="1090" width="780" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="osdomain" value="OpenSearch domain&#10;openmetadata-dev&#10;OpenSearch 3.3&#10;2 × t3.small.search&#10;10 GB EBS each&#10;2 AZ (zone awareness)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E6FF;strokeColor=#6A4C93;strokeWidth=2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1390" y="600" width="170" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="efs" value="EFS file systems&#10;airflow-dags&#10;airflow-logs&#10;bursting throughput" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E6FF;strokeColor=#6A4C93;strokeWidth=2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1390" y="740" width="170" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="kms" value="KMS key&#10;alias/openmetadata&#10;rotation enabled" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7E6;strokeColor=#D79B00;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1390" y="270" width="170" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="oidc" value="EKS OIDC provider&#10;(IRSA trust)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7E6;strokeColor=#D79B00;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1390" y="360" width="170" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="irsa" value="IRSA roles&#10;ebs-csi&#10;efs-csi&#10;aws-load-balancer-controller" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7E6;strokeColor=#D79B00;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1390" y="440" width="170" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="slr" value="Service-linked role&#10;AWSServiceRoleFor&#10;AmazonOpenSearchService&#10;(account-wide, bootstrap/)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7E6;strokeColor=#D79B00;dashed=1;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="1390" y="870" width="170" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_users_nlb" value="HTTP(S) :8585&#10;source-range filtered" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#3A5CCC;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="users" target="nlb">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_r53_nlb" value="alias" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#9673A6;dashed=1;fontSize=10;" edge="1" parent="1" source="r53" target="nlb">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_acm_nlb" value="TLS cert on listener" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#9673A6;dashed=1;fontSize=10;" edge="1" parent="1" source="acm" target="nlb">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_nlb_omd" value="ip targets :8585" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#3A5CCC;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="nlb" target="omd1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_lbc_nlb" value="creates / reconciles" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#3A5CCC;dashed=1;fontSize=10;" edge="1" parent="1" source="lbc" target="nlb">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_omd_rds" value="5432" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6A4C93;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="omd1" target="rds1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_air_rds" value="5432" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6A4C93;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="deps1" target="rds2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_omd_os" value="443 — search index" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6A4C93;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="omd1" target="oseni1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_air_efs" value="2049 NFS — dags / logs PVCs" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6A4C93;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="deps1" target="efsmt1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_mt_efs" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6A4C93;dashed=1;" edge="1" parent="1" source="efsmt2" target="efs">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_eni_os" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6A4C93;dashed=1;" edge="1" parent="1" source="oseni2" target="osdomain">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_node_nat" value="egress: image pulls, AWS APIs" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#7AA116;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="node1" target="nat">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_nat_igw" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#7AA116;strokeWidth=2;" edge="1" parent="1" source="nat" target="igw">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_cp_node" value="kubelet ↔ API server" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#D45B07;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="cp" target="node1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_addons_cp" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#D45B07;dashed=1;" edge="1" parent="1" source="addons" target="cp">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_oidc_irsa" value="web identity" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#D79B00;fontSize=10;" edge="1" parent="1" source="oidc" target="irsa">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_irsa_lbc" value="AssumeRoleWithWebIdentity" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#D79B00;dashed=1;fontSize=10;" edge="1" parent="1" source="irsa" target="lbc">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_irsa_csi" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#D79B00;dashed=1;" edge="1" parent="1" source="irsa" target="csi1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_kms_rds" value="encryption at rest (EBS, RDS, OpenSearch, EFS)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#D79B00;dashed=1;fontSize=10;" edge="1" parent="1" source="kms" target="rds2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_slr_os" value="manages VPC ENIs" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#D79B00;dashed=1;fontSize=9;" edge="1" parent="1" source="slr" target="osdomain">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_gha_role" value="OIDC token" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#666666;fontSize=10;" edge="1" parent="1" source="gha" target="deployrole">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_role_region" value="terraform apply" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#666666;strokeWidth=2;fontSize=10;" edge="1" parent="1" source="deployrole" target="cp">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_gha_s3" value="state + lock" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#666666;fontSize=10;" edge="1" parent="1" source="gha" target="s3state">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="legend" value="Legend&#10;━━ solid = live traffic / control path&#10;┄┄ dashed = trust, encryption, or optional (not currently enabled)&#10;Purple = stateful data services   Orange = EKS / IAM   Green = network egress   Blue = load balancing&#10;Not in Terraform state: the NLB itself (owned by the LB controller) and pod-level objects created by Helm" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#666666;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="40" y="430" width="380" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="costnote" value="dev cost ≈ $15/day + ~$0.60 NLB&#10;Largest items: 2 × t3.xlarge ($7.99), EKS control plane ($2.40),&#10;OpenSearch ($1.73), NAT gateway ($1.08)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFDF0;strokeColor=#D79B00;align=left;verticalAlign=top;spacingLeft=10;spacingTop=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="40" y="580" width="380" height="80" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
