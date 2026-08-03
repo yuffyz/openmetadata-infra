@@ -36,6 +36,53 @@ inputs:
 runs:
   using: composite
   steps:
+    # Fail fast, naming the setting that is missing.
+    #
+    # Repository variables and secrets do not travel with the code, so a repo
+    # that has never been configured substitutes EMPTY STRINGS for them. That
+    # surfaces much later as something unrecognisable -- an empty
+    # -backend-config value fails init with "Invalid Value: The value cannot be
+    # empty or all whitespace", forty lines into module downloads.
+    #
+    # `required: true` on a composite action input does not help: it only
+    # requires the key to be present, and an empty value satisfies it.
+    #
+    # Values arrive via env rather than direct ${{ }} interpolation so nothing
+    # from a variable or secret is ever pasted into the shell script itself.
+    - name: Validate required settings
+      shell: bash
+      env:
+        IN_ROLE_ARN: ${{ inputs.role-arn }}
+        IN_AWS_REGION: ${{ inputs.aws-region }}
+        IN_STATE_BUCKET: ${{ inputs.state-bucket }}
+        IN_STATE_REGION: ${{ inputs.state-region }}
+        IN_STATE_KEY: ${{ inputs.state-key }}
+        IN_TF_DIR: ${{ inputs.terraform-dir }}
+      run: |
+        set -uo pipefail
+        missing=()
+        # empty, or whitespace only
+        check() { [ -n "${1//[[:space:]]/}" ] || missing+=("$2"); }
+
+        check "${IN_ROLE_ARN:-}"     "secret AWS_ROLE_ARN"
+        check "${IN_AWS_REGION:-}"   "variable AWS_REGION"
+        check "${IN_STATE_BUCKET:-}" "variable TF_STATE_BUCKET"
+        check "${IN_STATE_REGION:-}" "variable TF_STATE_REGION"
+        check "${IN_STATE_KEY:-}"    "workflow env STATE_KEY"
+        check "${IN_TF_DIR:-}"       "workflow env TF_DIR"
+
+        if [ "${#missing[@]}" -gt 0 ]; then
+          printf '::error::Missing required setting: %s\n' "${missing[@]}"
+          echo "::error::Set the above in THIS repository under Settings -> Secrets and variables -> Actions. They are per-repository and are not inherited when a repo is created, forked, or copied from another one."
+          exit 1
+        fi
+        echo "Required settings present:"
+        echo "  region       = ${IN_AWS_REGION}"
+        echo "  state bucket = ${IN_STATE_BUCKET}"
+        echo "  state region = ${IN_STATE_REGION}"
+        echo "  state key    = ${IN_STATE_KEY}"
+        echo "  terraform    = ${IN_TF_DIR}"
+
     # The Terraform project lives in this repo, so there is nothing to check out
     # and nothing to patch -- the config is already consistent with the provider
     # and module versions it pins. Only two environment-specific files are
