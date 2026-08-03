@@ -280,10 +280,33 @@ aws ec2 describe-security-groups $R --filters Name=vpc-id,Values=$VPC \
   ```bash
   terraform state list | grep -E '^kubernetes_|helm_release' | xargs -n1 terraform state rm
   ```
-- **A namespace stuck `Terminating`** makes a later apply fail with
-  `unable to create new content in namespace openmetadata because it is being
-  terminated`. Check for finalizers with
-  `kubectl get ns openmetadata -o jsonpath='{.status}'`.
+- **A namespace stuck `Terminating`.** Two ways this shows up: a later apply
+  fails with `unable to create new content in namespace openmetadata because it
+  is being terminated`, or the destroy itself hangs on
+  `kubernetes_namespace_v1.app: Still destroying...` and gives up with
+  `Error: context deadline exceeded`.
+
+  The usual cause during teardown is that **the node group is already gone while
+  the cluster remains**. Namespace termination needs controllers to release
+  finalizers on the objects inside it — with no nodes there is no CSI controller
+  to clear `kubernetes.io/pvc-protection` on the Airflow PVCs, and no pod behind
+  any admission webhook the deletion must pass through. It can never complete.
+
+  The namespace is inside the cluster you are deleting anyway, so the quickest
+  correct move is to stop tracking it and let the cluster removal take it:
+  ```bash
+  terraform state rm kubernetes_namespace_v1.app
+  ```
+  To unstick it properly instead, inspect
+  `kubectl get ns openmetadata -o jsonpath='{.status}'`, clear PVC finalizers,
+  or force-finalize via `/api/v1/namespaces/openmetadata/finalize`.
+
+  Either way, check afterwards for volumes and EFS access points that
+  Kubernetes provisioned and Terraform never knew about:
+  ```bash
+  aws ec2 describe-volumes --region us-east-1 --filters Name=status,Values=available \
+    --query 'Volumes[].[VolumeId,Size,Tags[?Key==`kubernetes.io/created-for/pvc/name`].Value|[0]]' --output table
+  ```
 - **A Helm release live in the cluster but absent from state** fails apply with
   `cannot re-use a name that is still in use`. Either
   `helm -n kube-system uninstall <name>` or `terraform import` it.
