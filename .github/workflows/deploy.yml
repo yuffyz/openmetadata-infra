@@ -131,6 +131,82 @@ jobs:
         working-directory: ${{ env.TF_DIR }}
         run: terraform output -raw update_kubeconfig
 
+      # Report where the UI is, in the job summary as well as the log.
+      #
+      # With TLS configured the URL is known at apply time. Without it, the NLB
+      # is created by the AWS Load Balancer Controller *after* Terraform
+      # returns -- the upstream helm_release sets wait = false -- so the
+      # hostname does not exist yet and has to be polled for. The controller
+      # tags the load balancer with elbv2.k8s.aws/cluster, which is how we find
+      # it without needing cluster credentials.
+      #
+      # Never fails the job: the apply already succeeded, and not knowing the
+      # hostname yet is not a deployment failure.
+      - name: Report UI URL
+        if: success()
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          set -uo pipefail
+
+          url=$(terraform output -raw app_url 2>/dev/null || true)
+          exposed=$(terraform output -raw app_expose_via_nlb 2>/dev/null || echo "false")
+          cluster=$(terraform output -raw eks_cluster_name 2>/dev/null || true)
+          ns=$(terraform output -raw app_namespace 2>/dev/null || echo "openmetadata")
+
+          if [ -z "$url" ] && [ "$exposed" = "true" ] && [ -n "$cluster" ]; then
+            echo "Waiting for the load balancer controller to provision the NLB..."
+            for _ in $(seq 1 30); do          # up to 5 minutes
+              arn=$(aws resourcegroupstaggingapi get-resources \
+                      --tag-filters "Key=elbv2.k8s.aws/cluster,Values=$cluster" \
+                      --resource-type-filters elasticloadbalancing:loadbalancer \
+                      --query 'ResourceTagMappingList[0].ResourceARN' \
+                      --output text 2>/dev/null || true)
+              if [ -n "$arn" ] && [ "$arn" != "None" ]; then
+                host=$(aws elbv2 describe-load-balancers --load-balancer-arns "$arn" \
+                        --query 'LoadBalancers[0].DNSName' --output text 2>/dev/null || true)
+                if [ -n "$host" ] && [ "$host" != "None" ]; then
+                  url="http://${host}:8585"
+                  break
+                fi
+              fi
+              sleep 10
+            done
+          fi
+
+          {
+            echo "## OpenMetadata — ${{ github.event.inputs.environment }}"
+            echo
+            if [ -n "$url" ]; then
+              echo "**UI:** $url"
+              echo
+              case "$url" in
+                http://*)
+                  echo "> Served over plain HTTP and reachable only from the allowlisted CIDRs."
+                  echo "> Change the default admin password over \`kubectl port-forward\`, not this URL."
+                  ;;
+              esac
+              echo
+              echo "Login: \`admin@open-metadata.org\` / \`admin\` — change it immediately."
+              echo
+              echo "First boot runs database migrations and builds search indexes, so"
+              echo "503s for a few minutes are normal."
+            elif [ "$exposed" = "true" ]; then
+              echo "The NLB was not ready within 5 minutes. Find it with:"
+              echo
+              echo '```bash'
+              echo "kubectl get svc -n $ns openmetadata -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
+              echo '```'
+            else
+              echo "Not published externally (\`app_expose_via_nlb = false\`). Reach it with:"
+              echo
+              echo '```bash'
+              echo "kubectl port-forward -n $ns svc/openmetadata 8585:8585   # then http://localhost:8585"
+              echo '```'
+            fi
+            echo
+            echo "**kubeconfig:** \`$(terraform output -raw update_kubeconfig)\`"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
   destroy:
     name: Destroy (${{ github.event.inputs.environment }})
     if: ${{ github.event.inputs.action == 'destroy' }}
