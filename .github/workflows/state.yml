@@ -1,0 +1,162 @@
+name: state maintenance
+
+# Manual state surgery against the remote S3 state, using the same OIDC role,
+# backend config and Terraform version as the deploy workflow. Use this instead
+# of running `terraform state ...` from a laptop or CloudShell: those need their
+# own credentials and can easily init against the wrong backend.
+#
+# `state rm` makes Terraform FORGET a resource. It deletes nothing in AWS and it
+# is not reversible -- recovering means `terraform import`. It is the right tool
+# when a resource is already gone, or when it lives inside something else that is
+# about to be destroyed (the classic case: kubernetes_namespace_v1.app, which
+# cannot finalise once the node group is gone but disappears with the cluster).
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment (selects which state file)
+        type: choice
+        options:
+          - dev
+          - production
+        default: dev
+      operation:
+        description: Operation to run
+        type: choice
+        options:
+          - list
+          - show
+          - rm
+          - force-unlock
+        default: list
+      address:
+        description: 'Resource address(es), space-separated. Required for show/rm. e.g. kubernetes_namespace_v1.app'
+        type: string
+        required: false
+      lock_id:
+        description: Lock ID from the "Error acquiring the state lock" message. Required for force-unlock.
+        type: string
+        required: false
+      confirm:
+        description: Type the environment name to confirm a state-modifying operation (rm, force-unlock)
+        type: string
+        required: false
+
+# Same group as deploy.yml, so state surgery can never run concurrently with a
+# plan/apply/destroy for the same environment.
+concurrency:
+  group: openmetadata-infra-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # required for AWS OIDC
+  contents: read
+
+env:
+  TF_DIR: terraform
+  TF_VERSION: "1.15.8"
+  BACKEND_FILE: backend.tf
+  TFVARS_FILE: config/${{ github.event.inputs.environment }}.auto.tfvars
+  STATE_KEY: ${{ vars.TF_STATE_PREFIX || 'openmetadata' }}/${{ github.event.inputs.environment }}/terraform.tfstate
+
+jobs:
+  state:
+    name: state ${{ github.event.inputs.operation }} (${{ github.event.inputs.environment }})
+    runs-on: ubuntu-latest
+    # Inherits the environment's protection rules: production requires reviewers,
+    # dev is unprotected.
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Check out infra project
+        uses: actions/checkout@v4
+
+      # Validate before touching anything, so a mistyped dispatch fails in
+      # seconds rather than after assuming a role and downloading providers.
+      - name: Validate request
+        env:
+          OP: ${{ github.event.inputs.operation }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          CONFIRM: ${{ github.event.inputs.confirm }}
+          ADDRESS: ${{ github.event.inputs.address }}
+          LOCK_ID: ${{ github.event.inputs.lock_id }}
+        run: |
+          set -uo pipefail
+
+          case "$OP" in
+            rm|force-unlock)
+              if [ "${CONFIRM:-}" != "$ENVIRONMENT" ]; then
+                echo "::error::'$OP' modifies state. Re-run with confirm set to '$ENVIRONMENT'."
+                exit 1
+              fi
+              ;;
+          esac
+
+          case "$OP" in
+            show|rm)
+              [ -n "${ADDRESS//[[:space:]]/}" ] || { echo "::error::address is required for '$OP'."; exit 1; }
+              ;;
+            force-unlock)
+              [ -n "${LOCK_ID//[[:space:]]/}" ] || { echo "::error::lock_id is required for force-unlock."; exit 1; }
+              ;;
+          esac
+
+          echo "operation   = $OP"
+          echo "environment = $ENVIRONMENT"
+          echo "address     = ${ADDRESS:-(none)}"
+
+      - name: Prepare Terraform
+        uses: ./.github/actions/prepare
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key: ${{ env.STATE_KEY }}
+          state-region: ${{ vars.TF_STATE_REGION }}
+          terraform-dir: ${{ env.TF_DIR }}
+          backend-file: ${{ env.BACKEND_FILE }}
+          tfvars-file: ${{ env.TFVARS_FILE }}
+          terraform-version: ${{ env.TF_VERSION }}
+
+      # Audit trail either side of the change. Non-fatal: with a stuck lock,
+      # force-unlock is exactly the operation you need and must not be blocked
+      # by a failing listing.
+      - name: State before
+        continue-on-error: true
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform state list
+
+      - name: Run operation
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          OP: ${{ github.event.inputs.operation }}
+          ADDRESS: ${{ github.event.inputs.address }}
+          LOCK_ID: ${{ github.event.inputs.lock_id }}
+        run: |
+          set -euo pipefail
+          # Addresses arrive via env and are split into an array, never
+          # interpolated into the script text.
+          read -ra addrs <<< "${ADDRESS:-}"
+          case "$OP" in
+            list)
+              terraform state list
+              ;;
+            show)
+              for a in "${addrs[@]}"; do
+                echo "--- $a ---"
+                terraform state show "$a"
+              done
+              ;;
+            rm)
+              terraform state rm "${addrs[@]}"
+              ;;
+            force-unlock)
+              terraform force-unlock -force "$LOCK_ID"
+              ;;
+          esac
+
+      - name: State after
+        if: always()
+        continue-on-error: true
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform state list
