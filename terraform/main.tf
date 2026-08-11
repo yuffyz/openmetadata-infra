@@ -57,6 +57,28 @@ locals {
     "service.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-nlb-target-type" = "ip"
     "service.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-scheme"          = "internet-facing"
     "service.annotations.service\\.beta\\.kubernetes\\.io/load-balancer-source-ranges"       = join("\\,", var.app_lb_allowed_cidrs)
+
+    # Cross-zone load balancing, which an NLB has OFF by default
+    # (defaultLoadBalancingCrossZoneEnabled = false in the controller's
+    # model_builder.go). The load balancer gets a node in every subnet it is
+    # given -- azs_to_use of them -- but with cross-zone off each node can only
+    # reach targets in its own AZ, and OpenMetadata is a single replica sitting
+    # in exactly one. Every other node then has no target to send to, and AWS
+    # answers DNS with all of them in rotation, so a client resolving to the
+    # wrong node gets no SYN-ACK at all: a hang, not a refusal. Which client
+    # that is changes per DNS lookup and moves when the pod reschedules, which
+    # is what "works for me, not for them" looks like from the outside.
+    #
+    # Set through the attributes annotation rather than
+    # aws-load-balancer-cross-zone-load-balancing-enabled, whose value would be
+    # "true" -- and Helm's --set typing would make that a bool, which the API
+    # server rejects the same way it rejects a numeric annotation. The
+    # key=value form cannot be parsed as anything but a string. It stays a
+    # single pair for a reason: the controller splits this annotation on
+    # commas, so a second attribute needs the \\, escaping used above.
+    #
+    # Cross-AZ traffic is billed on an NLB. At this scale it is cents.
+    "service.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-attributes" = "load_balancing.cross_zone.enabled=true"
   } : {}
 
   # TLS terminates on the NLB listener for the chart's service port. Switching

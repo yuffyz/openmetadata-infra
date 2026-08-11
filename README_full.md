@@ -369,6 +369,15 @@ returns when the Helm release succeeds (the module sets `wait = false`), but the
 controller still has to provision the NLB and pass health checks, so the
 hostname is briefly empty and then briefly unresolvable.
 
+Cross-zone load balancing is switched on explicitly
+(`load_balancing.cross_zone.enabled=true`). An NLB has it **off** by default and
+gets one node per subnet, so with a single OpenMetadata replica every node
+outside the pod's AZ has nothing to forward to. Clients that resolve to one of
+those nodes hang with no SYN-ACK, and which clients those are changes with each
+DNS lookup and each time the pod reschedules — the failure reads as "the UI
+works for some people and not others". Cross-AZ traffic is billed, which at one
+replica is cents.
+
 The hostname is also readable without cluster access, which is often quicker:
 
 ```bash
