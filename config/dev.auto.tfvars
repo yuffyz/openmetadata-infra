@@ -17,8 +17,16 @@ app_version      = "1.12.13"
 
 # --- OpenMetadata UI exposure ----------------------------------------------
 # Published on an internet-facing NLB, reachable only from the CIDRs below.
-# The UI is plain HTTP with a default admin account, so Terraform refuses both
-# 0.0.0.0/0 and an empty list -- keep this list tight.
+# This creates a second Service, openmetadata-public, which owns the NLB; the
+# chart's own Service stays ClusterIP on 8585 for in-cluster traffic.
+#
+# The address that arrives at the NLB is whatever the client egresses from. A
+# coworker behind a corporate proxy (Netskope, Zscaler) arrives as the proxy,
+# from a large rotating pool -- allowlist the vendor's published ranges rather
+# than one /32 per complaint.
+#
+# Without TLS the UI is plain HTTP on 8585 with a default admin account, so
+# Terraform refuses both 0.0.0.0/0 and an empty list -- keep this list tight.
 #
 # Adds roughly $0.55-0.70/day for the NLB, plus LCUs.
 #
@@ -42,8 +50,10 @@ app_lb_allowed_cidrs = [
 # a domain you control -- ACM proves ownership by publishing a validation record
 # into it, so a zone for a domain you don't own can never validate.
 #
-# Enabling this keeps the existing NLB -- the controller just adds a TLS
-# listener to it -- so the raw *.elb.amazonaws.com hostname stays valid.
+# Enabling this adds a 443 listener, so the URL is https://<domain> with no
+# port. 8585 keeps working alongside it. 443 matters for anyone behind a
+# corporate proxy: those forward 443 and 80, and typically will not proxy a
+# non-standard port at all -- the connection just hangs.
 # app_tls_domain_name       = "openmetadata.example.com"
 # app_tls_route53_zone_name = "example.com"
 

@@ -158,6 +158,7 @@ jobs:
             for _ in $(seq 1 30); do          # up to 5 minutes
               arn=$(aws resourcegroupstaggingapi get-resources \
                       --tag-filters "Key=elbv2.k8s.aws/cluster,Values=$cluster" \
+                                    "Key=service.k8s.aws/stack,Values=$ns/openmetadata-public" \
                       --resource-type-filters elasticloadbalancing:loadbalancer \
                       --query 'ResourceTagMappingList[0].ResourceARN' \
                       --output text 2>/dev/null || true)
@@ -194,7 +195,7 @@ jobs:
               echo "The NLB was not ready within 5 minutes. Find it with:"
               echo
               echo '```bash'
-              echo "kubectl get svc -n $ns openmetadata -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
+              echo "kubectl get svc -n $ns openmetadata-public -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
               echo '```'
             else
               echo "Not published externally (\`app_expose_via_nlb = false\`). Reach it with:"

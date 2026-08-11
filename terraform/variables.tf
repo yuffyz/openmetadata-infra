@@ -175,12 +175,16 @@ variable "app_lb_allowed_cidrs" {
     error_message = "0.0.0.0/0 is not accepted. OpenMetadata is served over plain HTTP here; put an ALB with an ACM certificate in front before exposing it to the internet at large."
   }
 
-  # Kubernetes requires CIDR notation on the source-ranges annotation, and it
-  # only finds out at Service-patch time -- i.e. part-way through `apply`, after
-  # other resources have already changed:
-  #   Service "openmetadata" is invalid: metadata.annotations[...source-ranges]:
-  #   Invalid value: "13.223.252.86": must be a valid CIDR value
+  # These become spec.loadBalancerSourceRanges, which Kubernetes requires in
+  # CIDR notation and only validates when the Service is written -- i.e.
+  # part-way through `apply`, after other resources have already changed:
+  #   Service "openmetadata-public" is invalid:
+  #   spec.loadBalancerSourceRanges: Invalid value: "13.223.252.86":
+  #   must be a valid CIDR value
   # A bare address is the easy mistake; append /32 for a single host.
+  #
+  # For a client behind a forward proxy the address that arrives here is the
+  # proxy's egress, not their workstation -- see the note in nlb_service.tf.
   validation {
     condition     = alltrue([for c in var.app_lb_allowed_cidrs : can(cidrhost(c, 0))])
     error_message = "Every entry in app_lb_allowed_cidrs must be CIDR notation, not a bare address: use \"203.0.113.4/32\" for a single host, \"203.0.113.0/24\" for a range."
@@ -188,7 +192,7 @@ variable "app_lb_allowed_cidrs" {
 }
 
 variable "app_tls_domain_name" {
-  description = "FQDN to serve the OpenMetadata UI over HTTPS, e.g. openmetadata.example.com. Empty leaves the NLB on plain HTTP. Requires app_expose_via_nlb."
+  description = "FQDN to serve the OpenMetadata UI over HTTPS on 443, e.g. openmetadata.example.com. Empty leaves the NLB on plain HTTP on 8585. Requires app_expose_via_nlb."
   type        = string
   default     = ""
 
@@ -216,7 +220,7 @@ variable "lb_controller_chart_version" {
 }
 
 variable "app_extra_helm_values" {
-  description = "Additional Helm set-overrides for the OpenMetadata chart, merged on top of the NLB values."
+  description = "Additional Helm set-overrides for the OpenMetadata chart. Values reach Helm as --set, which types an all-digit or true/false value as a number or bool; anything that must stay a string needs a non-numeric form."
   type        = map(string)
   default     = {}
 }

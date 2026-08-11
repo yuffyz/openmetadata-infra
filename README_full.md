@@ -357,17 +357,30 @@ works from anywhere.
 ### dev — internet-facing NLB
 
 `dev.auto.tfvars` sets `app_expose_via_nlb = true`, which installs the AWS Load
-Balancer Controller and turns the chart's Service into a `LoadBalancer`:
+Balancer Controller and creates a second Service, `openmetadata-public`, of type
+`LoadBalancer` (`terraform/nlb_service.tf`):
 
 ```bash
-kubectl get svc -n openmetadata openmetadata \
+kubectl get svc -n openmetadata openmetadata-public \
   -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
 ```
 
-Then `http://<hostname>:8585`. Allow a couple of minutes after apply — Terraform
-returns when the Helm release succeeds (the module sets `wait = false`), but the
-controller still has to provision the NLB and pass health checks, so the
-hostname is briefly empty and then briefly unresolvable.
+Then `http://<hostname>:8585` without TLS, or `https://<domain>` with it. Either
+way the pods are reached on 8585.
+
+The chart's own Service is left as `ClusterIP` on 8585 and is not touched. An
+NLB listener port always equals the Service port, so serving 443 by moving the
+chart's Service would also move the cluster-internal address — and that address
+is baked into things that outlive an apply: the module hardcodes
+`metadataApiEndpoint: http://openmetadata.<ns>.svc:8585/api`, and every
+ingestion pipeline already deployed carries the host:port it was created with,
+inside its Airflow DAG configuration. Owning a separate Service decouples the
+public listener from all of that.
+
+Allow a couple of minutes after apply — Terraform returns when the Helm release
+succeeds (the module sets `wait = false`), and the Service resource then blocks
+until the controller reports a hostname, which is briefly unresolvable
+afterwards.
 
 Cross-zone load balancing is switched on explicitly
 (`load_balancing.cross_zone.enabled=true`). An NLB has it **off** by default and
@@ -404,55 +417,42 @@ app_tls_domain_name       = "openmetadata.example.com"
 app_tls_route53_zone_name = "example.com"
 ```
 
-The URL becomes `https://openmetadata.example.com:8585`. What Terraform creates
-(`terraform/nlb_tls.tf`), all conditional on those variables:
+The URL becomes `https://openmetadata.example.com` — with a certificate
+attached, `openmetadata-public` listens on 443 as well as 8585. What Terraform
+creates (`terraform/nlb_tls.tf`), all conditional on those variables:
 
 | Resource | Purpose |
 |---|---|
 | `aws_acm_certificate` | DNS-validated cert for the FQDN |
 | `aws_route53_record.app_cert_validation` | Validation CNAMEs, `allow_overwrite` for cert rotation |
 | `aws_acm_certificate_validation` | Blocks until ACM reports ISSUED |
-| `time_sleep.wait_for_nlb` | 240s for the controller to provision the NLB |
 | `data.aws_lb` | Reads the NLB back by the controller's resource tags |
 | `aws_route53_record.app` | Alias A record → NLB |
 
-The certificate reaches the chart as the
-`service.beta.kubernetes.io/aws-load-balancer-ssl-cert` annotation, paired with
-`ssl-ports: "http"`. It references the **validation** resource, not the
-certificate, so the Service is never created with an unissued ARN.
-
-`ssl-ports` names the Service port rather than numbering it (`http` is the
-chart's name for 8585). The controller accepts either, but these annotations
-reach the chart through the upstream module's `set = [...]` with the helm
-provider's default `auto` typing, and Helm parses an all-digit value into an
-integer — which the API server rejects, since annotation values must be
-strings (`cannot unmarshal number into Go struct field
-ObjectMeta.metadata.annotations of type string`). Leaving `ssl-ports` off
-entirely is not the same thing: with a certificate and no port list, *every*
-Service port gets a TLS listener, including the chart's 8586 admin port.
+The certificate reaches the NLB as the
+`service.beta.kubernetes.io/aws-load-balancer-ssl-cert` annotation on
+`openmetadata-public`, paired with `ssl-ports` listing the Service's port names
+(the controller matches either a name or a number). It references the
+**validation** resource, not the certificate, so the Service never carries an
+unissued ARN.
 
 Three things to know before enabling it:
 
-- **The NLB is kept, not replaced.** The controller adds a TLS listener to the
-  existing load balancer, so the `*.elb.amazonaws.com` hostname keeps working
-  and there is no outage. The `aws-load-balancer-name` annotation
-  (`<cluster>-omd`) applies only when the NLB is first provisioned — ELBv2 has
-  no rename API and the controller replaces an LB only on a type or scheme
-  change — so an NLB created before TLS was switched on keeps its generated
-  `k8s-*` name. That is why `data.aws_lb` matches on the controller's tags
-  (`service.k8s.aws/stack`, `service.k8s.aws/resource`, `elbv2.k8s.aws/cluster`)
-  instead of the name.
-- **The port stays 8585**, so the URL is `https://<domain>:8585`, not 443. The
-  NLB listener mirrors the chart's Service port. Moving to 443 means setting
-  `app_extra_helm_values = { "service.port" = "443" }` — verify afterwards that
-  `kubectl get svc -n openmetadata openmetadata -o yaml` still shows
-  `targetPort: 8585`, since how this chart templates `targetPort` isn't
-  guaranteed.
-- **The first apply may need a re-run.** Because `wait = false`, Terraform can
-  reach the `data.aws_lb` lookup before the controller has finished. The 240s
-  sleep usually covers it; if not, apply fails with *reading ELBv2 Load
-  Balancers: couldn't find resource* and re-running completes it. Nothing is
-  left half-built.
+- **443 is what makes this usable from a corporate network.** Clients behind a
+  forward proxy — Netskope, Zscaler — reach the origin through the proxy, and
+  those proxies steer 443 and 80 only. A non-standard port is typically not
+  proxied at all, so the request hangs with no error rather than failing fast.
+  Such a client also arrives from the *proxy's* egress address, so
+  `app_lb_allowed_cidrs` has to hold the vendor's published ranges, and the
+  certificate the user's browser validates is the proxy's, not this one.
+- **Only the listeners differ.** `targetPort` stays the pod's `http` port, so
+  targets, health checks, and the backend security group rules the controller
+  manages are all still on 8585 — as is the chart's own ClusterIP Service,
+  which is what the cluster talks to.
+- **Failures surface on the Service, not the lookup.** `kubernetes_service_v1`
+  waits up to 10 minutes for the controller to report a hostname and prints the
+  Service's warning events if it doesn't, so a controller problem reads as a
+  controller problem instead of a missing load balancer later on.
 
 The hosted zone must already exist and be **public** — this repo does not create
 it, and DNS validation needs it to be authoritative for the domain.
@@ -527,9 +527,10 @@ Production deliberately has **no** UI exposure configured: its tfvars omit
 — they are per-environment — and for an internal tool behind a tight allowlist
 that may be enough. What it still doesn't give you:
 
-1. **Standard ports.** The NLB listener mirrors the chart's Service port, so the
-   URL carries `:8585`. An ALB Ingress serves 443 with an HTTP→HTTPS redirect and
-   no port in the URL.
+1. **HTTP→HTTPS redirect.** The NLB serves 443, but it cannot redirect plain
+   HTTP to HTTPS — port 80 is not served at all, so a user who types the bare
+   hostname gets a connection refused. An ALB Ingress does the redirect in a
+   listener rule.
 2. **Authentication.** The chart's default is a single `admin` account with a
    well-known password. This is the significant gap — TLS protects the transport,
    not the auth model. OpenMetadata supports OIDC/SAML via

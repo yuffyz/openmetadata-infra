@@ -18,11 +18,5 @@ terraform {
       source  = "hashicorp/tls"
       version = "~> 4.0"
     }
-    # Used to let the AWS Load Balancer Controller finish provisioning the NLB
-    # before Terraform reads it back for the Route 53 alias (see nlb_tls.tf).
-    time = {
-      source  = "hashicorp/time"
-      version = "~> 0.13"
-    }
   }
 }

@@ -139,7 +139,7 @@ The apply job prints the URL in its run summary. To find it yourself:
 
 ```bash
 # via the cluster
-kubectl get svc -n openmetadata openmetadata \
+kubectl get svc -n openmetadata openmetadata-public \
   -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
 
 # or straight from AWS, no cluster access needed
@@ -147,9 +147,10 @@ aws elbv2 describe-load-balancers --region us-east-1 \
   --query "LoadBalancers[?Type=='network'&&Scheme=='internet-facing'].DNSName" --output text
 ```
 
-Then `http://<hostname>:8585` — port **8585**, and `http` not `https` unless TLS
-is configured. Allow a couple of minutes after apply: the controller has to
-provision the NLB and pass health checks.
+Then `http://<hostname>:8585` — plain HTTP on **8585** without TLS. With TLS
+configured the UI is also on **443**, so the URL is just `https://<domain>`.
+Allow a couple of minutes after apply: the controller has to provision the NLB
+and pass health checks.
 
 Login is `admin@open-metadata.org` / `admin`. **Change it over `port-forward`,
 not over the NLB** — until TLS is configured that password crosses the internet
@@ -172,8 +173,9 @@ app_tls_route53_zone_name = "example.com"
 ```
 
 Requires an existing **public** Route 53 hosted zone for a domain you control.
-The URL becomes `https://openmetadata.example.com:8585`. The NLB is kept, not
-replaced — the controller adds a TLS listener to it. Details and caveats in
+The URL becomes `https://openmetadata.example.com` — 443, no port. 8585 keeps
+working. Users behind a corporate proxy need the 443 URL: those proxies do not
+forward non-standard ports. Details and caveats in
 [README_full.md](README_full.md#dev--https-on-the-nlb).
 
 ## Airflow and connecting data sources
@@ -306,9 +308,9 @@ Production deliberately has **no** UI exposure configured: its tfvars omit
 — they are per-environment — and for an internal tool behind a tight allowlist
 that may be enough. What it still doesn't give you:
 
-1. **Standard ports.** The NLB listener mirrors the chart's Service port, so the
-   URL carries `:8585`. An ALB Ingress serves 443 with an HTTP→HTTPS redirect and
-   no port in the URL.
+1. **HTTP→HTTPS redirect.** The NLB serves 443, but it cannot redirect plain
+   HTTP to HTTPS — port 80 is not served at all. An ALB Ingress does that in a
+   listener rule.
 2. **Authentication.** The chart's default is a single `admin` account with a
    well-known password. This is the significant gap — TLS protects the transport,
    not the auth model. OpenMetadata supports OIDC/SAML via
