@@ -43,8 +43,11 @@ module "app" {
 locals {
   app_tls_enabled = var.app_expose_via_nlb && var.app_tls_domain_name != ""
 
-  # Deterministic NLB name so Terraform can read the load balancer back and
-  # point Route 53 at it (see nlb_tls.tf). 32 chars is the AWS limit.
+  # Recognizable NLB name in the console. Only applied when the controller
+  # first provisions the load balancer -- an NLB that already exists keeps its
+  # generated k8s-* name, so nothing may depend on this being the actual name
+  # (nlb_tls.tf finds the NLB by tag for exactly that reason). 32 chars is the
+  # AWS limit.
   app_nlb_name = substr("${var.eks_cluster_name}-omd", 0, 32)
 
   nlb_helm_values = var.app_expose_via_nlb ? {
@@ -56,10 +59,9 @@ locals {
     "service.annotations.service\\.beta\\.kubernetes\\.io/load-balancer-source-ranges"       = join("\\,", var.app_lb_allowed_cidrs)
   } : {}
 
-  # TLS terminates on the NLB listener for the chart's service port. The name
-  # annotation is only set here because renaming an existing NLB forces the
-  # controller to replace it -- enabling TLS therefore changes the hostname,
-  # which is fine since DNS is what's used from then on.
+  # TLS terminates on the NLB listener for the chart's service port. Switching
+  # this on does not replace the NLB: the controller adds a TLS listener to the
+  # existing one, so the *.elb.amazonaws.com hostname survives.
   #
   # ssl-ports names the port ("http", the chart's 8585 UI port) instead of the
   # number. These values reach the chart through the upstream module's
