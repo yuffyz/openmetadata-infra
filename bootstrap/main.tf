@@ -152,6 +152,43 @@ resource "aws_iam_service_linked_role" "opensearch" {
 }
 
 # ---------------------------------------------------------------------------
+# Stable NAT egress addresses (optional)
+#
+# Everything in the cluster runs in private subnets, so all outbound traffic --
+# including metadata ingestion -- is source-NAT'd through the environment's NAT
+# gateway. External systems that allowlist by IP (Snowflake network policies,
+# partner firewalls, on-prem ACLs) see that NAT gateway's Elastic IP.
+#
+# By default the VPC module allocates that EIP itself, which means it is
+# destroyed along with the environment and a NEW address appears on the next
+# apply. Anything that allowlisted the old one then fails, typically with an
+# unhelpful connection timeout.
+#
+# Allocating the EIPs here instead keeps them stable across teardown cycles:
+# bootstrap is applied once and is not part of the dev destroy loop. The
+# environment stack finds its EIP by Name tag (see terraform/vpc.tf) and hands
+# it to the VPC module via reuse_nat_ips.
+#
+# They are deliberately NOT in the environment stack with prevent_destroy --
+# that would make `terraform destroy` fail outright and break the dev loop.
+#
+# Cost: AWS bills every public IPv4 address (~$0.12/day each), whether attached
+# or not, so a held EIP costs that much while the environment is torn down.
+# Off by default for that reason.
+# ---------------------------------------------------------------------------
+resource "aws_eip" "nat" {
+  for_each = var.create_nat_eips ? toset(var.environment_names) : toset([])
+
+  domain = "vpc"
+
+  tags = {
+    Name        = "${var.nat_eip_name_prefix}-${each.key}-nat"
+    Environment = each.key
+    ManagedBy   = "openmetadata-infra/bootstrap"
+  }
+}
+
+# ---------------------------------------------------------------------------
 # IAM role with a trust policy scoped to this repo
 # ---------------------------------------------------------------------------
 data "aws_iam_policy_document" "trust" {

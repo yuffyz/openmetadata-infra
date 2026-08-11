@@ -1,5 +1,21 @@
 # VPC module
 
+# Optional pre-allocated NAT egress address, owned by bootstrap/ so it survives
+# this environment's destroy/apply cycles. Without it the VPC module allocates a
+# fresh EIP each apply, and anything that allowlisted the previous address --
+# a Snowflake network policy, a partner firewall -- starts timing out.
+#
+# Fails with "no matching EC2 EIP found" if the name is set but bootstrap has
+# not been applied with create_nat_eips = true.
+data "aws_eip" "nat" {
+  count = var.stable_nat_eip_name != "" ? 1 : 0
+
+  filter {
+    name   = "tag:Name"
+    values = [var.stable_nat_eip_name]
+  }
+}
+
 locals {
   vpc_id          = module.vpc.vpc_id
   subnet_ids      = module.vpc.private_subnets
@@ -24,6 +40,11 @@ module "vpc" {
   enable_nat_gateway   = true
   single_nat_gateway   = true
   enable_dhcp_options  = true
+
+  # Empty stable_nat_eip_name keeps the previous behaviour: the module allocates
+  # and owns the EIP, and it changes on every rebuild.
+  reuse_nat_ips       = var.stable_nat_eip_name != ""
+  external_nat_ip_ids = var.stable_nat_eip_name != "" ? [data.aws_eip.nat[0].id] : []
 
   # Subnet discovery tags for the AWS Load Balancer Controller. Without
   # kubernetes.io/role/elb on the public subnets an internet-facing load

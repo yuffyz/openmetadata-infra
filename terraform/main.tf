@@ -60,10 +60,25 @@ locals {
   # annotation is only set here because renaming an existing NLB forces the
   # controller to replace it -- enabling TLS therefore changes the hostname,
   # which is fine since DNS is what's used from then on.
+  #
+  # ssl-ports names the port ("http", the chart's 8585 UI port) instead of the
+  # number. These values reach the chart through the upstream module's
+  # `set = [for k, v in var.extra_helm_values : {name = k, value = v}]`, which
+  # leaves the helm provider on its default "auto" typing -- and Helm's strvals
+  # parser turns an all-digit value into an int64. A numeric annotation is
+  # rejected by the API server, so the port number fails the upgrade with:
+  #   json: cannot unmarshal number into Go struct field
+  #   ObjectMeta.metadata.annotations of type string
+  # The AWS Load Balancer Controller matches this annotation against either the
+  # port name or the port number (model_build_listener.go: buildListenerProtocol
+  # / validateTLSPortsSet), so the name is equivalent and stays a string.
+  # Leaving it unset is NOT equivalent: with no ssl-ports, every port with a
+  # certificate gets a TLS listener, which would include the chart's 8586
+  # admin port.
   tls_helm_values = local.app_tls_enabled ? {
     "service.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-name"      = local.app_nlb_name
     "service.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-ssl-cert"  = aws_acm_certificate_validation.app[0].certificate_arn
-    "service.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-ssl-ports" = "8585"
+    "service.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-ssl-ports" = "http"
   } : {}
 
   app_helm_values = merge(local.nlb_helm_values, local.tls_helm_values, var.app_extra_helm_values)

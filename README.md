@@ -246,7 +246,20 @@ Ingestion runs from **pods on nodes in the private subnets**, so "can I reach it
 from my laptop" is the wrong test. What matters:
 
 - **Internet sources** (Snowflake, BigQuery, SaaS APIs) — reachable via the
-  single NAT gateway. Works with no extra setup.
+  single NAT gateway, with no extra setup **unless the source allowlists by IP**.
+  What it sees is the NAT gateway's address, not your workstation:
+  ```bash
+  terraform output nat_egress_ip
+  # or, without Terraform:
+  aws ec2 describe-nat-gateways --region us-east-1 --filter Name=state,Values=available \
+    --query 'NatGateways[].NatGatewayAddresses[].PublicIp' --output text
+  ```
+  By default that address is **reallocated on every destroy/apply**, so an
+  allowlist entry goes stale on the next rebuild — a Snowflake network policy
+  reports this as `250001: Could not connect to Snowflake backend`, which reads
+  like a network fault rather than an allowlist miss. For a fixed address, apply
+  `bootstrap/` with `create_nat_eips = true` and set `stable_nat_eip_name` in the
+  environment's tfvars.
 - **In-VPC sources** (RDS, Redshift, MSK, OpenSearch) — the source's security
   group must allow ingress **from the EKS cluster security group**. This is the
   same pattern the stack uses for its own RDS and OpenSearch, and the same thing

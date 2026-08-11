@@ -47,6 +47,18 @@ app_lb_allowed_cidrs = [
 # app_tls_domain_name       = "openmetadata.example.com"
 # app_tls_route53_zone_name = "example.com"
 
+# Stable outbound address. Everything runs in private subnets, so external
+# systems see the NAT gateway's IP -- and by default that IP is reallocated on
+# every destroy/apply, silently breaking anything that allowlisted the old one
+# (a Snowflake network policy shows this as a connection timeout, not an auth
+# error).
+#
+# Apply bootstrap/ with create_nat_eips = true first, then uncomment. Switching
+# this on or off REPLACES the NAT gateway, so egress drops for a minute and the
+# address changes once, at the point of the switch.
+#
+# stable_nat_eip_name = "openmetadata-dev-nat"
+
 # --- OpenMetadata database (teardown-safe) ---------------------------------
 db = {
   provisioner = "aws"
