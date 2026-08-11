@@ -12,3 +12,8 @@ output "allowed_subjects" {
   description = "GitHub token 'sub' claims permitted to assume the role."
   value       = local.subs
 }
+
+output "nat_egress_ips" {
+  description = "Stable outbound address per environment. These are what external systems see and must allowlist (Snowflake network policies, partner firewalls). Empty unless create_nat_eips is true."
+  value       = { for env, eip in aws_eip.nat : env => eip.public_ip }
+}

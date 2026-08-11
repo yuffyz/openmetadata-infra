@@ -69,6 +69,12 @@ variable "app_version" {
   default     = "1.12.13"
 }
 
+variable "stable_nat_eip_name" {
+  description = "Name tag of a pre-allocated Elastic IP to use for the NAT gateway, e.g. \"openmetadata-dev-nat\", created by bootstrap/ with create_nat_eips = true. Gives the environment a fixed outbound address that survives destroy/apply, so it can be allowlisted in external systems such as a Snowflake network policy. Empty lets the VPC module allocate a fresh EIP on every apply."
+  type        = string
+  default     = ""
+}
+
 variable "azs_to_use" {
   description = "Availability zones to use in selected region"
   type        = number
@@ -167,6 +173,17 @@ variable "app_lb_allowed_cidrs" {
   validation {
     condition     = !contains(var.app_lb_allowed_cidrs, "0.0.0.0/0")
     error_message = "0.0.0.0/0 is not accepted. OpenMetadata is served over plain HTTP here; put an ALB with an ACM certificate in front before exposing it to the internet at large."
+  }
+
+  # Kubernetes requires CIDR notation on the source-ranges annotation, and it
+  # only finds out at Service-patch time -- i.e. part-way through `apply`, after
+  # other resources have already changed:
+  #   Service "openmetadata" is invalid: metadata.annotations[...source-ranges]:
+  #   Invalid value: "13.223.252.86": must be a valid CIDR value
+  # A bare address is the easy mistake; append /32 for a single host.
+  validation {
+    condition     = alltrue([for c in var.app_lb_allowed_cidrs : can(cidrhost(c, 0))])
+    error_message = "Every entry in app_lb_allowed_cidrs must be CIDR notation, not a bare address: use \"203.0.113.4/32\" for a single host, \"203.0.113.0/24\" for a range."
   }
 }
 

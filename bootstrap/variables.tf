@@ -83,6 +83,18 @@ variable "create_opensearch_service_linked_role" {
   default     = true
 }
 
+variable "create_nat_eips" {
+  description = "Allocate a stable Elastic IP per environment for that environment's NAT gateway, so outbound traffic keeps the same address across destroy/apply cycles and can be allowlisted externally (e.g. a Snowflake network policy). One EIP is created per entry in environment_names. Costs ~$0.12/day each even while unattached."
+  type        = bool
+  default     = false
+}
+
+variable "nat_eip_name_prefix" {
+  description = "Name-tag prefix for the NAT EIPs. The environment stack looks its EIP up as \"<prefix>-<environment>-nat\", so this must match stable_nat_eip_name_prefix in the environment stack."
+  type        = string
+  default     = "openmetadata"
+}
+
 variable "create_state_bucket" {
   description = "Create the state S3 bucket named by state_bucket. Leave false if it already exists (Terraform would fail on a bucket it doesn't own)."
   type        = bool

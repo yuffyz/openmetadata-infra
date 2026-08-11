@@ -35,6 +35,11 @@ output "app_namespace" {
   value       = local.namespace
 }
 
+output "nat_egress_ip" {
+  description = "Outbound address every pod egresses from. This is what external systems see and must allowlist (Snowflake network policies, partner firewalls). Stable across rebuilds only when stable_nat_eip_name is set."
+  value       = try(one(module.vpc.nat_public_ips), null)
+}
+
 output "eks_cluster_name" {
   description = "EKS cluster name. Used to find the controller-created load balancer by its elbv2.k8s.aws/cluster tag."
   value       = local.eks_cluster_name
