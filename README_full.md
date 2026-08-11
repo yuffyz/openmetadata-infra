@@ -404,20 +404,35 @@ The URL becomes `https://openmetadata.example.com:8585`. What Terraform creates
 | `aws_route53_record.app_cert_validation` | Validation CNAMEs, `allow_overwrite` for cert rotation |
 | `aws_acm_certificate_validation` | Blocks until ACM reports ISSUED |
 | `time_sleep.wait_for_nlb` | 240s for the controller to provision the NLB |
-| `data.aws_lb` | Reads the NLB back by its pinned name |
+| `data.aws_lb` | Reads the NLB back by the controller's resource tags |
 | `aws_route53_record.app` | Alias A record → NLB |
 
 The certificate reaches the chart as the
 `service.beta.kubernetes.io/aws-load-balancer-ssl-cert` annotation, paired with
-`ssl-ports: "8585"`. It references the **validation** resource, not the
+`ssl-ports: "http"`. It references the **validation** resource, not the
 certificate, so the Service is never created with an unissued ARN.
+
+`ssl-ports` names the Service port rather than numbering it (`http` is the
+chart's name for 8585). The controller accepts either, but these annotations
+reach the chart through the upstream module's `set = [...]` with the helm
+provider's default `auto` typing, and Helm parses an all-digit value into an
+integer — which the API server rejects, since annotation values must be
+strings (`cannot unmarshal number into Go struct field
+ObjectMeta.metadata.annotations of type string`). Leaving `ssl-ports` off
+entirely is not the same thing: with a certificate and no port list, *every*
+Service port gets a TLS listener, including the chart's 8586 admin port.
 
 Three things to know before enabling it:
 
-- **The NLB is replaced.** TLS pins the load balancer to a deterministic name
-  (`<cluster>-omd`) so Terraform can find it, and renaming makes the controller
-  recreate it. The old `*.elb.amazonaws.com` hostname stops working — fine, since
-  the domain is what you use afterwards, but it is a brief outage.
+- **The NLB is kept, not replaced.** The controller adds a TLS listener to the
+  existing load balancer, so the `*.elb.amazonaws.com` hostname keeps working
+  and there is no outage. The `aws-load-balancer-name` annotation
+  (`<cluster>-omd`) applies only when the NLB is first provisioned — ELBv2 has
+  no rename API and the controller replaces an LB only on a type or scheme
+  change — so an NLB created before TLS was switched on keeps its generated
+  `k8s-*` name. That is why `data.aws_lb` matches on the controller's tags
+  (`service.k8s.aws/stack`, `service.k8s.aws/resource`, `elbv2.k8s.aws/cluster`)
+  instead of the name.
 - **The port stays 8585**, so the URL is `https://<domain>:8585`, not 443. The
   NLB listener mirrors the chart's Service port. Moving to 443 means setting
   `app_extra_helm_values = { "service.port" = "443" }` — verify afterwards that
@@ -426,8 +441,9 @@ Three things to know before enabling it:
   guaranteed.
 - **The first apply may need a re-run.** Because `wait = false`, Terraform can
   reach the `data.aws_lb` lookup before the controller has finished. The 240s
-  sleep usually covers it; if not, apply fails with *no matching LB found* and
-  re-running completes it. Nothing is left half-built.
+  sleep usually covers it; if not, apply fails with *reading ELBv2 Load
+  Balancers: couldn't find resource* and re-running completes it. Nothing is
+  left half-built.
 
 The hosted zone must already exist and be **public** — this repo does not create
 it, and DNS validation needs it to be authoritative for the domain.

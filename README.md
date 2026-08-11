@@ -172,8 +172,8 @@ app_tls_route53_zone_name = "example.com"
 ```
 
 Requires an existing **public** Route 53 hosted zone for a domain you control.
-The URL becomes `https://openmetadata.example.com:8585`. Enabling it replaces the
-NLB, so the raw `*.elb.amazonaws.com` hostname changes. Details and caveats in
+The URL becomes `https://openmetadata.example.com:8585`. The NLB is kept, not
+replaced — the controller adds a TLS listener to it. Details and caveats in
 [README_full.md](README_full.md#dev--https-on-the-nlb).
 
 ## Airflow and connecting data sources

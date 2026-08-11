@@ -42,8 +42,8 @@ app_lb_allowed_cidrs = [
 # a domain you control -- ACM proves ownership by publishing a validation record
 # into it, so a zone for a domain you don't own can never validate.
 #
-# Enabling this replaces the NLB, so the raw *.elb.amazonaws.com hostname
-# changes; use the domain from then on.
+# Enabling this keeps the existing NLB -- the controller just adds a TLS
+# listener to it -- so the raw *.elb.amazonaws.com hostname stays valid.
 # app_tls_domain_name       = "openmetadata.example.com"
 # app_tls_route53_zone_name = "example.com"
 
