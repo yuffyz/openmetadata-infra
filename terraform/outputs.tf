@@ -4,11 +4,11 @@ output "update_kubeconfig" {
 }
 
 output "openmetadata_url" {
-  description = "URL of the OpenMetadata UI. HTTPS via the domain when TLS is configured, otherwise the raw NLB hostname over plain HTTP, otherwise a port-forward command."
+  description = "URL of the OpenMetadata UI. HTTPS on 443 via the domain when TLS is configured, otherwise the raw NLB hostname on plain HTTP 8585, otherwise a port-forward command."
   value = (local.app_tls_enabled
-    ? "https://${var.app_tls_domain_name}:8585"
+    ? "https://${var.app_tls_domain_name}"
     : (var.app_expose_via_nlb
-      ? "http://<nlb-hostname>:8585 -- kubectl get svc -n ${local.namespace} openmetadata -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
+      ? "http://<nlb-hostname>:8585 -- kubectl get svc -n ${local.namespace} openmetadata-public -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
     : "kubectl port-forward -n ${local.namespace} svc/openmetadata 8585:8585 -- then http://localhost:8585")
   )
 }
@@ -22,7 +22,7 @@ output "openmetadata_url" {
 
 output "app_url" {
   description = "Final UI URL when it is knowable at apply time (TLS configured). Empty when the NLB hostname must be resolved from AWS after the fact."
-  value       = local.app_tls_enabled ? "https://${var.app_tls_domain_name}:8585" : ""
+  value       = local.app_tls_enabled ? "https://${var.app_tls_domain_name}" : ""
 }
 
 output "app_expose_via_nlb" {
