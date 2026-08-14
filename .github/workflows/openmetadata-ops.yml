@@ -1,0 +1,249 @@
+name: openmetadata-ops
+
+# Runs read-only diagnostics and a server restart against a deployed
+# OpenMetadata environment.
+#
+# Why this exists in CI rather than as local kubectl: `eks.tf` sets
+# `authentication_mode = "API"` with
+# `bootstrap_cluster_creator_admin_permissions = true`, so cluster-admin belongs
+# to the principal that created the cluster -- the GitHub OIDC role in
+# AWS_ROLE_ARN. Individuals need an EKS access entry for their own ARN, which is
+# its own troubleshooting exercise (SSO roles must be mapped by their IAM role
+# ARN with the path stripped, IAM users by their user ARN). This workflow needs
+# no access entry at all.
+#
+# Deliberately NOT a free-text kubectl runner: this role holds cluster-admin, so
+# an arbitrary-command input would hand cluster-admin to anyone with write access
+# to the repo. Add a named action below when you need a new operation.
+#
+# `diagnose` is the one to reach for when the UI's Explore page is empty while
+# ingestion reports success. Explore reads only from the search index, so an
+# OpenSearch auth failure looks exactly like "no metadata" -- the search index
+# sink fails with `TransportException: Unauthorized access` while entities sit
+# happily in the application database.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options:
+          - dev
+          - production
+        default: dev
+      action:
+        description: What to do
+        type: choice
+        options:
+          - diagnose                 # read-only; changes nothing
+          - restart-server           # rollout restart of the OpenMetadata deployment
+          - diagnose-and-restart     # diagnose, restart, then diagnose again
+        default: diagnose
+
+concurrency:
+  # Serialise per environment: two concurrent rollout restarts of the same
+  # deployment is never what anyone wanted.
+  group: openmetadata-ops-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # required for AWS OIDC
+  contents: read
+
+env:
+  # Hardcoded in terraform/namespace.tf, not a variable.
+  NAMESPACE: openmetadata
+  # Helm release name, so both the Deployment and its Service are `openmetadata`.
+  RELEASE: openmetadata
+  # Read cluster/domain names from the same per-environment tfvars the deploy
+  # workflow uses, so this cannot drift from what was actually applied.
+  TFVARS_FILE: config/${{ github.event.inputs.environment }}.auto.tfvars
+
+jobs:
+  ops:
+    name: ${{ github.event.inputs.action }} (${{ github.event.inputs.environment }})
+    runs-on: ubuntu-latest
+    # Inherits the selected GitHub Environment's protection rules, matching
+    # deploy.yml: restarting the production server should be reviewable.
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Check out infra project
+        uses: actions/checkout@v4
+
+      # Repository variables and secrets do not travel with the code: an
+      # unconfigured repo substitutes empty strings, which would surface much
+      # later as an unrecognisable AWS or kubectl error. Fail here instead,
+      # naming the setting. Values arrive via env so nothing from a secret is
+      # ever pasted into the shell script itself.
+      - name: Validate required settings
+        env:
+          IN_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          IN_AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          set -euo pipefail
+          fail=0
+          for v in IN_ROLE_ARN IN_AWS_REGION; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::${v#IN_} is not set (repository secret/variable)"
+              fail=1
+            fi
+          done
+          [ -f "$TFVARS_FILE" ] || { echo "::error::$TFVARS_FILE not found"; fail=1; }
+          exit $fail
+
+      - name: Assume AWS role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Parsed out of tfvars rather than terraform output: reading an output
+      # would mean a full init against remote state just to learn two names.
+      - name: Resolve cluster and OpenSearch domain
+        run: |
+          set -euo pipefail
+          # `|| true` so a missing key produces the named error below rather than
+          # a bare pipefail exit with no explanation.
+          cluster=$(grep -E '^[[:space:]]*eks_cluster_name[[:space:]]*=' "$TFVARS_FILE" \
+                    | head -1 | cut -d'"' -f2 || true)
+          # Only present when the environment uses an AWS-managed OpenSearch
+          # domain (provisioner = "aws"). Absent means the module default --
+          # OpenSearch running in-cluster via the deps chart -- and the domain
+          # lookups below are skipped.
+          domain=$(grep -E '^[[:space:]]*domain_name[[:space:]]*=' "$TFVARS_FILE" \
+                   | head -1 | cut -d'"' -f2 || true)
+
+          [ -n "$cluster" ] || { echo "::error::eks_cluster_name not found in $TFVARS_FILE"; exit 1; }
+
+          echo "CLUSTER=$cluster" >> "$GITHUB_ENV"
+          echo "OS_DOMAIN=$domain" >> "$GITHUB_ENV"
+          echo "Cluster: $cluster"
+          echo "OpenSearch domain: ${domain:-<in-cluster, no AWS domain>}"
+
+      - name: Configure kubectl
+        run: |
+          set -euo pipefail
+          kubectl version --client
+          aws eks update-kubeconfig --region "${{ vars.AWS_REGION }}" --name "$CLUSTER"
+          kubectl get nodes -o wide
+
+      - name: Diagnose
+        if: ${{ github.event.inputs.action != 'restart-server' }}
+        run: |
+          set -uo pipefail   # not -e: every check should report, not abort the run
+
+          echo "::group::Workloads"
+          kubectl get deploy,pods -n "$NAMESPACE" -o wide
+          echo "::endgroup::"
+
+          echo "::group::Search credential drift (server pod vs Kubernetes secret)"
+          # The module regenerates the OpenSearch master password with
+          # random_password, and the OpenMetadata chart embeds it into
+          # openmetadata.yaml at CONTAINER START. A terraform apply that rolls the
+          # password therefore updates the secret while the running pod keeps the
+          # old one in memory -- search writes then fail as Unauthorized with
+          # everything else healthy. Compare hashes so nothing secret is logged.
+          #
+          # Hash only NON-EMPTY values. sha256sum of empty input is a perfectly
+          # valid digest (e3b0c442...), so hashing unconditionally would make a
+          # missing secret and an unset pod variable compare EQUAL and report
+          # "no drift" -- the exact opposite of the truth.
+          sec_b64=$(kubectl get secret -n "$NAMESPACE" opensearch-credentials \
+                      -o jsonpath='{.data.password}' 2>/dev/null || true)
+          pod_raw=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- \
+                      sh -c 'printf %s "${ELASTICSEARCH_PASSWORD:-}"' 2>/dev/null || true)
+
+          sec_hash=""
+          pod_hash=""
+          [ -n "$sec_b64" ] && sec_hash=$(printf %s "$sec_b64" | base64 -d | sha256sum | cut -c1-16)
+          [ -n "$pod_raw" ] && pod_hash=$(printf %s "$pod_raw" | sha256sum | cut -c1-16)
+
+          echo "secret password sha256[0:16] : ${sec_hash:-<empty or unreadable>}"
+          echo "pod ELASTICSEARCH_PASSWORD    : ${pod_hash:-<empty or unreadable>}"
+
+          if [ -z "$sec_hash" ]; then
+            echo "::warning::Could not read the opensearch-credentials secret"
+          elif [ -z "$pod_hash" ]; then
+            echo "::warning::ELASTICSEARCH_PASSWORD is empty/unset in the server pod -- the chart is not wiring the secret through"
+          elif [ "$sec_hash" != "$pod_hash" ]; then
+            echo "::warning::Server pod's OpenSearch password does not match the secret -- run action 'restart-server'"
+          else
+            echo "Passwords match; drift is not the cause."
+          fi
+          # Names only, never values.
+          kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- \
+            sh -c 'env | grep -iE "^(ELASTICSEARCH|OPENSEARCH|SEARCH)" | cut -d= -f1 | sort' || true
+          echo "::endgroup::"
+
+          echo "::group::OpenSearch auth, as the server itself sees it"
+          # Runs inside the pod using the pod's own environment, so this is
+          # exactly the credential path the search sink uses. The domain is
+          # VPC-only and its security group admits the EKS node security groups,
+          # so this cannot be tested from the runner.
+          #   200 = healthy
+          #   401 = password mismatch (reset the domain master user, or restart)
+          #   403 = authenticated but not authorised (check all_access role mapping)
+          kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c '
+            user="${ELASTICSEARCH_USERNAME:-${ELASTICSEARCH_USER:-admin}}"
+            scheme="${ELASTICSEARCH_SCHEME:-https}"
+            host="${ELASTICSEARCH_HOST:-}"
+            port="${ELASTICSEARCH_PORT:-443}"
+            [ -n "$host" ] || { echo "ELASTICSEARCH_HOST unset in pod"; exit 0; }
+            if command -v curl >/dev/null 2>&1; then
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+                       -u "$user:${ELASTICSEARCH_PASSWORD:-}" \
+                       "$scheme://$host:$port/_cluster/health")
+              echo "GET /_cluster/health -> HTTP $code"
+              [ "$code" = "200" ] && curl -s --max-time 15 \
+                -u "$user:${ELASTICSEARCH_PASSWORD:-}" \
+                "$scheme://$host:$port/_cat/indices?v" | grep -iE "index|table|glossary|tag" | head -30
+            else
+              echo "curl not present in the server image; skipping"
+            fi' || true
+          echo "::endgroup::"
+
+          if [ -n "${OS_DOMAIN:-}" ]; then
+            echo "::group::AWS view of the OpenSearch domain"
+            aws opensearch describe-domain-health --domain-name "$OS_DOMAIN" \
+              --region "${{ vars.AWS_REGION }}" || true
+            aws opensearch describe-domain --domain-name "$OS_DOMAIN" \
+              --region "${{ vars.AWS_REGION }}" \
+              --query 'DomainStatus.{Version:EngineVersion,Processing:Processing,FGAC:AdvancedSecurityOptions.Enabled,InternalUserDB:AdvancedSecurityOptions.InternalUserDatabaseEnabled,Endpoint:Endpoints.vpc}' \
+              --output table || true
+            echo "::endgroup::"
+          fi
+
+          echo "::group::Recent server-side search errors"
+          kubectl logs -n "$NAMESPACE" "deploy/$RELEASE" --tail=400 2>/dev/null \
+            | grep -iE 'opensearch|elasticsearch|unauthorized|index' | tail -40 || true
+          echo "::endgroup::"
+
+      - name: Restart the OpenMetadata server
+        if: ${{ github.event.inputs.action != 'diagnose' }}
+        run: |
+          set -euo pipefail
+          kubectl rollout restart "deploy/$RELEASE" -n "$NAMESPACE"
+          kubectl rollout status  "deploy/$RELEASE" -n "$NAMESPACE" --timeout=10m
+
+      - name: Re-check after restart
+        if: ${{ github.event.inputs.action == 'diagnose-and-restart' }}
+        run: |
+          set -uo pipefail
+          kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c '
+            user="${ELASTICSEARCH_USERNAME:-${ELASTICSEARCH_USER:-admin}}"
+            scheme="${ELASTICSEARCH_SCHEME:-https}"
+            host="${ELASTICSEARCH_HOST:-}"
+            port="${ELASTICSEARCH_PORT:-443}"
+            [ -n "$host" ] || exit 0
+            command -v curl >/dev/null 2>&1 || exit 0
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+                     -u "$user:${ELASTICSEARCH_PASSWORD:-}" \
+                     "$scheme://$host:$port/_cluster/health")
+            echo "after restart: GET /_cluster/health -> HTTP $code"' || true
+
+          echo "If this now returns 200, re-run Search Indexing from the UI:"
+          echo "  Settings -> Applications -> Search Indexing -> Configure"
+          echo "  (Recreate Index = true, all entity types) -> Run"
+          echo "Entities are already in the application database, so ingestion does not need re-running."
