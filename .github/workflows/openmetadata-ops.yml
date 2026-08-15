@@ -233,9 +233,35 @@ jobs:
           OS_SCHEME=$(printf %s "$dump" | sed -n 's/^S=//p')
           OS_USER=$(printf %s "$dump" | sed -n 's/^U=//p')
 
+          # A previous run produced `"https"://"vpc-...":"443"` and every request
+          # came back HTTP 000 -- curl could not resolve a hostname with literal
+          # quote characters in it. Print the raw bytes so the values are not a
+          # matter of inference, then strip surrounding quotes, stray CRs and
+          # whitespace so the probe runs regardless.
+          echo "raw values as seen in the pod, delimited by []:"
+          printf %s "$dump" | sed -n 's/^\([HPSU]\)=\(.*\)$/  \1=[\2]/p'
+          echo "byte dump:"
+          printf %s "$dump" | od -c | head -12
+
+          strip() {
+            printf %s "$1" | tr -d '\r' \
+              | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+                    -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+          }
+          OS_HOST=$(strip "$OS_HOST")
+          OS_PORT=$(strip "$OS_PORT")
+          OS_SCHEME=$(strip "$OS_SCHEME")
+          OS_USER=$(strip "$OS_USER")
+
           if [ -z "${OS_HOST:-}" ]; then
             echo "::error::ELASTICSEARCH_HOST is empty in the server pod"
             exit 1
+          fi
+
+          # If stripping changed anything, the server's own configuration is
+          # carrying those characters too -- worth surfacing loudly.
+          if printf %s "$dump" | grep -q '="'; then
+            echo "::warning::Pod env values are wrapped in literal quotes; the chart is double-quoting them"
           fi
           echo "target: $OS_SCHEME://$OS_HOST:$OS_PORT as $OS_USER (mode=$MODE)"
 
@@ -274,8 +300,15 @@ jobs:
           fi
           PROBE
 
+          # The container must be named after the pod: `kubectl run -i` attaches
+          # to the container matching the pod name, and an override that renames
+          # it makes the attach fail ("container probe not found"), fall back to
+          # log streaming, and print everything twice.
+          POD_NAME="om-os-probe-${GITHUB_RUN_ID}"
+
           OVERRIDES=$(SCRIPT="$SCRIPT" OS_HOST="$OS_HOST" OS_PORT="$OS_PORT" \
                       OS_SCHEME="$OS_SCHEME" OS_USER="$OS_USER" MODE="$MODE" \
+                      POD_NAME="$POD_NAME" \
                       python3 - <<'PY'
           import json, os
           env = lambda k: {"name": k, "value": os.environ[k]}
@@ -284,7 +317,7 @@ jobs:
               "spec": {
                   "restartPolicy": "Never",
                   "containers": [{
-                      "name": "probe",
+                      "name": os.environ["POD_NAME"],
                       "image": "curlimages/curl:8.11.1",
                       "command": ["sh", "-c", os.environ["SCRIPT"]],
                       "env": [env("OS_HOST"), env("OS_PORT"), env("OS_SCHEME"),
@@ -297,7 +330,7 @@ jobs:
           PY
           )
 
-          kubectl run "om-os-probe-${GITHUB_RUN_ID}" -n "$NAMESPACE" \
+          kubectl run "$POD_NAME" -n "$NAMESPACE" \
             --image=curlimages/curl:8.11.1 --restart=Never --rm -i --quiet \
             --pod-running-timeout=3m --overrides="$OVERRIDES" || true
 
