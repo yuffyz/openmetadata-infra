@@ -178,33 +178,6 @@ jobs:
             sh -c 'env | grep -iE "^(ELASTICSEARCH|OPENSEARCH|SEARCH)" | cut -d= -f1 | sort' || true
           echo "::endgroup::"
 
-          echo "::group::OpenSearch auth, as the server itself sees it"
-          # Runs inside the pod using the pod's own environment, so this is
-          # exactly the credential path the search sink uses. The domain is
-          # VPC-only and its security group admits the EKS node security groups,
-          # so this cannot be tested from the runner.
-          #   200 = healthy
-          #   401 = password mismatch (reset the domain master user, or restart)
-          #   403 = authenticated but not authorised (check all_access role mapping)
-          kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c '
-            user="${ELASTICSEARCH_USERNAME:-${ELASTICSEARCH_USER:-admin}}"
-            scheme="${ELASTICSEARCH_SCHEME:-https}"
-            host="${ELASTICSEARCH_HOST:-}"
-            port="${ELASTICSEARCH_PORT:-443}"
-            [ -n "$host" ] || { echo "ELASTICSEARCH_HOST unset in pod"; exit 0; }
-            if command -v curl >/dev/null 2>&1; then
-              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
-                       -u "$user:${ELASTICSEARCH_PASSWORD:-}" \
-                       "$scheme://$host:$port/_cluster/health")
-              echo "GET /_cluster/health -> HTTP $code"
-              [ "$code" = "200" ] && curl -s --max-time 15 \
-                -u "$user:${ELASTICSEARCH_PASSWORD:-}" \
-                "$scheme://$host:$port/_cat/indices?v" | grep -iE "index|table|glossary|tag" | head -30
-            else
-              echo "curl not present in the server image; skipping"
-            fi' || true
-          echo "::endgroup::"
-
           if [ -n "${OS_DOMAIN:-}" ]; then
             echo "::group::AWS view of the OpenSearch domain"
             aws opensearch describe-domain-health --domain-name "$OS_DOMAIN" \
@@ -221,66 +194,120 @@ jobs:
             | grep -iE 'opensearch|elasticsearch|unauthorized|index' | tail -40 || true
           echo "::endgroup::"
 
-      # Probes what indexing actually needs: create an index, write a document,
-      # refresh, delete. A 200 on /_cluster/health only proves the credentials
+      # Probes what indexing actually needs: reach the cluster, list indices with
+      # their doc counts, and (in write mode) create an index, write a document,
+      # bulk-write, delete. A 200 on /_cluster/health only proves the credentials
       # authenticate for a READ -- the search sink creates indices and issues
       # _bulk writes, which are authorised separately and can also be refused by
       # a cluster-level write block.
       #
-      # Uses a throwaway index (om-auth-probe) and removes it again. It never
-      # touches OpenMetadata's own indices.
-      - name: Probe OpenSearch write access
-        if: ${{ github.event.inputs.action == 'test-search-write' }}
+      # Runs in a THROWAWAY curl pod rather than via `kubectl exec` on the
+      # server. The OpenMetadata server image ships no HTTP client: an earlier
+      # run of this workflow reported "curl absent from image" and skipped the
+      # check silently, which is worse than failing -- it reads as a pass. The
+      # probe pod lands on the same nodes, so it presents the same node security
+      # group to the VPC-only domain; the network path under test is identical.
+      #
+      # The password is injected by secretKeyRef, so it appears neither in the
+      # pod spec nor in this log.
+      #
+      # Write mode uses a throwaway index (om-auth-probe) and removes it again.
+      # It never touches OpenMetadata's own indices.
+      - name: Probe OpenSearch
+        if: ${{ github.event.inputs.action != 'restart-server' }}
+        env:
+          MODE: ${{ github.event.inputs.action == 'test-search-write' && 'write' || 'read' }}
         run: |
           set -uo pipefail
-          kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c '
-            user="${ELASTICSEARCH_USERNAME:-${ELASTICSEARCH_USER:-admin}}"
-            scheme="${ELASTICSEARCH_SCHEME:-https}"
-            host="${ELASTICSEARCH_HOST:-}"
-            port="${ELASTICSEARCH_PORT:-443}"
-            [ -n "$host" ] || { echo "ELASTICSEARCH_HOST unset"; exit 1; }
-            command -v curl >/dev/null 2>&1 || { echo "curl absent from image"; exit 1; }
-            B="$scheme://$host:$port"
-            A="-u $user:${ELASTICSEARCH_PASSWORD:-}"
-            req() { printf "%-34s -> HTTP %s\n" "$1 $2" \
-                     "$(curl -s -o /tmp/body -w "%{http_code}" --max-time 20 -X "$1" $A "$B$2" ${3:+-H "Content-Type: application/json" -d "$3"})"; \
-                    head -c 400 /tmp/body; echo; }
 
-            echo "--- cluster state (body, not just the code) ---"
-            curl -s --max-time 20 $A "$B/_cluster/health?pretty"
+          # Connection settings come from the server pod's own environment, so
+          # the probe targets exactly what the server targets. Note the chart
+          # sets ELASTICSEARCH_USER, not ELASTICSEARCH_USERNAME.
+          dump=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c '
+            echo "H=${ELASTICSEARCH_HOST:-}"
+            echo "P=${ELASTICSEARCH_PORT:-443}"
+            echo "S=${ELASTICSEARCH_SCHEME:-https}"
+            echo "U=${ELASTICSEARCH_USER:-${ELASTICSEARCH_USERNAME:-admin}}"' 2>/dev/null)
+          OS_HOST=$(printf %s "$dump" | sed -n 's/^H=//p')
+          OS_PORT=$(printf %s "$dump" | sed -n 's/^P=//p')
+          OS_SCHEME=$(printf %s "$dump" | sed -n 's/^S=//p')
+          OS_USER=$(printf %s "$dump" | sed -n 's/^U=//p')
 
-            echo "--- write blocks / disk watermark ---"
-            # A cluster that crossed the flood-stage watermark flips indices to
-            # read_only_allow_delete. That surfaces as a write failure while all
-            # reads keep returning 200 -- worth ruling out explicitly, since the
-            # dev domain has only 10 GiB per node.
-            curl -s --max-time 20 $A "$B/_cluster/settings?flat_settings=true&include_defaults=true" \
-              | tr "," "\n" | grep -iE "watermark|read_only" | head -20
-            curl -s --max-time 20 $A "$B/_cat/allocation?v"
+          if [ -z "${OS_HOST:-}" ]; then
+            echo "::error::ELASTICSEARCH_HOST is empty in the server pod"
+            exit 1
+          fi
+          echo "target: $OS_SCHEME://$OS_HOST:$OS_PORT as $OS_USER (mode=$MODE)"
 
-            echo "--- FGAC identity actually in use ---"
-            # Confirms which OpenSearch user/roles the credentials map to. The
-            # master user should map to all_access; anything else explains a
-            # read-yes/write-no result.
-            curl -s --max-time 20 $A "$B/_plugins/_security/api/account?pretty"
+          read -r -d '' SCRIPT <<'PROBE' || true
+          set -u
+          B="$OS_SCHEME://$OS_HOST:$OS_PORT"
+          req() {
+            m=$1; p=$2; d=${3:-}
+            if [ -n "$d" ]; then
+              code=$(curl -s -o /tmp/body -w '%{http_code}' --max-time 25 -X "$m" \
+                       -u "$OS_USER:$OS_PASS" -H 'Content-Type: application/json' -d "$d" "$B$p")
+            else
+              code=$(curl -s -o /tmp/body -w '%{http_code}' --max-time 25 -X "$m" \
+                       -u "$OS_USER:$OS_PASS" "$B$p")
+            fi
+            printf '\n%-44s -> HTTP %s\n' "$m $p" "$code"
+            head -c 600 /tmp/body; echo
+          }
 
-            echo "--- write probe ---"
+          req GET /_cluster/health
+          # Doc counts are the direct answer to "are the indices empty?".
+          req GET "/_cat/indices?v&s=index"
+          # Which OpenSearch user/roles the credentials map to. The FGAC master
+          # user should map to all_access; anything else explains read-yes/write-no.
+          req GET /_plugins/_security/api/account
+
+          if [ "$MODE" = "write" ]; then
+            req GET "/_cat/allocation?v"
             req DELETE /om-auth-probe
-            req PUT    /om-auth-probe
-            req POST   "/om-auth-probe/_doc?refresh=true" "{\"probe\":true}"
-            # _bulk is what the search sink actually uses. NDJSON needs real
-            # newlines, built with printf so this stays on one YAML line.
-            # Note _bulk can return HTTP 200 with per-item errors in the body,
-            # which is why req prints the body too.
-            req POST /_bulk "$(printf "{\"index\":{\"_index\":\"om-auth-probe\"}}\n{\"probe\":\"bulk\"}\n")"
+            req PUT /om-auth-probe
+            req POST "/om-auth-probe/_doc?refresh=true" '{"probe":true}'
+            # _bulk is what the search sink actually uses, and it can return
+            # HTTP 200 with per-item errors in the body -- hence printing bodies.
+            req POST /_bulk "$(printf '{"index":{"_index":"om-auth-probe"}}\n{"probe":"bulk"}\n')"
             req DELETE /om-auth-probe
-          ' || true
+          fi
+          PROBE
+
+          OVERRIDES=$(SCRIPT="$SCRIPT" OS_HOST="$OS_HOST" OS_PORT="$OS_PORT" \
+                      OS_SCHEME="$OS_SCHEME" OS_USER="$OS_USER" MODE="$MODE" \
+                      python3 - <<'PY'
+          import json, os
+          env = lambda k: {"name": k, "value": os.environ[k]}
+          print(json.dumps({
+              "apiVersion": "v1",
+              "spec": {
+                  "restartPolicy": "Never",
+                  "containers": [{
+                      "name": "probe",
+                      "image": "curlimages/curl:8.11.1",
+                      "command": ["sh", "-c", os.environ["SCRIPT"]],
+                      "env": [env("OS_HOST"), env("OS_PORT"), env("OS_SCHEME"),
+                              env("OS_USER"), env("MODE"),
+                              {"name": "OS_PASS", "valueFrom": {"secretKeyRef": {
+                                  "name": "opensearch-credentials", "key": "password"}}}],
+                  }],
+              },
+          }))
+          PY
+          )
+
+          kubectl run "om-os-probe-${GITHUB_RUN_ID}" -n "$NAMESPACE" \
+            --image=curlimages/curl:8.11.1 --restart=Never --rm -i --quiet \
+            --pod-running-timeout=3m --overrides="$OVERRIDES" || true
 
           echo
           echo "Interpretation:"
-          echo "  all 200/201        -> credentials and write auth are fine; the failure is stale or elsewhere"
-          echo "  health 200, PUT 403 -> authenticated but not authorised: check the account/roles output above"
-          echo "  cluster_block_exception / read_only_allow_delete -> disk watermark, not auth; grow the volume"
+          echo "  health 200 + non-zero docs.count on *_search_index -> index is populated; Explore should work"
+          echo "  health 200, indices present but docs.count 0        -> writes are failing; see the write probe"
+          echo "  health 200, PUT/_bulk 403                           -> authorised for reads only; check the account/roles output"
+          echo "  cluster_block_exception / read_only_allow_delete    -> disk watermark, not auth; grow volume_size"
+          echo "  health 401                                          -> credentials rejected outright"
 
       - name: Restart the OpenMetadata server
         if: ${{ github.event.inputs.action == 'restart-server' || github.event.inputs.action == 'diagnose-and-restart' }}
@@ -289,23 +316,16 @@ jobs:
           kubectl rollout restart "deploy/$RELEASE" -n "$NAMESPACE"
           kubectl rollout status  "deploy/$RELEASE" -n "$NAMESPACE" --timeout=10m
 
-      - name: Re-check after restart
+      - name: What to do next
         if: ${{ github.event.inputs.action == 'diagnose-and-restart' }}
         run: |
-          set -uo pipefail
-          kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c '
-            user="${ELASTICSEARCH_USERNAME:-${ELASTICSEARCH_USER:-admin}}"
-            scheme="${ELASTICSEARCH_SCHEME:-https}"
-            host="${ELASTICSEARCH_HOST:-}"
-            port="${ELASTICSEARCH_PORT:-443}"
-            [ -n "$host" ] || exit 0
-            command -v curl >/dev/null 2>&1 || exit 0
-            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
-                     -u "$user:${ELASTICSEARCH_PASSWORD:-}" \
-                     "$scheme://$host:$port/_cluster/health")
-            echo "after restart: GET /_cluster/health -> HTTP $code"' || true
-
-          echo "If this now returns 200, re-run Search Indexing from the UI:"
+          # Deliberately no curl here: the server image has none, and the
+          # earlier version of this step silently exited 0, which read as a
+          # pass. Re-run the workflow with action=test-search-write to re-probe
+          # through the throwaway curl pod.
+          echo "Server restarted. Re-run this workflow with action=test-search-write to re-probe."
+          echo
+          echo "If the probe returns 200, re-run Search Indexing from the UI:"
           echo "  Settings -> Applications -> Search Indexing -> Configure"
           echo "  (Recreate Index = true, all entity types) -> Run"
           echo "Entities are already in the application database, so ingestion does not need re-running."
