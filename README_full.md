@@ -612,74 +612,179 @@ domain on the old password unless the domain update also lands.
 
 Use the `openmetadata-ops` workflow rather than local `kubectl`: cluster-admin
 belongs to the GitHub OIDC role that created the cluster (see *Get cluster access
-first*), so CI needs no EKS access entry.
+first*), so CI needs no EKS access entry, and no individual has to win the
+access-entry fight to run any of this.
 
-| Action | What it answers |
+| Action | Mutates | What it answers |
+|---|---|---|
+| `diagnose` | no | Pod password vs secret (by hash), stored password *shape*, domain health, node/AZ availability, `MasterUserName`, `UpdateVersion`, recent server-side search errors |
+| `test-search-write` | throwaway index | Can the credentials read **and write**? Cluster health, node list, index list with `docs.count`, FGAC roles in effect |
+| `restart-server` | rollout | For the stale-pod case: secret rolled, running pod still holds the old value |
+| `reset-opensearch-password` | domain | Sets the domain master password to the secret's value. **Often a no-op — see below** |
+| `rotate-opensearch-password` | domain + secret + rollout | Sets a *new* password on both sides and verifies the change actually landed. This is the one that works |
+| `reduce-replicas` | index settings, dev only | Drops `number_of_replicas` to 0 on non-system indices |
+
+Read `test-search-write` by **which kind of failure** you get. The distinction
+that matters is *rejected* versus *overwhelmed*:
+
+| Result | Meaning |
 |---|---|
-| `diagnose` | Does the pod's password match the secret? Domain health, version, FGAC flags, recent server-side search errors |
-| `test-search-write` | Can the credentials actually read **and write**? Index list with doc counts |
-| `reset-opensearch-password` | **Mutates:** sets the domain master password to the secret's value |
-| `restart-server` | Rollout restart, for the stale-pod case below |
-
-Read `test-search-write` like this:
-
-- **401 on everything** — the domain rejects the credentials. Password drift;
-  run `reset-opensearch-password`.
-- **403 on writes, 200 on reads** — authenticated but not authorised. Check the
-  `_plugins/_security/api/account` output for the roles actually in effect; the
-  master user should map to `all_access`.
-- **`cluster_block_exception` / `read_only_allow_delete`** — not auth at all. The
-  cluster crossed the flood-stage disk watermark and flipped indices read-only.
-  Dev runs 10 GiB per node; raise `volume_size`.
-- **200s with indices present but `docs.count` 0** — connection is fine, the
-  index was never populated. Re-run Search Indexing.
-- **`HTTP 000`** — never connected. Malformed endpoint or a security group.
+| `401` on everything | Credentials rejected. Password drift → `rotate-opensearch-password` |
+| `403` on writes, `200` on reads | Authenticated, not authorised. Check `_plugins/_security/api/account`; the master user should show `all_access` |
+| `HTTP 000` / `504`, mixed with successes | **Timeouts, not refusals.** The cluster is overwhelmed — see *When the cluster is overwhelmed* |
+| `HTTP 000` on everything, instantly | Never connected. Malformed endpoint (the quoting trap below) or a security group |
+| `cluster_block_exception` / `read_only_allow_delete` | Flood-stage disk watermark, not auth. Raise `volume_size` |
+| `200`s, indices present, `docs.count` 0 | Connection fine, index never populated. Re-run Search Indexing |
+| `404` on a `DELETE` of a nonexistent index | **Success.** A 404 is an authenticated answer |
 
 A distinct failure with the same outward symptom: the chart embeds the password
 into `openmetadata.yaml` **at container start**, so an apply that rolls the
 password updates the secret while the running pod keeps the old one in memory.
-`diagnose` catches this by comparing hashes of the two and warns; the fix is
-`restart-server`, not a password reset.
+`diagnose` catches this by comparing hashes and warns; the fix is
+`restart-server`, not a password change.
 
-### Fixing it
+### Runbook
 
-1. Run `reset-opensearch-password` (a few minutes; it waits for
-   `Processing=False`).
-2. Run `test-search-write` — expect `200`.
-3. In the UI: **Settings → Applications → Search Indexing → Configure**,
-   *Recreate Index* = true, all entity types, **Run**.
+1. `diagnose` — read-only. May end it immediately: a stale pod needs only
+   `restart-server`.
+2. `test-search-write` — classify the failure with the table above.
+3. Repair: `rotate-opensearch-password` for `401`; `reduce-replicas` plus
+   right-sizing for timeouts.
+4. `test-search-write` again — confirm `200`s and check `table_search_index`
+   has a non-zero `docs.count`.
+5. Only once the cluster is **green**: **Settings → Applications → Search
+   Indexing → Configure**, *Recreate Index* = true, all entity types, **Run**.
 
-No re-ingestion is needed. The entities are already in the database; only the
-index was missing. A pod restart is not needed either — the server's password is
-already correct, and it is the domain being moved to match it.
+Re-ingestion is never part of this. The entities are already in the application
+database; only the index was missing.
 
-### Two known traps
+### Fixing password drift — and why `reset` is not enough
+
+`reset-opensearch-password` sends the secret's existing value to the domain.
+**AWS frequently accepts that call and applies nothing**, returning what looks
+exactly like success:
+
+```json
+{ "State": "Active", "UpdateDate": "2026-08-04T03:56:20", "UpdateVersion": 10 }
+```
+
+`State` never becomes `Processing` and `UpdateDate` is whenever the domain was
+last genuinely changed. There is no error, and the CLI exit code is 0. The only
+way to tell is to compare `AdvancedSecurityOptions.Status.UpdateVersion` before
+and after.
+
+`rotate-opensearch-password` exists because of this. It generates a **new**
+password — which AWS cannot treat as unchanged — asserts that `UpdateVersion`
+incremented, waits for `Processing=False`, patches the secret only after the
+domain has taken the value, and then restarts the server so it reloads. If
+`UpdateVersion` still does not move, the AWS API cannot set this domain's master
+password and the step tells you to reset it from OpenSearch Dashboards
+(*Security → Internal users → admin*).
+
+Its generated password satisfies AWS complexity **and** the module's YAML-safety
+constraints: uppercase first character, specials limited to `_ - .` so it
+survives being embedded in `openmetadata.yaml`.
+
+Two things that look wrong in the output but are not:
+
+- `MasterUserName: None` from `describe-domain-config` — AWS redacts it. It does
+  not mean the master user is unset.
+- Rotation **diverges from Terraform state**, which still holds the old
+  `random_password`. The next `apply` pushes the state value back to both the
+  domain and the secret, which reconverges them — but if a state operation is
+  what broke them originally, watch that apply.
+
+### When the cluster is overwhelmed instead
+
+Once authentication is fixed, the next wall is capacity, and it presents very
+differently: **timeouts rather than refusals** — `HTTP 000` and `504` mixed with
+successes, and slow endpoints (`_cluster/health`, `_cat/indices`) failing while
+trivial ones answer instantly.
+
+OpenMetadata 1.12 creates roughly **45 indices at 5 primaries + 1 replica each**,
+around **757 shards**. A `t3.small.search` node has ~2 GiB RAM, so ~1 GiB heap,
+and the working guideline is **20–25 shards per GiB** — about 25 shards. That is
+some thirty times oversubscribed, and it is enough to knock a data node out:
+
+```
+AvailabilityZoneName: us-east-1b
+ZoneStatus:           NotAvailable
+AvailableDataNodeCount: 0
+```
+
+```
+status yellow  node.total 1  shards 391  unassign 366  active_shards_percent 51.7%
+```
+
+With one node gone, every replica is unassignable. Note what is *not* the
+problem: `disk.used` was 32.7 MB of 9.6 GB. This is heap and shard overhead, not
+storage — raising `volume_size` does nothing for it.
+
+Two fixes, and dev wants both:
+
+1. **`reduce-replicas`** — sets `number_of_replicas: 0` on non-system indices.
+   Clears every unassigned shard at once and halves the shard load. Safe in dev
+   because these indices are *derived*: Search Indexing rebuilds them from the
+   database. The action refuses to run outside dev for that reason, and excludes
+   dot-prefixed system indices (`.opendistro_security`, `.plugins-ml-*`), which
+   OpenSearch manages itself.
+2. **Right-size the domain.** `instance_type` in the env tfvars —
+   `t3.small.search` is below what this index set needs. `t3.medium.search` is a
+   floor; `m6g.large.search` gives real headroom.
+
+Reindexing against a saturated or yellow cluster is how you get another round of
+partial failures. Get it green first.
+
+Caveat: a Search Indexing run with *Recreate Index* may recreate indices at the
+chart's default replica count and undo `reduce-replicas`. Re-run it afterwards,
+or fix the shard defaults once the domain is right-sized.
+
+### Traps that waste time
 
 - **`ELASTICSEARCH_HOST`, `_PORT`, `_SCHEME` and `_USER` reach the container
   wrapped in literal double-quote characters.** `helm_values.tftpl` writes them
   unquoted, so the quoting is added downstream by the chart.
   `ELASTICSEARCH_PASSWORD` is unaffected because it arrives via `secretRef`
   rather than string templating. This does not stop the server, but anything
-  reading those variables must strip the quotes or it will fail to resolve the
+  else reading those variables must strip the quotes or it will not resolve the
   host — `curl` reports `HTTP 000`. Verify with a byte dump, not by eye:
   ```bash
   kubectl exec -n openmetadata deploy/openmetadata -- \
     sh -c 'printf %s "$ELASTICSEARCH_HOST"' | od -c | head
   ```
 - **The server image ships no `curl` or `wget`.** Probing OpenSearch from inside
-  it is impossible; a naive `command -v curl` guard exits 0 and reads as a pass.
-  `openmetadata-ops` runs its probe in a throwaway `curlimages/curl` pod
-  instead — scheduled onto the same nodes, so it presents the same node security
-  group to the VPC-only domain, and the password is injected by `secretKeyRef`
-  so it never appears in a pod spec or a log.
+  it is impossible, and a naive `command -v curl` guard exits 0 — which reads as
+  a pass. `openmetadata-ops` probes from a throwaway `curlimages/curl` pod
+  instead: same nodes, so the same node security group faces the VPC-only
+  domain, with the password injected by `secretKeyRef` so it never lands in a pod
+  spec or a log.
+- **A matching password hash proves agreement, not correctness.** Comparing the
+  secret against the pod shows they agree with *each other*. If the stored value
+  itself were malformed — wrapping quotes, a trailing newline — both sides would
+  send the malformed value and both would be rejected, with hashes matching
+  throughout. `diagnose` therefore also reports the stored password's *shape*:
+  length, leading/trailing quote, whitespace, first/last byte class.
+- **Truncated output hides the answer.** `docs.count` for `table_search_index`
+  is the number that settles whether Explore should work, and it sits far down an
+  alphabetical `_cat/indices` listing. Print enough of the body, and sort by
+  `docs.count`.
+- **`$( )` strips trailing newlines**, so a `_bulk` body built with
+  `$(printf '...\n')` loses its terminator and OpenSearch answers
+  `400 The bulk request must be terminated by a newline` — a self-inflicted
+  failure that reads as a cluster fault.
 
 ### Worth fixing properly
 
-Password drift will recur on any apply that rolls it. Two durable options: add a
-checksum annotation to the deployment's pod template so a secret change forces a
-rollout, or give `random_password` `keepers` so it stops regenerating. The first
-is the better fix but lives in the upstream module's deployment template, so it
-needs `app_extra_helm_values` or an upstream change.
+- **Password drift recurs** on any apply that rolls it. Either add a checksum
+  annotation to the deployment's pod template so a secret change forces a
+  rollout, or give `random_password` `keepers` so it stops regenerating. The
+  first is better but lives in the upstream module's deployment template, so it
+  needs `app_extra_helm_values` or an upstream change.
+- **Shard defaults.** 5 primaries per index is wrong for a single-node dev
+  domain. Until that is configurable here, `reduce-replicas` plus a larger
+  instance type is the workaround.
+- **The quoting bug** belongs upstream — the module writes those values
+  unquoted, so the chart is adding them.
 
 ## Configuration notes
 
