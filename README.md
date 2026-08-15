@@ -300,6 +300,16 @@ A pipeline that never appears in Airflow points at the pipeline-service client
 (endpoint or `airflow-auth` credentials); a pipeline that appears and fails is
 usually connector configuration or network.
 
+### When ingestion succeeds but Explore stays empty
+
+Explore reads only from the OpenSearch index, so a search sink that cannot write
+leaves a green pipeline, entities that exist by API, and a blank Explore page —
+with nothing in the Airflow log, because sink errors surface in the **server**
+log. The usual cause is OpenSearch master-password drift, which Terraform cannot
+detect. Diagnose and repair it with the `openmetadata-ops` workflow; full
+walkthrough in
+[README_full.md](README_full.md#search-index--when-explore-is-empty).
+
 ## Production exposure — what's still missing
 
 Production deliberately has **no** UI exposure configured: its tfvars omit
