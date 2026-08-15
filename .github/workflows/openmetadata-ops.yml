@@ -40,6 +40,7 @@ on:
           - restart-server           # rollout restart of the OpenMetadata deployment
           - diagnose-and-restart     # diagnose, restart, then diagnose again
           - test-search-write        # probe WRITE auth: creates and deletes a throwaway index
+          - reset-opensearch-password  # MUTATES: set the domain master password to the secret's value
         default: diagnose
 
 concurrency:
@@ -341,6 +342,79 @@ jobs:
           echo "  health 200, PUT/_bulk 403                           -> authorised for reads only; check the account/roles output"
           echo "  cluster_block_exception / read_only_allow_delete    -> disk watermark, not auth; grow volume_size"
           echo "  health 401                                          -> credentials rejected outright"
+
+      # Re-points the domain's FGAC master user at the password already held in
+      # the opensearch-credentials secret.
+      #
+      # Why this drifts: modules/opensearch/main.tf generates the password with
+      # random_password and writes it to BOTH the domain and the Kubernetes
+      # secret. AWS never returns master_user_password, so Terraform cannot
+      # detect that the domain's copy no longer matches -- a plan is clean while
+      # every search request is rejected with 401. The server and the secret
+      # agree with each other; only the domain disagrees.
+      #
+      # Sends the password via --cli-input-json rather than the shorthand
+      # --advanced-security-options syntax, which splits on commas and equals
+      # signs and would corrupt some passwords.
+      - name: Reset the OpenSearch master password to match the secret
+        if: ${{ github.event.inputs.action == 'reset-opensearch-password' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OS_DOMAIN:-}" ]; then
+            echo "::error::This environment has no AWS OpenSearch domain (in-cluster via the deps chart)"
+            exit 1
+          fi
+
+          PW=$(kubectl get secret -n "$NAMESPACE" opensearch-credentials \
+                 -o jsonpath='{.data.password}' | base64 -d)
+          [ -n "$PW" ] || { echo "::error::opensearch-credentials secret is empty"; exit 1; }
+          # Keep it out of the log even if a command below echoes it.
+          echo "::add-mask::$PW"
+
+          # Username from the pod, with the literal quotes stripped (the chart
+          # double-quotes these values -- see the Probe step).
+          OS_USER=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- \
+                      sh -c 'printf %s "${ELASTICSEARCH_USER:-admin}"' 2>/dev/null \
+                    | tr -d '\r"' )
+          OS_USER=${OS_USER:-admin}
+          echo "Resetting master user '$OS_USER' on domain '$OS_DOMAIN'"
+
+          umask 077
+          CFG=$(mktemp)
+          trap 'rm -f "$CFG"' EXIT
+          OS_DOMAIN="$OS_DOMAIN" OS_USER="$OS_USER" PW="$PW" python3 - > "$CFG" <<'PY'
+          import json, os
+          print(json.dumps({
+              "DomainName": os.environ["OS_DOMAIN"],
+              "AdvancedSecurityOptions": {
+                  "Enabled": True,
+                  "InternalUserDatabaseEnabled": True,
+                  "MasterUserOptions": {
+                      "MasterUserName": os.environ["OS_USER"],
+                      "MasterUserPassword": os.environ["PW"],
+                  },
+              },
+          }))
+          PY
+
+          aws opensearch update-domain-config --region "${{ vars.AWS_REGION }}" \
+            --cli-input-json "file://$CFG" \
+            --query 'DomainConfig.AdvancedSecurityOptions.Status' --output json
+
+          echo "Waiting for the domain to finish processing..."
+          for _ in $(seq 1 40); do
+            p=$(aws opensearch describe-domain --domain-name "$OS_DOMAIN" \
+                  --region "${{ vars.AWS_REGION }}" \
+                  --query 'DomainStatus.Processing' --output text)
+            echo "  Processing=$p"
+            [ "$p" = "False" ] && break
+            sleep 15
+          done
+
+          echo
+          echo "Next: re-run this workflow with action=test-search-write."
+          echo "Expect HTTP 200s. Then re-run Search Indexing from the UI"
+          echo "(Settings -> Applications -> Search Indexing, Recreate Index = true)."
 
       - name: Restart the OpenMetadata server
         if: ${{ github.event.inputs.action == 'restart-server' || github.event.inputs.action == 'diagnose-and-restart' }}
