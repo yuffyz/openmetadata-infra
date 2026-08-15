@@ -42,6 +42,7 @@ on:
           - test-search-write        # probe WRITE auth: creates and deletes a throwaway index
           - reset-opensearch-password  # MUTATES: set the domain master password to the secret's value
           - rotate-opensearch-password # MUTATES: new password on BOTH domain and secret, then restart
+          - reduce-replicas          # MUTATES (dev only): number_of_replicas = 0 on non-system indices
         default: diagnose
 
 concurrency:
@@ -313,13 +314,13 @@ jobs:
             m=$1; p=$2; d=${3:-}
             if [ -n "$d" ]; then
               code=$(curl -s -o /tmp/body -w '%{http_code}' --max-time 120 -X "$m" \
-                       -u "$OS_USER:$OS_PASS" -H 'Content-Type: application/json' -d "$d" "$B$p")
+                       -u "$OS_USER:$OS_PASS" -H 'Content-Type: application/json' --data-binary "$d" "$B$p")
             else
               code=$(curl -s -o /tmp/body -w '%{http_code}' --max-time 120 -X "$m" \
                        -u "$OS_USER:$OS_PASS" "$B$p")
             fi
             printf '\n%-44s -> HTTP %s\n' "$m $p" "$code"
-            head -c 600 /tmp/body; echo
+            head -c 4000 /tmp/body; echo
           }
 
           req GET /_cluster/health
@@ -328,6 +329,7 @@ jobs:
           # per GiB. Hundreds of shards make the cluster time out rather than
           # refuse, which shows up as HTTP 000/504 instead of an error body.
           req GET "/_cat/health?v"
+          req GET "/_cat/nodes?v&h=name,node.role,heap.percent,ram.percent,cpu,load_1m"
           # Doc counts are the direct answer to "are the indices empty?", and
           # store.size shows which indices are worth reclaiming.
           req GET "/_cat/indices?v&h=index,health,pri,rep,docs.count,store.size&s=store.size:desc"
@@ -342,7 +344,12 @@ jobs:
             req POST "/om-auth-probe/_doc?refresh=true" '{"probe":true}'
             # _bulk is what the search sink actually uses, and it can return
             # HTTP 200 with per-item errors in the body -- hence printing bodies.
-            req POST /_bulk "$(printf '{"index":{"_index":"om-auth-probe"}}\n{"probe":"bulk"}\n')"
+            # Command substitution strips trailing newlines, so a bare
+            # $(printf '...\n') loses the terminator and OpenSearch rejects the
+            # body with "The bulk request must be terminated by a newline".
+            # The X sentinel is appended then removed, preserving it.
+            BULK=$(printf '{"index":{"_index":"om-auth-probe"}}\n{"probe":"bulk"}\nX'); BULK=${BULK%X}
+            req POST /_bulk "$BULK"
             req DELETE /om-auth-probe
           fi
           PROBE
@@ -561,6 +568,110 @@ jobs:
           echo
           echo "Rotated. Re-run with action=test-search-write; expect HTTP 200."
           echo "Terraform state still holds the OLD password -- see the note in this step."
+
+      # Sets number_of_replicas = 0 on every non-system index.
+      #
+      # Why: OpenMetadata creates ~45 indices at 5 primaries + 1 replica each --
+      # around 757 shards. A t3.small.search node has roughly 1 GiB of heap and
+      # the working guideline is ~20-25 shards per GiB, so the domain is heavily
+      # oversubscribed. With one data node unavailable, every replica shard is
+      # unassignable: the cluster sits yellow with 366 unassigned shards and
+      # ~52% active. Dropping replicas to 0 clears all of them at once and
+      # halves the shard load, which is also what keeps knocking the node over.
+      #
+      # Safe in dev because these indices are DERIVED data -- Search Indexing
+      # rebuilds them from the application database. It is not safe where search
+      # must survive a node loss, so this refuses to run outside dev.
+      #
+      # The `-.*` term excludes dot-prefixed system indices
+      # (.opendistro_security, .plugins-ml-*, .kibana*): those are managed by
+      # OpenSearch itself and must keep their own replica settings.
+      #
+      # The connection block below mirrors the Probe step rather than sharing a
+      # helper. Kept self-contained deliberately: the probe is the one piece of
+      # working diagnosis in this file and is not worth refactoring under a live
+      # incident.
+      - name: Reduce index replicas to 0 (dev only)
+        if: ${{ github.event.inputs.action == 'reduce-replicas' }}
+        run: |
+          set -uo pipefail
+
+          if [ "${{ github.event.inputs.environment }}" != "dev" ]; then
+            echo "::error::reduce-replicas is restricted to dev. Removing replicas elsewhere means a single node loss takes search down until a full reindex."
+            exit 1
+          fi
+
+          dump=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c '
+            echo "H=${ELASTICSEARCH_HOST:-}"
+            echo "P=${ELASTICSEARCH_PORT:-443}"
+            echo "S=${ELASTICSEARCH_SCHEME:-https}"
+            echo "U=${ELASTICSEARCH_USER:-admin}"' 2>/dev/null)
+          # The chart double-quotes these; see the Probe step's byte dump.
+          strip() { printf %s "$1" | tr -d '\r' | sed -e 's/^"\(.*\)"$/\1/'; }
+          OS_HOST=$(strip "$(printf %s "$dump" | sed -n 's/^H=//p')")
+          OS_PORT=$(strip "$(printf %s "$dump" | sed -n 's/^P=//p')")
+          OS_SCHEME=$(strip "$(printf %s "$dump" | sed -n 's/^S=//p')")
+          OS_USER=$(strip "$(printf %s "$dump" | sed -n 's/^U=//p')")
+          [ -n "$OS_HOST" ] || { echo "::error::ELASTICSEARCH_HOST empty in the server pod"; exit 1; }
+          echo "target: $OS_SCHEME://$OS_HOST:$OS_PORT as $OS_USER"
+
+          read -r -d '' SCRIPT <<'REPLICAS' || true
+          set -u
+          B="$OS_SCHEME://$OS_HOST:$OS_PORT"
+          A="-u $OS_USER:$OS_PASS"
+
+          echo "--- before ---"
+          curl -s --max-time 120 $A "$B/_cat/health?v"
+
+          echo
+          echo "--- setting number_of_replicas=0 on non-system indices ---"
+          curl -s --max-time 180 -X PUT $A \
+            -H 'Content-Type: application/json' \
+            --data-binary '{"index":{"number_of_replicas":0}}' \
+            "$B/*,-.*/_settings?expand_wildcards=open&allow_no_indices=true"
+          echo
+
+          echo
+          echo "--- after (allow a moment for shards to settle) ---"
+          sleep 20
+          curl -s --max-time 120 $A "$B/_cat/health?v"
+          echo
+          curl -s --max-time 120 $A "$B/_cat/indices?v&h=index,health,pri,rep,docs.count,store.size&s=docs.count:desc" \
+            | head -60
+          REPLICAS
+
+          POD_NAME="om-os-replicas-${GITHUB_RUN_ID}"
+          OVERRIDES=$(SCRIPT="$SCRIPT" OS_HOST="$OS_HOST" OS_PORT="$OS_PORT" \
+                      OS_SCHEME="$OS_SCHEME" OS_USER="$OS_USER" POD_NAME="$POD_NAME" \
+                      python3 - <<'PY'
+          import json, os
+          env = lambda k: {"name": k, "value": os.environ[k]}
+          print(json.dumps({
+              "apiVersion": "v1",
+              "spec": {
+                  "restartPolicy": "Never",
+                  "containers": [{
+                      "name": os.environ["POD_NAME"],
+                      "image": "curlimages/curl:8.11.1",
+                      "command": ["sh", "-c", os.environ["SCRIPT"]],
+                      "env": [env("OS_HOST"), env("OS_PORT"), env("OS_SCHEME"),
+                              env("OS_USER"),
+                              {"name": "OS_PASS", "valueFrom": {"secretKeyRef": {
+                                  "name": "opensearch-credentials", "key": "password"}}}],
+                  }],
+              },
+          }))
+          PY
+          )
+
+          kubectl run "$POD_NAME" -n "$NAMESPACE" \
+            --image=curlimages/curl:8.11.1 --restart=Never --rm -i --quiet \
+            --pod-running-timeout=3m --overrides="$OVERRIDES" || true
+
+          echo
+          echo "Expect status=green and unassign=0 in the 'after' block."
+          echo "If it is still yellow, the missing data node is the remaining cause;"
+          echo "check us-east-1b in the diagnose action's AWS domain health output."
 
       - name: Restart the OpenMetadata server
         if: ${{ github.event.inputs.action == 'restart-server' || github.event.inputs.action == 'diagnose-and-restart' }}
