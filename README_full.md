@@ -61,6 +61,7 @@ openmetadata-infra/                     # repo root
 │  ├─ actions/prepare/action.yml     # composite: inject cfg, OIDC, pre-flight, init
 │  └─ workflows/
 │     ├─ deploy.yml                  # manual: environment × (plan / apply / destroy)
+│     ├─ openmetadata-ops.yml        # manual: diagnose / restart / search-index repair
 │     └─ validate.yml                # PR fmt + validate (no cloud creds)
 ├─ terraform/                        # the Terraform root module that gets deployed
 │  ├─ core_addons.tf                # vpc-cni / kube-proxy / coredns EKS addons
@@ -566,6 +567,119 @@ Two further considerations for production specifically:
 Also worth revisiting for production, unrelated to exposure:
 `enabled_cluster_log_types = []` disables EKS control-plane logging, and the
 node group is the same 2 × `t3.xlarge` as dev.
+
+## Search index — when Explore is empty
+
+The **Explore** page reads exclusively from the OpenSearch index, never from the
+application database. Nothing else in OpenMetadata does. So when the search sink
+cannot write, ingestion still reports success, the entities are genuinely
+present and reachable by API and by direct URL, and Explore is blank. The failure
+is silent in every place you would naturally look:
+
+- The ingestion pipeline is green — it writes to the database, and indexing is a
+  separate, asynchronous path.
+- The **Airflow task log shows nothing.** Sink errors live in the OpenMetadata
+  **server** log, which that log never touches.
+- `terraform plan` is clean, for the reason in the next section.
+
+The symptom to recognise: **Search Indexing fails for every entity type at once**
+— `table`, `tag`, `classification`, `domain`, `ingestionPipeline`,
+`webAnalyticUserActivityReportData` — all with the same error. A fault affecting
+every entity kind equally is never about the entities; it is the transport.
+
+```
+os.org.opensearch.client.transport.TransportException: Unauthorized access
+```
+
+### The recurring cause: OpenSearch master password drift
+
+`modules/opensearch/main.tf` generates the domain's FGAC master password with
+`random_password` and writes it to **two** places: the domain's
+`master_user_options`, and the `opensearch-credentials` Kubernetes secret that
+the server reads.
+
+AWS never returns `master_user_password` from any API. Terraform therefore
+**cannot detect drift on it** — if the domain's copy stops matching the secret,
+a `plan` stays clean forever while every single search request is rejected with
+`401`. The server and the secret agree with each other; only the domain
+disagrees, and nothing reports it.
+
+Anything that regenerates `random_password` — state rebuilt, resource replaced,
+`terraform state rm` — updates the secret and the state, but leaves the live
+domain on the old password unless the domain update also lands.
+
+### Diagnosing it
+
+Use the `openmetadata-ops` workflow rather than local `kubectl`: cluster-admin
+belongs to the GitHub OIDC role that created the cluster (see *Get cluster access
+first*), so CI needs no EKS access entry.
+
+| Action | What it answers |
+|---|---|
+| `diagnose` | Does the pod's password match the secret? Domain health, version, FGAC flags, recent server-side search errors |
+| `test-search-write` | Can the credentials actually read **and write**? Index list with doc counts |
+| `reset-opensearch-password` | **Mutates:** sets the domain master password to the secret's value |
+| `restart-server` | Rollout restart, for the stale-pod case below |
+
+Read `test-search-write` like this:
+
+- **401 on everything** — the domain rejects the credentials. Password drift;
+  run `reset-opensearch-password`.
+- **403 on writes, 200 on reads** — authenticated but not authorised. Check the
+  `_plugins/_security/api/account` output for the roles actually in effect; the
+  master user should map to `all_access`.
+- **`cluster_block_exception` / `read_only_allow_delete`** — not auth at all. The
+  cluster crossed the flood-stage disk watermark and flipped indices read-only.
+  Dev runs 10 GiB per node; raise `volume_size`.
+- **200s with indices present but `docs.count` 0** — connection is fine, the
+  index was never populated. Re-run Search Indexing.
+- **`HTTP 000`** — never connected. Malformed endpoint or a security group.
+
+A distinct failure with the same outward symptom: the chart embeds the password
+into `openmetadata.yaml` **at container start**, so an apply that rolls the
+password updates the secret while the running pod keeps the old one in memory.
+`diagnose` catches this by comparing hashes of the two and warns; the fix is
+`restart-server`, not a password reset.
+
+### Fixing it
+
+1. Run `reset-opensearch-password` (a few minutes; it waits for
+   `Processing=False`).
+2. Run `test-search-write` — expect `200`.
+3. In the UI: **Settings → Applications → Search Indexing → Configure**,
+   *Recreate Index* = true, all entity types, **Run**.
+
+No re-ingestion is needed. The entities are already in the database; only the
+index was missing. A pod restart is not needed either — the server's password is
+already correct, and it is the domain being moved to match it.
+
+### Two known traps
+
+- **`ELASTICSEARCH_HOST`, `_PORT`, `_SCHEME` and `_USER` reach the container
+  wrapped in literal double-quote characters.** `helm_values.tftpl` writes them
+  unquoted, so the quoting is added downstream by the chart.
+  `ELASTICSEARCH_PASSWORD` is unaffected because it arrives via `secretRef`
+  rather than string templating. This does not stop the server, but anything
+  reading those variables must strip the quotes or it will fail to resolve the
+  host — `curl` reports `HTTP 000`. Verify with a byte dump, not by eye:
+  ```bash
+  kubectl exec -n openmetadata deploy/openmetadata -- \
+    sh -c 'printf %s "$ELASTICSEARCH_HOST"' | od -c | head
+  ```
+- **The server image ships no `curl` or `wget`.** Probing OpenSearch from inside
+  it is impossible; a naive `command -v curl` guard exits 0 and reads as a pass.
+  `openmetadata-ops` runs its probe in a throwaway `curlimages/curl` pod
+  instead — scheduled onto the same nodes, so it presents the same node security
+  group to the VPC-only domain, and the password is injected by `secretKeyRef`
+  so it never appears in a pod spec or a log.
+
+### Worth fixing properly
+
+Password drift will recur on any apply that rolls it. Two durable options: add a
+checksum annotation to the deployment's pod template so a secret change forces a
+rollout, or give `random_password` `keepers` so it stops regenerating. The first
+is the better fix but lives in the upstream module's deployment template, so it
+needs `app_extra_helm_values` or an upstream change.
 
 ## Configuration notes
 
