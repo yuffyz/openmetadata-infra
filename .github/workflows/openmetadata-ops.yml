@@ -312,10 +312,10 @@ jobs:
           req() {
             m=$1; p=$2; d=${3:-}
             if [ -n "$d" ]; then
-              code=$(curl -s -o /tmp/body -w '%{http_code}' --max-time 25 -X "$m" \
+              code=$(curl -s -o /tmp/body -w '%{http_code}' --max-time 120 -X "$m" \
                        -u "$OS_USER:$OS_PASS" -H 'Content-Type: application/json' -d "$d" "$B$p")
             else
-              code=$(curl -s -o /tmp/body -w '%{http_code}' --max-time 25 -X "$m" \
+              code=$(curl -s -o /tmp/body -w '%{http_code}' --max-time 120 -X "$m" \
                        -u "$OS_USER:$OS_PASS" "$B$p")
             fi
             printf '\n%-44s -> HTTP %s\n' "$m $p" "$code"
@@ -323,8 +323,14 @@ jobs:
           }
 
           req GET /_cluster/health
-          # Doc counts are the direct answer to "are the indices empty?".
-          req GET "/_cat/indices?v&s=index"
+          # Shard count is the capacity question: two t3.small.search nodes have
+          # roughly 1 GiB of heap each, and the usual ceiling is ~20-25 shards
+          # per GiB. Hundreds of shards make the cluster time out rather than
+          # refuse, which shows up as HTTP 000/504 instead of an error body.
+          req GET "/_cat/health?v"
+          # Doc counts are the direct answer to "are the indices empty?", and
+          # store.size shows which indices are worth reclaiming.
+          req GET "/_cat/indices?v&h=index,health,pri,rep,docs.count,store.size&s=store.size:desc"
           # Which OpenSearch user/roles the credentials map to. The FGAC master
           # user should map to all_access; anything else explains read-yes/write-no.
           req GET /_plugins/_security/api/account
