@@ -39,6 +39,7 @@ on:
           - diagnose                 # read-only; changes nothing
           - restart-server           # rollout restart of the OpenMetadata deployment
           - diagnose-and-restart     # diagnose, restart, then diagnose again
+          - test-search-write        # probe WRITE auth: creates and deletes a throwaway index
         default: diagnose
 
 concurrency:
@@ -220,8 +221,69 @@ jobs:
             | grep -iE 'opensearch|elasticsearch|unauthorized|index' | tail -40 || true
           echo "::endgroup::"
 
+      # Probes what indexing actually needs: create an index, write a document,
+      # refresh, delete. A 200 on /_cluster/health only proves the credentials
+      # authenticate for a READ -- the search sink creates indices and issues
+      # _bulk writes, which are authorised separately and can also be refused by
+      # a cluster-level write block.
+      #
+      # Uses a throwaway index (om-auth-probe) and removes it again. It never
+      # touches OpenMetadata's own indices.
+      - name: Probe OpenSearch write access
+        if: ${{ github.event.inputs.action == 'test-search-write' }}
+        run: |
+          set -uo pipefail
+          kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c '
+            user="${ELASTICSEARCH_USERNAME:-${ELASTICSEARCH_USER:-admin}}"
+            scheme="${ELASTICSEARCH_SCHEME:-https}"
+            host="${ELASTICSEARCH_HOST:-}"
+            port="${ELASTICSEARCH_PORT:-443}"
+            [ -n "$host" ] || { echo "ELASTICSEARCH_HOST unset"; exit 1; }
+            command -v curl >/dev/null 2>&1 || { echo "curl absent from image"; exit 1; }
+            B="$scheme://$host:$port"
+            A="-u $user:${ELASTICSEARCH_PASSWORD:-}"
+            req() { printf "%-34s -> HTTP %s\n" "$1 $2" \
+                     "$(curl -s -o /tmp/body -w "%{http_code}" --max-time 20 -X "$1" $A "$B$2" ${3:+-H "Content-Type: application/json" -d "$3"})"; \
+                    head -c 400 /tmp/body; echo; }
+
+            echo "--- cluster state (body, not just the code) ---"
+            curl -s --max-time 20 $A "$B/_cluster/health?pretty"
+
+            echo "--- write blocks / disk watermark ---"
+            # A cluster that crossed the flood-stage watermark flips indices to
+            # read_only_allow_delete. That surfaces as a write failure while all
+            # reads keep returning 200 -- worth ruling out explicitly, since the
+            # dev domain has only 10 GiB per node.
+            curl -s --max-time 20 $A "$B/_cluster/settings?flat_settings=true&include_defaults=true" \
+              | tr "," "\n" | grep -iE "watermark|read_only" | head -20
+            curl -s --max-time 20 $A "$B/_cat/allocation?v"
+
+            echo "--- FGAC identity actually in use ---"
+            # Confirms which OpenSearch user/roles the credentials map to. The
+            # master user should map to all_access; anything else explains a
+            # read-yes/write-no result.
+            curl -s --max-time 20 $A "$B/_plugins/_security/api/account?pretty"
+
+            echo "--- write probe ---"
+            req DELETE /om-auth-probe
+            req PUT    /om-auth-probe
+            req POST   "/om-auth-probe/_doc?refresh=true" "{\"probe\":true}"
+            # _bulk is what the search sink actually uses. NDJSON needs real
+            # newlines, built with printf so this stays on one YAML line.
+            # Note _bulk can return HTTP 200 with per-item errors in the body,
+            # which is why req prints the body too.
+            req POST /_bulk "$(printf "{\"index\":{\"_index\":\"om-auth-probe\"}}\n{\"probe\":\"bulk\"}\n")"
+            req DELETE /om-auth-probe
+          ' || true
+
+          echo
+          echo "Interpretation:"
+          echo "  all 200/201        -> credentials and write auth are fine; the failure is stale or elsewhere"
+          echo "  health 200, PUT 403 -> authenticated but not authorised: check the account/roles output above"
+          echo "  cluster_block_exception / read_only_allow_delete -> disk watermark, not auth; grow the volume"
+
       - name: Restart the OpenMetadata server
-        if: ${{ github.event.inputs.action != 'diagnose' }}
+        if: ${{ github.event.inputs.action == 'restart-server' || github.event.inputs.action == 'diagnose-and-restart' }}
         run: |
           set -euo pipefail
           kubectl rollout restart "deploy/$RELEASE" -n "$NAMESPACE"
