@@ -108,7 +108,7 @@ opensearch = {
     domain_name             = "openmetadata-dev"
     engine_version          = "OpenSearch_3.3"
     instance_count          = 2
-    instance_type           = "t3.small.search"
+    instance_type           = "t3.medium.search"
     tls_security_policy     = "Policy-Min-TLS-1-2-2019-07"
   }
   credentials = {
