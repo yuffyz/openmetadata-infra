@@ -48,7 +48,7 @@ resource "kubernetes_service_v1" "app_public" {
       {
         "service.beta.kubernetes.io/aws-load-balancer-type"            = "external"
         "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type" = "ip"
-        "service.beta.kubernetes.io/aws-load-balancer-scheme"          = "internet-facing"
+        "service.beta.kubernetes.io/aws-load-balancer-scheme"          = var.app_lb_scheme
         "service.beta.kubernetes.io/aws-load-balancer-name"            = local.app_nlb_name
 
         # Off by default on an NLB (defaultLoadBalancingCrossZoneEnabled =
@@ -66,7 +66,7 @@ resource "kubernetes_service_v1" "app_public" {
       # what we want here, but naming them keeps it explicit and survives a
       # port being added later.
       local.app_tls_enabled ? {
-        "service.beta.kubernetes.io/aws-load-balancer-ssl-cert"  = aws_acm_certificate_validation.app[0].certificate_arn
+        "service.beta.kubernetes.io/aws-load-balancer-ssl-cert"  = local.app_cert_arn
         "service.beta.kubernetes.io/aws-load-balancer-ssl-ports" = join(",", [for p in local.app_public_ports : p.name])
       } : {}
     )

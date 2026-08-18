@@ -12,13 +12,13 @@
 # stamps on everything it provisions, and point Route 53 at it.
 
 data "aws_route53_zone" "app" {
-  count        = local.app_tls_enabled ? 1 : 0
+  count        = local.app_cert_managed ? 1 : 0
   name         = var.app_tls_route53_zone_name
   private_zone = false
 }
 
 resource "aws_acm_certificate" "app" {
-  count             = local.app_tls_enabled ? 1 : 0
+  count             = local.app_cert_managed ? 1 : 0
   domain_name       = var.app_tls_domain_name
   validation_method = "DNS"
 
@@ -30,7 +30,7 @@ resource "aws_acm_certificate" "app" {
 # DNS validation records. allow_overwrite guards against a stale record from a
 # previous certificate for the same name.
 resource "aws_route53_record" "app_cert_validation" {
-  for_each = local.app_tls_enabled ? {
+  for_each = local.app_cert_managed ? {
     for dvo in aws_acm_certificate.app[0].domain_validation_options :
     dvo.domain_name => {
       name   = dvo.resource_record_name
@@ -51,7 +51,7 @@ resource "aws_route53_record" "app_cert_validation" {
 # annotation references this rather than the certificate itself, so the Service
 # is never created with an unvalidated ARN.
 resource "aws_acm_certificate_validation" "app" {
-  count                   = local.app_tls_enabled ? 1 : 0
+  count                   = local.app_cert_managed ? 1 : 0
   certificate_arn         = aws_acm_certificate.app[0].arn
   validation_record_fqdns = [for r in aws_route53_record.app_cert_validation : r.fqdn]
 }
@@ -71,7 +71,7 @@ resource "aws_acm_certificate_validation" "app" {
 # account. Referencing the Service resource also orders this read after the
 # provider has waited for the load balancer to come up.
 data "aws_lb" "app" {
-  count = local.app_tls_enabled ? 1 : 0
+  count = local.app_cert_managed ? 1 : 0
 
   tags = {
     "elbv2.k8s.aws/cluster"    = local.eks_cluster_name
@@ -83,7 +83,7 @@ data "aws_lb" "app" {
 # Alias record rather than CNAME: no charge for queries, and it resolves at a
 # zone apex if the domain is ever moved there.
 resource "aws_route53_record" "app" {
-  count   = local.app_tls_enabled ? 1 : 0
+  count   = local.app_cert_managed ? 1 : 0
   zone_id = data.aws_route53_zone.app[0].zone_id
   name    = var.app_tls_domain_name
   type    = "A"
