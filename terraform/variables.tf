@@ -203,13 +203,76 @@ variable "app_tls_domain_name" {
 }
 
 variable "app_tls_route53_zone_name" {
-  description = "Public Route 53 hosted zone that owns app_tls_domain_name, e.g. example.com. Used for both ACM DNS validation and the alias record."
+  description = "Public Route 53 hosted zone that owns app_tls_domain_name, e.g. example.com. Used for both ACM DNS validation and the alias record. Leave empty when supplying app_tls_certificate_arn -- DNS is then yours to manage."
+  type        = string
+  default     = ""
+
+  # Required only when Terraform has to issue the certificate. With
+  # app_tls_certificate_arn set there is nothing to validate and no record to
+  # create, so a Route 53 zone is neither needed nor consulted.
+  validation {
+    condition     = var.app_tls_domain_name == "" || var.app_tls_certificate_arn != "" || var.app_tls_route53_zone_name != ""
+    error_message = "app_tls_route53_zone_name must be set when app_tls_domain_name is set and no app_tls_certificate_arn is supplied -- the certificate is DNS-validated and the alias record is created in that zone."
+  }
+}
+
+# Bring-your-own certificate, for a domain that does not live in Route 53.
+#
+# An internal-only zone cannot be served by an ACM-issued public certificate at
+# all: ACM validates by resolving a record from the public internet, so a name
+# that resolves nowhere public can never be issued. The supported route is to
+# import a certificate from your own PKI and point this at it.
+#
+#   aws acm import-certificate --region <same region as the NLB> \
+#     --certificate fileb://cert.pem \
+#     --private-key  fileb://key.pem \
+#     --certificate-chain fileb://chain.pem
+#
+# Two operational notes. The certificate must live in the SAME region as the
+# load balancer, and imported certificates do NOT auto-renew -- re-import before
+# expiry with `--certificate-arn <existing arn>` so the ARN is stable and the
+# listener keeps working without a Terraform change.
+#
+# Setting this skips certificate issuance, DNS validation and the Route 53 alias
+# record entirely. Creating the DNS record is then yours: a CNAME from your
+# FQDN to the load balancer's *.elb.amazonaws.com name. Prefer a CNAME over an
+# A record -- an NLB's addresses are stable but change if it is ever replaced,
+# and an internal NLB's AWS hostname resolves through public DNS to its private
+# addresses, so a CNAME works from inside the VPC.
+variable "app_tls_certificate_arn" {
+  description = "ARN of an existing ACM certificate to terminate TLS with, in the same region as the NLB. Use for domains outside Route 53 (e.g. an internal-only zone) with a certificate imported from your own PKI. When set, Terraform issues no certificate and creates no DNS record."
   type        = string
   default     = ""
 
   validation {
-    condition     = var.app_tls_domain_name == "" || var.app_tls_route53_zone_name != ""
-    error_message = "app_tls_route53_zone_name must be set when app_tls_domain_name is set -- the certificate is DNS-validated and the record is created in that zone."
+    condition     = var.app_tls_certificate_arn == "" || var.app_expose_via_nlb
+    error_message = "app_tls_certificate_arn requires app_expose_via_nlb = true -- TLS terminates on the NLB, so there must be one."
+  }
+
+  validation {
+    condition     = var.app_tls_certificate_arn == "" || can(regex("^arn:aws[a-z-]*:acm:", var.app_tls_certificate_arn))
+    error_message = "app_tls_certificate_arn must be an ACM certificate ARN, e.g. arn:aws:acm:us-east-1:123456789012:certificate/<id>."
+  }
+}
+
+# internet-facing (default) publishes the NLB on public addresses; internal
+# gives it private addresses in the private subnets, reachable only from inside
+# the VPC and whatever is routed to it (VPN, Direct Connect, Transit Gateway).
+# The private subnets already carry kubernetes.io/role/internal-elb, so the
+# controller can place an internal load balancer without further tagging.
+#
+# > ⚠️ Changing this REPLACES the load balancer. Scheme is one of the two
+# > changes the controller treats as requiring replacement
+# > (isSDKLoadBalancerRequiresReplacement), so the *.elb.amazonaws.com hostname
+# > changes and the UI is unreachable until DNS is repointed.
+variable "app_lb_scheme" {
+  description = "NLB scheme: internet-facing or internal. Changing it replaces the load balancer and changes its hostname."
+  type        = string
+  default     = "internet-facing"
+
+  validation {
+    condition     = contains(["internet-facing", "internal"], var.app_lb_scheme)
+    error_message = "app_lb_scheme must be \"internet-facing\" or \"internal\"."
   }
 }
 

@@ -4,13 +4,34 @@ output "update_kubeconfig" {
 }
 
 output "openmetadata_url" {
-  description = "URL of the OpenMetadata UI. HTTPS on 443 via the domain when TLS is configured, otherwise the raw NLB hostname on plain HTTP 8585, otherwise a port-forward command."
-  value = (local.app_tls_enabled
+  description = "URL of the OpenMetadata UI. HTTPS on 443 via the domain when TLS is configured, otherwise the raw NLB hostname on plain HTTP 8585, otherwise a port-forward command. With a supplied certificate and no domain name, the NLB hostname must be resolved from AWS."
+  value = (local.app_tls_enabled && var.app_tls_domain_name != ""
     ? "https://${var.app_tls_domain_name}"
-    : (var.app_expose_via_nlb
-      ? "http://<nlb-hostname>:8585 -- kubectl get svc -n ${local.namespace} openmetadata-public -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
-    : "kubectl port-forward -n ${local.namespace} svc/openmetadata 8585:8585 -- then http://localhost:8585")
+    # TLS is on via app_tls_certificate_arn but no FQDN was declared, so the URL
+    # is not knowable here -- the certificate's own domain is what browsers will
+    # require, and only the operator knows it.
+    : (local.app_tls_enabled
+      ? "https://<nlb-hostname> -- kubectl get svc -n ${local.namespace} openmetadata-public -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' (set app_tls_domain_name to record the intended FQDN)"
+      : (var.app_expose_via_nlb
+        ? "http://<nlb-hostname>:8585 -- kubectl get svc -n ${local.namespace} openmetadata-public -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
+    : "kubectl port-forward -n ${local.namespace} svc/openmetadata 8585:8585 -- then http://localhost:8585"))
   )
+}
+
+# Whether Terraform owns the DNS record for the UI.
+#
+# False with app_tls_certificate_arn set: no Route 53 zone is consulted and no
+# record is created, so the CNAME from your FQDN to the load balancer's
+# *.elb.amazonaws.com name is yours to create and to keep. Surfaced as an output
+# so it is visible in `terraform output` rather than only in the code.
+output "app_dns_managed" {
+  description = "True when Terraform creates the Route 53 alias record for the UI. False when a certificate ARN was supplied and DNS is managed outside Terraform."
+  value       = local.app_cert_managed
+}
+
+output "app_lb_scheme" {
+  description = "Scheme of the UI load balancer. internal means private addresses, reachable only from the VPC and networks routed to it."
+  value       = var.app_expose_via_nlb ? var.app_lb_scheme : ""
 }
 
 # --- machine-readable outputs, consumed by deploy.yml ------------------------
@@ -21,8 +42,8 @@ output "openmetadata_url" {
 # hostname from AWS, and needs these to do it.
 
 output "app_url" {
-  description = "Final UI URL when it is knowable at apply time (TLS configured). Empty when the NLB hostname must be resolved from AWS after the fact."
-  value       = local.app_tls_enabled ? "https://${var.app_tls_domain_name}" : ""
+  description = "Final UI URL when it is knowable at apply time (TLS configured and an FQDN declared). Empty when the NLB hostname must be resolved from AWS after the fact. Note this is the INTENDED URL: with app_tls_certificate_arn the DNS record is not created here, so it resolves only once you have published it."
+  value       = local.app_tls_enabled && var.app_tls_domain_name != "" ? "https://${var.app_tls_domain_name}" : ""
 }
 
 output "app_expose_via_nlb" {

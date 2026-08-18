@@ -458,6 +458,73 @@ Three things to know before enabling it:
 The hosted zone must already exist and be **public** — this repo does not create
 it, and DNS validation needs it to be authoritative for the domain.
 
+### A domain outside Route 53 — internal-only zones
+
+`app_tls_domain_name` + `app_tls_route53_zone_name` only work for a **public
+Route 53 hosted zone in this account**: `nlb_tls.tf` looks the zone up with a
+data source and ACM proves ownership by publishing a validation record into it.
+For a zone held elsewhere — an internal `ffdb.com`, say — that path cannot be
+used at all.
+
+The blocker is not Route 53, it is ACM. **A public certificate can never be
+issued for an internal-only name**, because ACM validates by resolving a record
+from the public internet, and a name that resolves nowhere public never
+validates. Email validation does not help either.
+
+So bring your own certificate. Import one from your corporate PKI — which
+clients on the internal network already trust — and point
+`app_tls_certificate_arn` at it:
+
+```bash
+aws acm import-certificate --region us-east-1 \
+  --certificate       fileb://cert.pem \
+  --private-key       fileb://key.pem \
+  --certificate-chain fileb://chain.pem
+```
+
+```hcl
+app_tls_domain_name     = "openmetadata.ffdb.com"   # served FQDN, for the URL output
+app_tls_certificate_arn = "arn:aws:acm:us-east-1:<acct>:certificate/<id>"
+app_lb_scheme           = "internal"
+app_lb_allowed_cidrs    = ["10.0.0.0/8"]            # internal ranges, not workstation /32s
+```
+
+Leave `app_tls_route53_zone_name` empty. Setting a certificate ARN switches off
+certificate issuance, DNS validation, the load balancer lookup and the alias
+record — every resource in `nlb_tls.tf`. `local.app_cert_managed` is the flag
+that gates them, and `terraform output app_dns_managed` reports `false` so the
+split is visible without reading the code.
+
+Then publish the record yourself:
+
+```
+openmetadata.ffdb.com.  CNAME  <name>.elb.amazonaws.com.
+```
+
+A **CNAME, not an A record**. An NLB's addresses are stable but change if it is
+ever replaced, and an internal NLB's AWS hostname resolves through *public* DNS
+to its *private* addresses — so a CNAME resolves correctly from inside the VPC
+and self-heals across a replacement.
+
+Three things to plan for:
+
+- **`app_lb_scheme = "internal"` REPLACES the load balancer.** Scheme is one of
+  the two changes the controller treats as requiring replacement
+  (`isSDKLoadBalancerRequiresReplacement`), so the hostname changes and the UI
+  is unreachable until DNS is repointed. Budget a short outage.
+- **Clients need a route into the VPC** — VPN, Direct Connect or Transit
+  Gateway. An internal NLB has no public address, so allowlisting alone is not
+  enough to make it reachable.
+- **Imported certificates do not auto-renew.** Re-import before expiry with
+  `--certificate-arn <existing arn>`; the ARN stays stable, the listener keeps
+  working, and no Terraform change is needed. Nothing here will warn you, so
+  put the expiry in a calendar.
+
+Migrating an existing environment onto this path moves the old certificate and
+alias record from managed to unmanaged, so **`plan` will show
+`aws_route53_record.app` and `aws_acm_certificate.app` being destroyed.** That is
+correct when migrating — but read it, rather than approving past it.
+
 ### Any environment — port-forward
 
 Works with no load balancer and no public exposure:
@@ -477,25 +544,30 @@ version.
 | `app_expose_via_nlb` | `false` | Install the LB Controller and switch the Service to `LoadBalancer` |
 | `app_lb_allowed_cidrs` | `[]` | CIDRs allowed to reach the NLB. **Required** when the toggle is on |
 | `app_tls_domain_name` | `""` | FQDN to serve over HTTPS. Empty leaves the NLB on plain HTTP |
-| `app_tls_route53_zone_name` | `""` | Public hosted zone owning that FQDN. **Required** with the above |
+| `app_tls_route53_zone_name` | `""` | Public Route 53 zone owning that FQDN. Required with the above **unless** `app_tls_certificate_arn` is set |
+| `app_tls_certificate_arn` | `""` | Existing ACM certificate to terminate with, for a domain outside Route 53. Skips issuance, validation and DNS |
+| `app_lb_scheme` | `"internet-facing"` | `internal` gives the NLB private addresses. **Changing it replaces the load balancer** |
 | `lb_controller_chart_version` | `null` | Controller chart version; `null` tracks latest |
 | `app_extra_helm_values` | `{}` | Arbitrary Helm `set` overrides, merged last |
 
-Four validation rules fail the plan rather than let a broken or unsafe config
+Validation rules fail the plan rather than let a broken or unsafe config
 through: an empty `app_lb_allowed_cidrs` while the NLB toggle is on, `0.0.0.0/0`
-anywhere in that list, a TLS domain without `app_expose_via_nlb`, and a TLS
-domain without a hosted zone.
+anywhere in that list, an entry that is not CIDR notation, a TLS domain or
+certificate ARN without `app_expose_via_nlb`, a TLS domain with neither a hosted
+zone nor a certificate ARN, a certificate ARN that is not an ACM ARN, and a
+scheme that is neither `internet-facing` nor `internal`.
 
 `module "app"` is **shared by both environments**, so exposure has to be a
 variable — hardcoding `service.type` would publish production on its next apply.
 That's why the toggle defaults to `false` and only dev opts in.
 
-Source ranges are applied as the controller annotation
-`service.beta.kubernetes.io/load-balancer-source-ranges`, not
-`service.loadBalancerSourceRanges`. The chart templates `service.annotations`
-verbatim, so the annotation is guaranteed to reach the Service; relying on a
-dedicated chart field that may not exist would silently leave the NLB open.
-Enforcement needs a controller that manages NLB security groups (v2.6+).
+Source ranges are applied as `spec.loadBalancerSourceRanges` on the Service in
+`nlb_service.tf` — the native field, which the controller reads first and turns
+into the NLB's security group rules. (An earlier revision used the
+`service.beta.kubernetes.io/load-balancer-source-ranges` annotation because the
+values went through the chart; owning the Service outright removed that
+constraint.) Enforcement needs a controller that manages NLB security groups
+(v2.6+).
 
 > ⚠️ **Without `app_tls_domain_name`, the NLB serves plain HTTP.** Credentials —
 > including that default admin password — cross the internet in the clear.

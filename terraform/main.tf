@@ -35,7 +35,27 @@ module "app" {
 # (nlb_service.tf), because an NLB listener port is always the Service port and
 # 8585 is the address the cluster itself depends on. See the comment there.
 locals {
-  app_tls_enabled = var.app_expose_via_nlb && var.app_tls_domain_name != ""
+  # TLS terminates on the NLB when there is a certificate to terminate it with,
+  # from either route: Terraform issues one via ACM + Route 53, or the operator
+  # supplies an existing ARN (app_tls_certificate_arn) for a domain that is not
+  # in Route 53.
+  app_tls_enabled = var.app_expose_via_nlb && (var.app_tls_domain_name != "" || var.app_tls_certificate_arn != "")
+
+  # True only for the Route 53 route, and therefore the switch for every
+  # resource in nlb_tls.tf: the certificate, its DNS validation records, the
+  # load balancer lookup and the alias record. With a supplied ARN none of that
+  # exists and DNS belongs to whoever owns the zone.
+  app_cert_managed = var.app_expose_via_nlb && var.app_tls_domain_name != "" && var.app_tls_certificate_arn == ""
+
+  # The ARN that reaches the Service's ssl-cert annotation. On the managed route
+  # it references the VALIDATION resource, not the certificate, so the Service
+  # never carries an unissued ARN.
+  # one() rather than [0]: it yields null for a zero-count resource, where an
+  # index would risk an "Invalid index" error on the branch that is not taken.
+  app_cert_arn = (var.app_tls_certificate_arn != ""
+    ? var.app_tls_certificate_arn
+    : one(aws_acm_certificate_validation.app[*].certificate_arn)
+  )
 
   # Recognizable NLB name in the console, applied when the controller first
   # provisions the load balancer. Nothing depends on it being the actual name

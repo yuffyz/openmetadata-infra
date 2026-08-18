@@ -57,6 +57,38 @@ app_lb_allowed_cidrs = [
 # app_tls_domain_name       = "openmetadata.example.com"
 # app_tls_route53_zone_name = "example.com"
 
+# --- Internal-only domain (a zone that is NOT in Route 53) -------------------
+# An internal-only name cannot be served by an ACM-issued certificate: ACM
+# validates by resolving a record from the public internet, so a name that
+# resolves nowhere public can never be issued. Import a certificate from your
+# own PKI instead -- clients on the corporate network already trust that CA:
+#
+#   aws acm import-certificate --region us-east-1 \
+#     --certificate fileb://cert.pem --private-key fileb://key.pem \
+#     --certificate-chain fileb://chain.pem
+#
+# Then set the ARN below and LEAVE app_tls_route53_zone_name empty. Terraform
+# issues no certificate and creates no DNS record; publish a CNAME from the
+# FQDN to the load balancer's *.elb.amazonaws.com name in your own zone.
+# `terraform output app_dns_managed` reports false to make that explicit.
+#
+# app_tls_domain_name     = "openmetadata.ffdb.com"   # served FQDN, for the URL output
+# app_tls_certificate_arn = "arn:aws:acm:us-east-1:<acct>:certificate/<id>"
+#
+# Imported certificates do NOT auto-renew. Re-import before expiry with
+# `--certificate-arn <existing arn>` so the ARN stays stable and the listener
+# keeps working without a Terraform change.
+#
+# For a UI that should not be reachable from the internet at all, make the load
+# balancer private too. Clients then need a route into the VPC (VPN, Direct
+# Connect, Transit Gateway), and app_lb_allowed_cidrs should list your internal
+# ranges rather than workstation /32s.
+#
+# > ⚠️ Changing the scheme REPLACES the load balancer: new hostname, and the UI
+# > is unreachable until DNS is repointed.
+#
+# app_lb_scheme = "internal"
+
 # Stable outbound address. Everything runs in private subnets, so external
 # systems see the NAT gateway's IP -- and by default that IP is reallocated on
 # every destroy/apply, silently breaking anything that allowlisted the old one
