@@ -30,16 +30,41 @@ app_version      = "1.12.13"
 #
 # Adds roughly $0.55-0.70/day for the NLB, plus LCUs.
 #
-# Both entries are dynamic ISP addresses: if access starts hanging, re-check
-# with `curl ifconfig.me` from the affected network and update the /32.
+# Reconciled against the live security group, which had drifted to 15 CIDRs
+# while this file still listed 2. Applying the old list would have removed
+# 162.10.0.0/17 -- the range corporate VPN clients egress from -- and locked
+# everyone out. The set below is the exact equivalent of what was live, with
+# seven entries dropped because a broader entry already covered them
+# (162.10.127.41/32 sits inside 162.10.0.0/17; five 163.116.x addresses and
+# 163.116.128.0/32 sit inside 163.116.128.0/17).
+#
+# The dynamic-ISP /32s still need re-checking with `curl ifconfig.me` from the
+# affected network when access starts hanging.
 #
 # Without this, the UI is still reachable via:
 #   kubectl port-forward -n openmetadata svc/openmetadata 8585:8585
 app_expose_via_nlb = true
 app_lb_allowed_cidrs = [
-  "73.141.150.76/32",  # workstation egress (seen in CloudTrail)
-  "163.116.255.50/32", # additional allowed client
+  # Corporate VPN / proxy egress pools. Broad on purpose: clients egress from a
+  # rotating pool, so a /32 per complaint never converges. Together these permit
+  # ~66,000 addresses -- see the warning below about the default admin account.
+  "162.10.0.0/17",
+  "163.116.128.0/17",
+  "8.39.144.0/24",
+  "8.36.116.0/24",
+  "31.186.239.0/24",
+  # Individual clients.
+  "73.141.150.76/32", # workstation egress (seen in CloudTrail)
+  "153.66.173.67/32",
+  "24.63.41.112/32",
 ]
+
+# > ⚠️ With an internet-facing NLB, this list is the ONLY thing limiting who can
+# > reach the UI, and it currently admits ~66k addresses. TLS encrypts the
+# > transport; it does nothing for the auth model, and the chart still ships a
+# > single `admin` account with a well-known password. Change that password and
+# > configure OIDC/SAML (`openmetadata.config.authentication.*`) before treating
+# > this as safe.
 
 # HTTPS on the NLB. Set both to terminate TLS with an ACM certificate and get a
 # Route 53 alias record; leave them empty and the NLB stays plain HTTP (browsers
@@ -72,17 +97,32 @@ app_lb_allowed_cidrs = [
 # FQDN to the load balancer's *.elb.amazonaws.com name in your own zone.
 # `terraform output app_dns_managed` reports false to make that explicit.
 #
-# app_tls_domain_name     = "openmetadata.ffdb.com"   # served FQDN, for the URL output
-# app_tls_certificate_arn = "arn:aws:acm:us-east-1:<acct>:certificate/<id>"
-#
 # Imported certificates do NOT auto-renew. Re-import before expiry with
 # `--certificate-arn <existing arn>` so the ARN stays stable and the listener
 # keeps working without a Terraform change.
+app_tls_domain_name     = "openmetadata-dev.ffdb.com"
+app_tls_certificate_arn = "arn:aws:acm:us-east-1:146445314234:certificate/a443aeb2-67db-4105-8c05-b9ca0020e654"
+
+# --- Scheme: internet-facing, deliberately ----------------------------------
+# Left at the default (internet-facing) after trying `internal` and reverting.
 #
-# For a UI that should not be reachable from the internet at all, make the load
-# balancer private too. Clients then need a route into the VPC (VPN, Direct
-# Connect, Transit Gateway), and app_lb_allowed_cidrs should list your internal
-# ranges rather than workstation /32s.
+# `internal` gives the load balancer private addresses only, so it is reachable
+# just from inside the VPC and networks routed to it. A corporate VPN
+# (GlobalProtect here) puts the client on the CORPORATE network, which is not
+# this VPC: with no Site-to-Site VPN, Direct Connect, Transit Gateway or peering
+# carrying 172.72.0.0/16, packets never arrive. Every connection times out, and
+# no app_lb_allowed_cidrs entry can help -- allowlisting a PUBLIC address on an
+# internal load balancer is a no-op, because there is no path for the packet to
+# take in the first place.
+#
+# So the UI stays internet-facing and the allowlist below is what limits access.
+# TLS still terminates on the listener with the imported certificate above, so
+# credentials are encrypted in transit either way.
+#
+# To revisit `internal`, the prerequisite is routing, not configuration: confirm
+# it first with the "Is anything routed into this VPC?" section of the
+# openmetadata-ops `show-exposure` action. Private subnets showing only
+# 0.0.0.0/0 -> NAT gateway are egress-only, and internal cannot work.
 #
 # > ⚠️ Changing the scheme REPLACES the load balancer: new hostname, and the UI
 # > is unreachable until DNS is repointed.
