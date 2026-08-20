@@ -43,6 +43,7 @@ on:
           - reset-opensearch-password  # MUTATES: set the domain master password to the secret's value
           - rotate-opensearch-password # MUTATES: new password on BOTH domain and secret, then restart
           - reduce-replicas          # MUTATES (dev only): number_of_replicas = 0 on non-system indices
+          - show-exposure            # read-only: how the UI is published (LB, listeners, cert, DNS, SG)
         default: diagnose
 
 concurrency:
@@ -672,6 +673,128 @@ jobs:
           echo "Expect status=green and unassign=0 in the 'after' block."
           echo "If it is still yellow, the missing data node is the remaining cause;"
           echo "check us-east-1b in the diagnose action's AWS domain health output."
+
+      # Everything about how the UI is published, in one read-only run: the
+      # Service the controller reconciles, the load balancer it produced, the
+      # listeners and certificate, target health, the security group rules
+      # actually in force, and any matching Route 53 record.
+      #
+      # Written for the "I cannot reach the URL" case, where the answer is
+      # usually one of: wrong scheme, no listener on the port being tried, a
+      # source range that does not match the address the load balancer actually
+      # sees, only some AZs routed, or DNS pointing at a load balancer that has
+      # since been replaced.
+      #
+      # Note ICMP is never the test: an NLB does not answer ping, and the
+      # controller-managed security group opens only the listener ports. A
+      # timed-out ping against a perfectly healthy NLB is the expected result.
+      - name: Show exposure
+        if: ${{ github.event.inputs.action == 'show-exposure' }}
+        run: |
+          set -uo pipefail
+          R="${{ vars.AWS_REGION }}"
+
+          echo "::group::Declared in $TFVARS_FILE"
+          grep -nE '^[[:space:]]*(app_expose_via_nlb|app_lb_scheme|app_lb_allowed_cidrs|app_tls_domain_name|app_tls_route53_zone_name|app_tls_certificate_arn)' \
+            "$TFVARS_FILE" || echo "(no exposure variables set -- UI is ClusterIP + port-forward only)"
+          echo "::endgroup::"
+
+          echo "::group::Service openmetadata-public (what the controller reconciles)"
+          kubectl get svc -n "$NAMESPACE" openmetadata-public -o wide 2>/dev/null \
+            || echo "Service not found -- app_expose_via_nlb is probably false"
+          kubectl get svc -n "$NAMESPACE" openmetadata-public -o json 2>/dev/null | python3 -c '
+          import json, sys
+          try: d = json.load(sys.stdin)
+          except Exception: sys.exit(0)
+          print("\nannotations:")
+          for k, v in sorted((d["metadata"].get("annotations") or {}).items()):
+              print(f"  {k} = {v}")
+          sp = d.get("spec", {})
+          print("\ntype:", sp.get("type"))
+          print("loadBalancerSourceRanges:", sp.get("loadBalancerSourceRanges"))
+          print("ports:", [(p.get("name"), p.get("port"), p.get("targetPort")) for p in sp.get("ports", [])])
+          ing = (d.get("status", {}).get("loadBalancer", {}) or {}).get("ingress") or []
+          print("status hostname:", [i.get("hostname") or i.get("ip") for i in ing])'
+          echo "::endgroup::"
+
+          # Scope to load balancers this cluster owns, by the tag the controller
+          # stamps on everything it provisions. Avoids picking up unrelated load
+          # balancers in the same account.
+          for arn in $(aws elbv2 describe-load-balancers --region "$R" \
+                         --query 'LoadBalancers[].LoadBalancerArn' --output text 2>/dev/null); do
+            owner=$(aws elbv2 describe-tags --resource-arns "$arn" --region "$R" \
+                      --query "TagDescriptions[0].Tags[?Key=='elbv2.k8s.aws/cluster'].Value" \
+                      --output text 2>/dev/null)
+            [ "$owner" = "$CLUSTER" ] || continue
+
+            name=$(aws elbv2 describe-load-balancers --load-balancer-arns "$arn" --region "$R" \
+                     --query 'LoadBalancers[0].LoadBalancerName' --output text)
+            echo "::group::Load balancer $name"
+
+            # Per-AZ private addresses matter: an internal NLB has one address
+            # per AZ and DNS hands them out in rotation, so a VPN that routes
+            # only one of the private subnets black-holes half the attempts.
+            aws elbv2 describe-load-balancers --load-balancer-arns "$arn" --region "$R" \
+              --query 'LoadBalancers[].{Name:LoadBalancerName,Type:Type,Scheme:Scheme,State:State.Code,DNS:DNSName,Zones:AvailabilityZones[].{Zone:ZoneName,Subnet:SubnetId,Addrs:LoadBalancerAddresses[].[PrivateIPv4Address,IpAddress]}}' \
+              --output json
+
+            echo "-- listeners (a port with no listener times out) --"
+            aws elbv2 describe-listeners --load-balancer-arn "$arn" --region "$R" \
+              --query 'Listeners[].{Port:Port,Protocol:Protocol,Cert:Certificates[0].CertificateArn}' \
+              --output table || true
+
+            echo "-- security group rules actually in force --"
+            for sg in $(aws elbv2 describe-load-balancers --load-balancer-arns "$arn" --region "$R" \
+                          --query 'LoadBalancers[].SecurityGroups[]' --output text 2>/dev/null); do
+              echo "   $sg"
+              aws ec2 describe-security-groups --group-ids "$sg" --region "$R" \
+                --query 'SecurityGroups[].IpPermissions[].{From:FromPort,To:ToPort,Proto:IpProtocol,Cidrs:IpRanges[].CidrIp}' \
+                --output json || true
+            done
+
+            echo "-- target health (unhealthy targets also present as timeouts) --"
+            for tg in $(aws elbv2 describe-target-groups --load-balancer-arn "$arn" --region "$R" \
+                          --query 'TargetGroups[].TargetGroupArn' --output text 2>/dev/null); do
+              aws elbv2 describe-target-health --target-group-arn "$tg" --region "$R" \
+                --query 'TargetHealthDescriptions[].{Id:Target.Id,Port:Target.Port,State:TargetHealth.State,Reason:TargetHealth.Reason}' \
+                --output table || true
+            done
+
+            echo "-- certificates on the listeners --"
+            for c in $(aws elbv2 describe-listeners --load-balancer-arn "$arn" --region "$R" \
+                         --query 'Listeners[].Certificates[].CertificateArn' --output text 2>/dev/null | tr '\t' '\n' | sort -u); do
+              # SubjectAlternativeNames is the field browsers enforce; CN is
+              # ignored. NotAfter matters because IMPORTED certificates do not
+              # auto-renew and nothing here will warn you.
+              aws acm describe-certificate --certificate-arn "$c" --region "$R" \
+                --query 'Certificate.{Domain:DomainName,SANs:SubjectAlternativeNames,Status:Status,Type:Type,NotAfter:NotAfter,InUseBy:InUseBy}' \
+                --output json || true
+            done
+            echo "::endgroup::"
+          done
+
+          echo "::group::Route 53 records that look related"
+          # Best effort, and only meaningful for a zone hosted here. A domain in
+          # an internal zone will show nothing -- that is expected, not a fault.
+          dom=$(grep -E '^[[:space:]]*app_tls_domain_name' "$TFVARS_FILE" | head -1 | cut -d'"' -f2)
+          needle="${dom:-openmetadata}"
+          echo "searching for: $needle"
+          for z in $(aws route53 list-hosted-zones --query 'HostedZones[].Id' --output text 2>/dev/null); do
+            out=$(aws route53 list-resource-record-sets --hosted-zone-id "$z" \
+                    --query "ResourceRecordSets[?contains(Name,'${needle%%.*}')].{Name:Name,Type:Type,Alias:AliasTarget.DNSName,Values:ResourceRecords[].Value}" \
+                    --output json 2>/dev/null)
+            [ "$out" = "[]" ] || { echo "zone $z:"; echo "$out"; }
+          done
+          echo "::endgroup::"
+
+          echo
+          echo "Reading this:"
+          echo "  Scheme internal  -> no public address; clients need VPN/DirectConnect/TGW into the VPC"
+          echo "  No listener on the port you are trying -> connection times out; check the cert annotation applied"
+          echo "  Source-range CIDRs must match the address the LB SEES, which behind a VPN or proxy is its NAT address, not the workstation's"
+          echo "  One address per AZ -> if only one private subnet is routed, roughly half of attempts black-hole"
+          echo "  A cert SAN that omits the FQDN fails TLS, not TCP -- that shows as a certificate error, never a timeout"
+          echo "  ping is not a test: an NLB does not answer ICMP. Use: nc -vz <fqdn> 443"
 
       - name: Restart the OpenMetadata server
         if: ${{ github.event.inputs.action == 'restart-server' || github.event.inputs.action == 'diagnose-and-restart' }}
