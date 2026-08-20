@@ -738,6 +738,16 @@ jobs:
               --query 'LoadBalancers[].{Name:LoadBalancerName,Type:Type,Scheme:Scheme,State:State.Code,DNS:DNSName,Zones:AvailabilityZones[].{Zone:ZoneName,Subnet:SubnetId,Addrs:LoadBalancerAddresses[].[PrivateIPv4Address,IpAddress]}}' \
               --output json
 
+            # LoadBalancerAddresses is frequently EMPTY for an internal NLB whose
+            # addresses were not explicitly assigned, so read them from the
+            # ENIs instead -- these are the addresses clients actually connect to,
+            # one per AZ, handed out by DNS in rotation.
+            echo "-- actual addresses, from the ENIs --"
+            aws ec2 describe-network-interfaces --region "$R" \
+              --filters "Name=description,Values=ELB net/$name/*" \
+              --query 'NetworkInterfaces[].{AZ:AvailabilityZone,Subnet:SubnetId,Private:PrivateIpAddress,Public:Association.PublicIp}' \
+              --output table || true
+
             echo "-- listeners (a port with no listener times out) --"
             aws elbv2 describe-listeners --load-balancer-arn "$arn" --region "$R" \
               --query 'Listeners[].{Port:Port,Protocol:Protocol,Cert:Certificates[0].CertificateArn}' \
@@ -772,6 +782,53 @@ jobs:
             done
             echo "::endgroup::"
           done
+
+          # An internal NLB is only reachable from inside the VPC or from a
+          # network routed to it. A corporate VPN (GlobalProtect and friends)
+          # puts the client on the CORPORATE network -- that is not the VPC.
+          # Without a Site-to-Site VPN, Direct Connect, Transit Gateway or
+          # peering carrying 172.72.0.0/16, packets never arrive, and no
+          # security-group entry can help because there is nothing to permit.
+          echo "::group::Is anything routed into this VPC?"
+          VPC=$(aws ec2 describe-vpcs --region "$R" \
+                  --filters "Name=tag:Name,Values=*${CLUSTER}*" \
+                  --query 'Vpcs[0].VpcId' --output text 2>/dev/null)
+          echo "VPC: ${VPC:-<not found by name tag>}"
+
+          echo "-- Site-to-Site VPN connections --"
+          aws ec2 describe-vpn-connections --region "$R" \
+            --query 'VpnConnections[].{Id:VpnConnectionId,State:State,VpcOrTgw:join(`/`,[VpnGatewayId||`-`,TransitGatewayId||`-`]),Routes:Routes[].DestinationCidrBlock}' \
+            --output json || true
+
+          echo "-- Transit Gateway attachments --"
+          aws ec2 describe-transit-gateway-attachments --region "$R" \
+            --query 'TransitGatewayAttachments[].{Id:TransitGatewayAttachmentId,Type:ResourceType,Resource:ResourceId,State:State}' \
+            --output table || true
+
+          echo "-- VPC peering --"
+          aws ec2 describe-vpc-peering-connections --region "$R" \
+            --query 'VpcPeeringConnections[].{Id:VpcPeeringConnectionId,Status:Status.Code,Requester:RequesterVpcInfo.CidrBlock,Accepter:AccepterVpcInfo.CidrBlock}' \
+            --output table || true
+
+          echo "-- Direct Connect --"
+          aws directconnect describe-connections --region "$R" \
+            --query 'connections[].{Id:connectionId,State:connectionState,Location:location}' \
+            --output table 2>/dev/null || echo "(none, or no permission)"
+
+          # The decisive check: the private subnets' route tables. Only a
+          # default route to a NAT gateway means egress-only -- nothing inbound
+          # from on-prem. A vgw-/tgw-/pcx- target is what makes internal
+          # reachable.
+          echo "-- route tables for the load balancer's subnets --"
+          for sn in $(aws elbv2 describe-load-balancers --region "$R" \
+                        --query 'LoadBalancers[].AvailabilityZones[].SubnetId' --output text 2>/dev/null | tr '\t' '\n' | sort -u); do
+            echo "   subnet $sn"
+            aws ec2 describe-route-tables --region "$R" \
+              --filters "Name=association.subnet-id,Values=$sn" \
+              --query 'RouteTables[].Routes[].{Dest:DestinationCidrBlock,NAT:NatGatewayId,GW:GatewayId,TGW:TransitGatewayId,VGW:VpcPeeringConnectionId}' \
+              --output table || true
+          done
+          echo "::endgroup::"
 
           echo "::group::Route 53 records that look related"
           # Best effort, and only meaningful for a zone hosted here. A domain in
