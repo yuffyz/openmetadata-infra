@@ -152,6 +152,7 @@ jobs:
           exposed=$(terraform output -raw app_expose_via_nlb 2>/dev/null || echo "false")
           cluster=$(terraform output -raw eks_cluster_name 2>/dev/null || true)
           ns=$(terraform output -raw app_namespace 2>/dev/null || echo "openmetadata")
+          alias=$(terraform output -raw app_dns_alias_fqdn 2>/dev/null || true)
 
           if [ -z "$url" ] && [ "$exposed" = "true" ] && [ -n "$cluster" ]; then
             echo "Waiting for the load balancer controller to provision the NLB..."
@@ -177,6 +178,18 @@ jobs:
           {
             echo "## OpenMetadata — ${{ github.event.inputs.environment }}"
             echo
+            # The name externally-managed DNS should target. Printed on every
+            # apply because the load balancer hostname it resolves to changes
+            # whenever the load balancer is recreated -- pointing an outside
+            # zone at that hostname is what this exists to stop.
+            if [ -n "$alias" ]; then
+              echo "**Stable DNS target:** \`$alias\`"
+              echo
+              echo "> Records in zones this account does not own should CNAME here, never to the"
+              echo "> \`*.elb.amazonaws.com\` hostname. Terraform repoints this at the current load"
+              echo "> balancer on every apply, so the external record is written once."
+              echo
+            fi
             if [ -n "$url" ]; then
               echo "**UI:** $url"
               echo
