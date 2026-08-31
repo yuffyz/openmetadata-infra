@@ -116,7 +116,7 @@ app_tls_certificate_arn = "arn:aws:acm:us-east-1:146445314234:certificate/a443ae
 # current load balancer on every apply. The internal record points there
 # instead, and is written once:
 #
-#   openmetadata-dev.ffdb.com.  CNAME  develop.fuji-openmetadata.com.
+#   openmetadata-dev.ffdb.com.  CNAME  dev.fuji-openmetadata.com.
 #
 # `terraform output app_dns_alias_fqdn` prints the name to point at.
 #
@@ -129,7 +129,7 @@ app_tls_certificate_arn = "arn:aws:acm:us-east-1:146445314234:certificate/a443ae
 # browsers send that name in SNI no matter how many CNAMEs they follow, so the
 # extra hop is invisible to the TLS handshake.
 app_tls_route53_zone_name = "fuji-openmetadata.com"
-app_dns_alias_name        = "develop.fuji-openmetadata.com"
+app_dns_alias_name        = "dev.fuji-openmetadata.com"
 
 # --- Scheme: internet-facing, deliberately ----------------------------------
 # Left at the default (internet-facing) after trying `internal` and reverting.
