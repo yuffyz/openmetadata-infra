@@ -75,6 +75,27 @@ resource "kubernetes_service_v1" "app_public" {
   spec {
     type = "LoadBalancer"
 
+    # Declared here because the controller sets it whether we do or not.
+    #
+    # The aws-load-balancer-type: external annotation above makes the
+    # controller's mutating webhook stamp
+    # spec.loadBalancerClass = "service.k8s.aws/nlb" onto this Service at
+    # admission. Leave it out of the config and every subsequent plan sees a
+    # field present in state and absent from config, and plans to remove it:
+    #
+    #   - load_balancer_class = "service.k8s.aws/nlb" -> null # forces replacement
+    #
+    # loadBalancerClass is immutable in Kubernetes, so "remove" means REPLACE.
+    # The controller deletes the load balancer along with the Service it
+    # belongs to, and AWS assigns a fresh hash to whatever replaces it -- so
+    # EVERY apply produced a new *.elb.amazonaws.com hostname and a few minutes
+    # of downtime while the new targets passed health checks, with no
+    # configuration change to explain it.
+    #
+    # Setting it makes config match what the webhook writes, so the diff
+    # disappears. If a plan ever shows the line above again, this is why.
+    load_balancer_class = "service.k8s.aws/nlb"
+
     # The native field rather than the source-ranges annotation: the controller
     # reads this first and turns it into the NLB's security group rules.
     #

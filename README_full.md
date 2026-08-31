@@ -612,6 +612,29 @@ constraint.) Enforcement needs a controller that manages NLB security groups
 > correctly flag the login page as "Not secure". Configure TLS above, or use
 > `port-forward`, before typing a password you care about.
 
+### If the NLB hostname changes on every apply
+
+Fixed, but worth recognising if it ever returns. The symptom is a new
+`*.elb.amazonaws.com` hostname after an apply that changed nothing relevant,
+plus a few minutes of downtime while the replacement's targets pass health
+checks. In a plan it looks like this, on `kubernetes_service_v1.app_public`:
+
+```
+- load_balancer_class = "service.k8s.aws/nlb" -> null # forces replacement
+```
+
+The `aws-load-balancer-type: external` annotation makes the controller's
+mutating webhook stamp `spec.loadBalancerClass` onto the Service at admission.
+If the Terraform config does not also declare it, every plan sees a field in
+state that is absent from config and moves to remove it — and `loadBalancerClass`
+is immutable, so removing it means replacing the Service. The controller then
+deletes the load balancer along with it, and AWS hashes a new hostname for the
+replacement.
+
+`nlb_service.tf` declares `load_balancer_class` explicitly so config matches
+what the webhook writes. Any controller-set immutable field left out of the
+config produces the same loop.
+
 ### Known gaps
 
 - **Allowlisted IPs drift.** The dev entries are dynamic ISP addresses. When
