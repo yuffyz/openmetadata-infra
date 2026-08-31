@@ -1,6 +1,25 @@
 # Terraform
 .terraform/
-.terraform.lock.hcl
+
+# NOT ignored: terraform/.terraform.lock.hcl is committed deliberately.
+#
+# plan and apply run as separate jobs on separate runners, each doing its own
+# `terraform init`. Without a committed lock file each one resolves providers
+# against the registry independently, and every provider in versions.tf floats
+# on a major-version constraint -- so a release landing between the two inits
+# makes the saved plan un-appliable:
+#
+#   Error: Inconsistent dependency lock file
+#   The given plan file was created with a different set of external
+#   dependency selections than the current configuration.
+#
+# That is a race against the registry, so it fails at random. The lock file
+# pins exact versions and hashes for linux_amd64 (CI) plus both darwin
+# architectures. Update it deliberately:
+#
+#   terraform init -upgrade
+#   terraform providers lock \
+#     -platform=linux_amd64 -platform=darwin_arm64 -platform=darwin_amd64
 *.tfstate
 *.tfstate.*
 crash.log
