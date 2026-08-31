@@ -201,7 +201,21 @@ runs:
       working-directory: ${{ inputs.terraform-dir }}
       run: |
         set -euo pipefail
-        terraform init -input=false \
+        # -lockfile=readonly: install exactly what terraform/.terraform.lock.hcl
+        # pins and fail if it would have to change. plan and apply run on
+        # separate runners, so without this each resolves providers on its own
+        # and a registry release between them leaves apply rejecting the saved
+        # plan with "Inconsistent dependency lock file" -- at random, since it
+        # depends on release timing.
+        #
+        # If this step fails with a lock file error, the constraints in
+        # versions.tf moved and the lock was not regenerated. Fix it in a
+        # commit, not by dropping this flag:
+        #
+        #   terraform init -upgrade
+        #   terraform providers lock \
+        #     -platform=linux_amd64 -platform=darwin_arm64 -platform=darwin_amd64
+        terraform init -input=false -lockfile=readonly \
           -backend-config="bucket=${{ inputs.state-bucket }}" \
           -backend-config="key=${{ inputs.state-key }}" \
           -backend-config="region=${{ inputs.state-region }}" \
