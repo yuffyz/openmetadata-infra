@@ -18,15 +18,29 @@ output "openmetadata_url" {
   )
 }
 
-# Whether Terraform owns the DNS record for the UI.
+# Whether Terraform owns the DNS record for app_tls_domain_name.
 #
-# False with app_tls_certificate_arn set: no Route 53 zone is consulted and no
-# record is created, so the CNAME from your FQDN to the load balancer's
-# *.elb.amazonaws.com name is yours to create and to keep. Surfaced as an output
-# so it is visible in `terraform output` rather than only in the code.
+# False with app_tls_certificate_arn set: that name is in a zone this account
+# does not own, so publishing it is yours. Surfaced as an output so it is
+# visible in `terraform output` rather than only in the code.
+#
+# It does NOT mean Terraform publishes no DNS at all -- see
+# app_dns_alias_fqdn, which is created on either certificate route.
 output "app_dns_managed" {
-  description = "True when Terraform creates the Route 53 alias record for the UI. False when a certificate ARN was supplied and DNS is managed outside Terraform."
+  description = "True when Terraform creates the Route 53 alias record for app_tls_domain_name. False when a certificate ARN was supplied and that name is managed outside Terraform -- app_dns_alias_fqdn may still be published."
   value       = local.app_cert_managed
+}
+
+# The stable target for a domain managed outside this repo.
+#
+# Point the external record here once. Terraform repoints this name at the
+# current load balancer on every apply, so the external record never has to
+# change again:
+#
+#   openmetadata-dev.ffdb.com.  CNAME  <this value>.
+output "app_dns_alias_fqdn" {
+  description = "Stable hostname Terraform keeps pointed at the current NLB. CNAME an externally-managed domain at this name once and it never needs repointing, because it survives the load balancer being recreated. Empty when app_dns_alias_name is unset."
+  value       = local.app_dns_alias_managed ? var.app_dns_alias_name : ""
 }
 
 output "app_lb_scheme" {

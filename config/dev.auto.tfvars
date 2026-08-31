@@ -103,6 +103,34 @@ app_lb_allowed_cidrs = [
 app_tls_domain_name     = "openmetadata-dev.ffdb.com"
 app_tls_certificate_arn = "arn:aws:acm:us-east-1:146445314234:certificate/a443aeb2-67db-4105-8c05-b9ca0020e654"
 
+# --- Stable hostname for the internal domain --------------------------------
+# openmetadata-dev.ffdb.com is published in an internal zone this account does
+# not own, and it used to CNAME straight to the NLB's *.elb.amazonaws.com
+# hostname. That hostname carries a hash AWS assigns per load balancer, so it
+# changed whenever the load balancer was recreated -- and the internal record
+# had to be repointed by hand each time, with the UI unreachable until someone
+# noticed. The aws-load-balancer-name annotation does not help: it fixes the
+# name, not the hash.
+#
+# Terraform now publishes a name in a zone we DO own and repoints it at the
+# current load balancer on every apply. The internal record points there
+# instead, and is written once:
+#
+#   openmetadata-dev.ffdb.com.  CNAME  develop.fuji-openmetadata.com.
+#
+# `terraform output app_dns_alias_fqdn` prints the name to point at.
+#
+# Setting the zone here does NOT switch on ACM issuance -- app_cert_managed
+# also requires app_tls_certificate_arn to be empty, and it is not. No
+# certificate is issued and nothing tries to DNS-validate ffdb.com, which could
+# never validate anyway (see the note above about internal-only names).
+#
+# The certificate is unchanged and still covers openmetadata-dev.ffdb.com:
+# browsers send that name in SNI no matter how many CNAMEs they follow, so the
+# extra hop is invisible to the TLS handshake.
+app_tls_route53_zone_name = "fuji-openmetadata.com"
+app_dns_alias_name        = "develop.fuji-openmetadata.com"
+
 # --- Scheme: internet-facing, deliberately ----------------------------------
 # Left at the default (internet-facing) after trying `internal` and reverting.
 #

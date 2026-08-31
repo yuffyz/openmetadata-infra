@@ -178,6 +178,28 @@ working. Users behind a corporate proxy need the 443 URL: those proxies do not
 forward non-standard ports. Details and caveats in
 [README_full.md](README_full.md#dev--https-on-the-nlb).
 
+For a domain served from an internal zone this account does not own, import a
+certificate from your own PKI and add a stable target for that zone to point at:
+
+```hcl
+app_tls_domain_name       = "openmetadata.ffdb.com"          # what clients type
+app_tls_certificate_arn   = "arn:aws:acm:...:certificate/..."
+app_tls_route53_zone_name = "example.com"                    # a zone you DO own
+app_dns_alias_name        = "openmetadata.example.com"       # stable, Terraform-managed
+```
+
+The load balancer's own hostname is `<name>-<hash>.elb.<region>.amazonaws.com`,
+and AWS assigns that hash per load balancer — so it changes whenever the load
+balancer is recreated, and any record pointing straight at it has to be
+repointed by hand. `app_dns_alias_name` is repointed by Terraform on every
+apply instead, so the record in your internal zone is written once:
+
+```
+openmetadata.ffdb.com.  CNAME  openmetadata.example.com.
+```
+
+`terraform output app_dns_alias_fqdn` prints the name to point at.
+
 ## Airflow and connecting data sources
 
 ### What's already deployed

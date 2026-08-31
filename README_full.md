@@ -487,24 +487,60 @@ app_tls_domain_name     = "openmetadata.ffdb.com"   # served FQDN, for the URL o
 app_tls_certificate_arn = "arn:aws:acm:us-east-1:<acct>:certificate/<id>"
 app_lb_scheme           = "internal"
 app_lb_allowed_cidrs    = ["10.0.0.0/8"]            # internal ranges, not workstation /32s
+
+# Stable target for the record you publish in the internal zone. Without these
+# the only thing to point at is the NLB hostname, which changes on rebuild.
+app_tls_route53_zone_name = "example.com"
+app_dns_alias_name        = "openmetadata.example.com"
 ```
 
-Leave `app_tls_route53_zone_name` empty. Setting a certificate ARN switches off
-certificate issuance, DNS validation, the load balancer lookup and the alias
-record — every resource in `nlb_tls.tf`. `local.app_cert_managed` is the flag
-that gates them, and `terraform output app_dns_managed` reports `false` so the
-split is visible without reading the code.
+Setting a certificate ARN switches off certificate issuance, DNS validation and
+the alias record for `app_tls_domain_name` — that name lives in a zone this
+account does not own, so publishing it is yours. `local.app_cert_managed` is the
+flag that gates those, and `terraform output app_dns_managed` reports `false` so
+the split is visible without reading the code.
 
-Then publish the record yourself:
+It does **not** switch off DNS entirely. `app_tls_route53_zone_name` stays
+useful here: combined with `app_dns_alias_name` it publishes a stable record, in
+a zone you do own, that Terraform keeps pointed at the current load balancer.
+That is gated separately by `local.app_dns_alias_managed`, precisely because it
+has nothing to do with which certificate is in use. Leave the zone empty only if
+you have no Route 53 zone at all.
+
+Then publish the record yourself — but **point it at `app_dns_alias_name`, not
+at the load balancer**:
+
+```hcl
+app_tls_route53_zone_name = "example.com"                    # a zone this account owns
+app_dns_alias_name        = "openmetadata.example.com"       # stable, Terraform-managed
+```
 
 ```
-openmetadata.ffdb.com.  CNAME  <name>.elb.amazonaws.com.
+openmetadata.ffdb.com.   CNAME  openmetadata.example.com.    # written once, by you
+openmetadata.example.com. ALIAS <current NLB>.elb.amazonaws.com.   # rewritten every apply
 ```
 
-A **CNAME, not an A record**. An NLB's addresses are stable but change if it is
-ever replaced, and an internal NLB's AWS hostname resolves through *public* DNS
-to its *private* addresses — so a CNAME resolves correctly from inside the VPC
-and self-heals across a replacement.
+The reason for the extra hop is that the load balancer's hostname is **not
+stable**. It is `<name>-<hash>.elb.<region>.amazonaws.com`, and AWS assigns that
+hash per load balancer at creation — so anything that recreates it produces a
+new hostname and breaks every record pointing at the old one. The
+`aws-load-balancer-name` annotation does not help: it fixes the *name*, not the
+hash. Pointing your zone straight at the ELB hostname means repointing it by
+hand after every rebuild, with the UI down until someone notices.
+
+`app_dns_alias_name` gives you a name in a zone this account controls that
+Terraform repoints on every apply. Your record targets that instead, and is
+written once. `terraform output app_dns_alias_fqdn` prints it.
+
+This is independent of who issues the certificate — it works with an imported
+`app_tls_certificate_arn`, which is the case it exists for. TLS is unaffected:
+the client sends the external name in SNI no matter how many CNAMEs it follows,
+so the NLB still answers with the certificate for that name.
+
+If you have no Route 53 zone at all, point your record at the ELB hostname as
+before — a **CNAME, not an A record**, since an NLB's addresses change if it is
+replaced, and an internal NLB's AWS hostname resolves through *public* DNS to
+its *private* addresses. Accept that it needs repointing after any replacement.
 
 Three things to plan for:
 
@@ -545,7 +581,8 @@ version.
 | `app_lb_allowed_cidrs` | `[]` | CIDRs allowed to reach the NLB. **Required** when the toggle is on |
 | `app_tls_domain_name` | `""` | FQDN to serve over HTTPS. Empty leaves the NLB on plain HTTP |
 | `app_tls_route53_zone_name` | `""` | Public Route 53 zone owning that FQDN. Required with the above **unless** `app_tls_certificate_arn` is set |
-| `app_tls_certificate_arn` | `""` | Existing ACM certificate to terminate with, for a domain outside Route 53. Skips issuance, validation and DNS |
+| `app_tls_certificate_arn` | `""` | Existing ACM certificate to terminate with, for a domain outside Route 53. Skips issuance, validation and the record for `app_tls_domain_name` |
+| `app_dns_alias_name` | `""` | FQDN in `app_tls_route53_zone_name` that Terraform repoints at the current NLB every apply. Give externally-managed DNS this as a target so it survives the load balancer being recreated |
 | `app_lb_scheme` | `"internet-facing"` | `internal` gives the NLB private addresses. **Changing it replaces the load balancer** |
 | `lb_controller_chart_version` | `null` | Controller chart version; `null` tracks latest |
 | `app_extra_helm_values` | `{}` | Arbitrary Helm `set` overrides, merged last |

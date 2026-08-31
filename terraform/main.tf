@@ -41,11 +41,31 @@ locals {
   # in Route 53.
   app_tls_enabled = var.app_expose_via_nlb && (var.app_tls_domain_name != "" || var.app_tls_certificate_arn != "")
 
-  # True only for the Route 53 route, and therefore the switch for every
-  # resource in nlb_tls.tf: the certificate, its DNS validation records, the
-  # load balancer lookup and the alias record. With a supplied ARN none of that
-  # exists and DNS belongs to whoever owns the zone.
+  # True only for the Route 53 route: Terraform issues the certificate, so it
+  # also owns the validation records and the alias record for
+  # app_tls_domain_name. With a supplied ARN none of that exists and that name
+  # belongs to whoever owns its zone.
+  #
+  # Scoped to certificate issuance ONLY. It used to gate every resource in
+  # nlb_tls.tf, which meant supplying app_tls_certificate_arn switched off DNS
+  # altogether -- including the one record that has nothing to do with the
+  # certificate. See app_dns_alias_managed.
   app_cert_managed = var.app_expose_via_nlb && var.app_tls_domain_name != "" && var.app_tls_certificate_arn == ""
+
+  # Terraform publishes a stable name that tracks whatever the current load
+  # balancer is, and repoints it on every apply.
+  #
+  # Independent of app_cert_managed on purpose. The imported-certificate route
+  # leaves app_tls_domain_name to be published by whoever owns that zone --
+  # an internal ffdb.com here -- and the only target available to them was the
+  # *.elb.amazonaws.com hostname, which changes whenever the load balancer is
+  # recreated. This gives them a name in a zone we control to point at instead,
+  # so their record is written once and never again.
+  app_dns_alias_managed = var.app_expose_via_nlb && var.app_dns_alias_name != "" && var.app_tls_route53_zone_name != ""
+
+  # Either DNS path needs the hosted zone and the load balancer looked up, so
+  # the data sources in nlb_tls.tf are gated on this rather than on one route.
+  app_zone_needed = local.app_cert_managed || local.app_dns_alias_managed
 
   # The ARN that reaches the Service's ssl-cert annotation. On the managed route
   # it references the VALIDATION resource, not the certificate, so the Service

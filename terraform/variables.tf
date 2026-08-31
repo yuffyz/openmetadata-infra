@@ -203,16 +203,63 @@ variable "app_tls_domain_name" {
 }
 
 variable "app_tls_route53_zone_name" {
-  description = "Public Route 53 hosted zone that owns app_tls_domain_name, e.g. example.com. Used for both ACM DNS validation and the alias record. Leave empty when supplying app_tls_certificate_arn -- DNS is then yours to manage."
+  description = "Public Route 53 hosted zone in this account, e.g. example.com. Used for ACM DNS validation, for the alias record when Terraform issues the certificate, and for app_dns_alias_name. Required when Terraform must issue the certificate; optional -- but needed for a stable hostname -- when supplying app_tls_certificate_arn."
   type        = string
   default     = ""
 
-  # Required only when Terraform has to issue the certificate. With
-  # app_tls_certificate_arn set there is nothing to validate and no record to
-  # create, so a Route 53 zone is neither needed nor consulted.
+  # Required only when Terraform has to issue the certificate: that path is
+  # DNS-validated, so there must be a zone to publish the validation record in.
+  #
+  # With app_tls_certificate_arn set the zone is optional, but it is NOT
+  # ignored the way it once was -- app_dns_alias_name uses it to publish the
+  # stable hostname that external DNS points at. See that variable.
   validation {
     condition     = var.app_tls_domain_name == "" || var.app_tls_certificate_arn != "" || var.app_tls_route53_zone_name != ""
     error_message = "app_tls_route53_zone_name must be set when app_tls_domain_name is set and no app_tls_certificate_arn is supplied -- the certificate is DNS-validated and the alias record is created in that zone."
+  }
+}
+
+# Stable hostname, for a domain published outside this repo.
+#
+# The NLB is created by the AWS Load Balancer Controller, and its
+# *.elb.amazonaws.com hostname carries a per-load-balancer hash that AWS
+# assigns at creation time. Anything that recreates the load balancer -- a
+# destroy/apply cycle, a scheme change, the Service being replaced -- yields a
+# new hostname, and every external record pointing at the old one breaks. The
+# aws-load-balancer-name annotation does not help: it fixes the NAME, while the
+# hash is per load balancer.
+#
+# Setting this creates a record in app_tls_route53_zone_name that Terraform
+# repoints at the current load balancer on every apply. Point the external
+# domain at THIS name, once, and it never needs repointing again:
+#
+#   openmetadata-dev.ffdb.com.  CNAME  openmetadata-dev.example.com.
+#
+# Deliberately independent of who issues the certificate -- it works with an
+# imported app_tls_certificate_arn, which is the case it exists for. TLS is
+# unaffected: the client still sends the external name in SNI and the NLB still
+# serves the certificate for that name, so the extra hop is invisible to it.
+variable "app_dns_alias_name" {
+  description = "FQDN inside app_tls_route53_zone_name that Terraform keeps pointed at the current NLB, giving external DNS a target that survives load balancer replacement. Empty disables it."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.app_dns_alias_name == "" || var.app_expose_via_nlb
+    error_message = "app_dns_alias_name requires app_expose_via_nlb = true -- there is no load balancer to point it at otherwise."
+  }
+
+  validation {
+    condition     = var.app_dns_alias_name == "" || var.app_tls_route53_zone_name != ""
+    error_message = "app_dns_alias_name requires app_tls_route53_zone_name -- the record has to be created in a hosted zone this account owns."
+  }
+
+  # A record can only be created inside its own zone. Caught here because the
+  # AWS error for the alternative ("InvalidChangeBatch: RRSet with DNS name
+  # ... is not permitted in zone ...") arrives several minutes into an apply.
+  validation {
+    condition     = var.app_dns_alias_name == "" || var.app_tls_route53_zone_name == "" || endswith(var.app_dns_alias_name, ".${var.app_tls_route53_zone_name}")
+    error_message = "app_dns_alias_name must be a name inside app_tls_route53_zone_name, e.g. openmetadata-dev.example.com in zone example.com."
   }
 }
 
@@ -240,7 +287,7 @@ variable "app_tls_route53_zone_name" {
 # and an internal NLB's AWS hostname resolves through public DNS to its private
 # addresses, so a CNAME works from inside the VPC.
 variable "app_tls_certificate_arn" {
-  description = "ARN of an existing ACM certificate to terminate TLS with, in the same region as the NLB. Use for domains outside Route 53 (e.g. an internal-only zone) with a certificate imported from your own PKI. When set, Terraform issues no certificate and creates no DNS record."
+  description = "ARN of an existing ACM certificate to terminate TLS with, in the same region as the NLB. Use for domains outside Route 53 (e.g. an internal-only zone) with a certificate imported from your own PKI. When set, Terraform issues no certificate and creates no record for app_tls_domain_name -- that name is yours to publish. It does still create app_dns_alias_name, if set, to give that record a stable target."
   type        = string
   default     = ""
 

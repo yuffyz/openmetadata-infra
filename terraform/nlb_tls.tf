@@ -1,9 +1,20 @@
-# HTTPS on the OpenMetadata NLB: ACM certificate + Route 53 alias record
+# HTTPS on the OpenMetadata NLB: ACM certificate + Route 53 records
 #
 # Enabled by setting app_tls_domain_name (and its hosted zone). TLS terminates
 # on the NLB listener; traffic from the NLB to the pod stays plain TCP inside
 # the VPC. The certificate ARN and the listener port are passed to the chart as
 # Service annotations in main.tf.
+#
+# Two independent DNS concerns live here, gated separately:
+#
+#   app_cert_managed      Terraform issues the certificate, so it also owns the
+#                         validation records and the alias for
+#                         app_tls_domain_name.
+#   app_dns_alias_managed Terraform publishes app_dns_alias_name and keeps it
+#                         pointed at the current load balancer. Works with an
+#                         imported certificate, and exists so that a domain
+#                         managed outside this repo has a target that does not
+#                         change when the load balancer is recreated.
 #
 # Why the NLB is looked up rather than created here: the load balancer is owned
 # by the AWS Load Balancer Controller, not Terraform. The Service in
@@ -11,8 +22,10 @@
 # the lookup below runs the NLB exists; we find it by the tags the controller
 # stamps on everything it provisions, and point Route 53 at it.
 
+# Needed by both DNS paths, so it is gated on app_zone_needed rather than on
+# certificate issuance.
 data "aws_route53_zone" "app" {
-  count        = local.app_cert_managed ? 1 : 0
+  count        = local.app_zone_needed ? 1 : 0
   name         = var.app_tls_route53_zone_name
   private_zone = false
 }
@@ -71,7 +84,7 @@ resource "aws_acm_certificate_validation" "app" {
 # account. Referencing the Service resource also orders this read after the
 # provider has waited for the load balancer to come up.
 data "aws_lb" "app" {
-  count = local.app_cert_managed ? 1 : 0
+  count = local.app_zone_needed ? 1 : 0
 
   tags = {
     "elbv2.k8s.aws/cluster"    = local.eks_cluster_name
@@ -86,6 +99,38 @@ resource "aws_route53_record" "app" {
   count   = local.app_cert_managed ? 1 : 0
   zone_id = data.aws_route53_zone.app[0].zone_id
   name    = var.app_tls_domain_name
+  type    = "A"
+
+  alias {
+    name                   = data.aws_lb.app[0].dns_name
+    zone_id                = data.aws_lb.app[0].zone_id
+    evaluate_target_health = true
+  }
+}
+
+# The stable name external DNS points at.
+#
+# Same alias mechanics as the record above, but created on either certificate
+# route and carrying a different job: this one exists purely so that a record
+# published outside this repo -- openmetadata-dev.ffdb.com, in an internal zone
+# this account does not own -- has something to CNAME to that Terraform keeps
+# current.
+#
+#   openmetadata-dev.ffdb.com.  CNAME  <app_dns_alias_name>.
+#   <app_dns_alias_name>.       ALIAS  <current NLB>.elb.amazonaws.com.
+#
+# The second hop is rewritten by every apply; the first is written once. That
+# is the whole point -- the load balancer is owned by the AWS Load Balancer
+# Controller and its hostname carries a hash AWS assigns per load balancer, so
+# it cannot be held stable directly.
+#
+# TLS is unaffected. The client resolves through the chain but still sends the
+# external name in SNI, and the NLB still answers with the certificate for that
+# name, so the indirection is invisible to the handshake.
+resource "aws_route53_record" "app_stable" {
+  count   = local.app_dns_alias_managed ? 1 : 0
+  zone_id = data.aws_route53_zone.app[0].zone_id
+  name    = var.app_dns_alias_name
   type    = "A"
 
   alias {
