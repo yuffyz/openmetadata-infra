@@ -103,33 +103,50 @@ app_lb_allowed_cidrs = [
 app_tls_domain_name     = "openmetadata-dev.ffdb.com"
 app_tls_certificate_arn = "arn:aws:acm:us-east-1:146445314234:certificate/a443aeb2-67db-4105-8c05-b9ca0020e654"
 
-# --- Stable hostname for the internal domain --------------------------------
+# --- DNS: pointed by hand, straight at the load balancer --------------------
 # openmetadata-dev.ffdb.com is published in an internal zone this account does
-# not own, and it used to CNAME straight to the NLB's *.elb.amazonaws.com
-# hostname. That hostname carries a hash AWS assigns per load balancer, so it
-# changed whenever the load balancer was recreated -- and the internal record
-# had to be repointed by hand each time, with the UI unreachable until someone
-# noticed. The aws-load-balancer-name annotation does not help: it fixes the
-# name, not the hash.
+# not own, and it is pointed manually. Terraform publishes no record for it and
+# no intermediate target -- the manual CNAME goes directly to the NLB:
 #
-# Terraform now publishes a name in a zone we DO own and repoints it at the
-# current load balancer on every apply. The internal record points there
-# instead, and is written once:
+#   openmetadata-dev.ffdb.com.  CNAME  <name>.elb.amazonaws.com.
 #
-#   openmetadata-dev.ffdb.com.  CNAME  dev.fuji-openmetadata.com.
+# A CNAME, not an A record: the addresses belong to the load balancer and do
+# not survive it being replaced.
 #
-# `terraform output app_dns_alias_fqdn` prints the name to point at.
+# Get the current hostname with either of:
 #
-# Setting the zone here does NOT switch on ACM issuance -- app_cert_managed
-# also requires app_tls_certificate_arn to be empty, and it is not. No
-# certificate is issued and nothing tries to DNS-validate ffdb.com, which could
-# never validate anyway (see the note above about internal-only names).
+#   aws elbv2 describe-load-balancers --region us-east-1 \
+#     --query "LoadBalancers[?LoadBalancerName=='open-metadata-dev-omd'].DNSName" \
+#     --output text
 #
-# The certificate is unchanged and still covers openmetadata-dev.ffdb.com:
-# browsers send that name in SNI no matter how many CNAMEs they follow, so the
-# extra hop is invisible to the TLS handshake.
-app_tls_route53_zone_name = "fuji-openmetadata.com"
-app_dns_alias_name        = "dev.fuji-openmetadata.com"
+#   kubectl get svc -n openmetadata openmetadata-public \
+#     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+#
+# TLS is unaffected. Clients send openmetadata-dev.ffdb.com in SNI regardless
+# of what the CNAME resolves to, and the certificate above is a *.ffdb.com
+# wildcard, so it matches.
+#
+# > ⚠️ This target is stable across `apply` but NOT across `destroy`.
+# >
+# > The load balancer is owned by the AWS Load Balancer Controller and follows
+# > the Service. Its hostname is <name>-<hash>.elb.<region>.amazonaws.com, and
+# > AWS assigns that hash per load balancer at creation -- the
+# > aws-load-balancer-name annotation fixes the name, not the hash. A teardown
+# > deletes the load balancer, and the rebuild gets a NEW hostname. Changing
+# > app_lb_scheme does the same, for the same reason.
+# >
+# > After any of those the manual record is stale and the UI is unreachable
+# > until it is repointed -- and for an externally managed zone that is a
+# > ticket, not a command. This environment is explicitly built for cheap
+# > teardown (see the header of this file), so plan for it.
+# >
+# > The alternative, left here deliberately: app_dns_alias_name publishes a
+# > Terraform-owned name in a zone this account controls and repoints it at the
+# > current load balancer on every apply. The manual record then targets a name
+# > that never changes and is written exactly once. It costs about $0.50/month.
+# > Re-enable both lines below to switch back.
+# app_tls_route53_zone_name = "fuji-openmetadata.com"
+# app_dns_alias_name        = "dev.fuji-openmetadata.com"
 
 # --- Scheme: internet-facing, deliberately ----------------------------------
 # Left at the default (internet-facing) after trying `internal` and reverting.
