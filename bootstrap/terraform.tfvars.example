@@ -15,3 +15,10 @@ state_bucket = "dkc-tfstate"
 
 # To allow the whole repo (any branch/PR/environment) instead of the tight default:
 # subject_claims = ["repo:your-org/kiban:*"]
+
+# Hold two static anycast IPs per environment, in front of that environment's
+# ALB, so the record in an externally-managed DNS zone is written once instead
+# of re-ticketed after every teardown. ~$18/month each, billed even while the
+# environment is destroyed. Set app_accelerator_name in the environment's tfvars
+# to the matching "<prefix>-<environment>" name to attach to it.
+# create_global_accelerator = true

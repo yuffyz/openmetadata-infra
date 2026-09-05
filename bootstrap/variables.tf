@@ -95,6 +95,18 @@ variable "nat_eip_name_prefix" {
   default     = "openmetadata"
 }
 
+variable "create_global_accelerator" {
+  description = "Create one AWS Global Accelerator per environment, giving that environment's UI two static anycast IPs that survive `terraform destroy`. The environment stack attaches its listener and endpoint group to it (see app_accelerator_name there). Costs ~$18/month each, billed even while the environment is torn down."
+  type        = bool
+  default     = false
+}
+
+variable "global_accelerator_name_prefix" {
+  description = "Name prefix for the accelerators. The environment stack looks its accelerator up as \"<prefix>-<environment>\", so this must match app_accelerator_name in the environment stack."
+  type        = string
+  default     = "openmetadata"
+}
+
 variable "create_state_bucket" {
   description = "Create the state S3 bucket named by state_bucket. Leave false if it already exists (Terraform would fail on a bucket it doesn't own)."
   type        = bool

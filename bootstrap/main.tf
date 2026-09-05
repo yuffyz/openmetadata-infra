@@ -13,6 +13,14 @@ provider "aws" {
   region = var.region
 }
 
+# Global Accelerator only. Its control plane is reachable through the us-west-2
+# endpoint alone, whatever region the endpoints it forwards to live in. The
+# accelerator itself is a global resource; only the API call is regional.
+provider "aws" {
+  alias  = "global_accelerator"
+  region = "us-west-2"
+}
+
 # ---------------------------------------------------------------------------
 # OIDC identity provider for GitHub Actions
 # (Only one per account for this URL. If it already exists, set
@@ -255,4 +263,49 @@ resource "aws_iam_role_policy" "state" {
   name   = "tfstate-access"
   role   = aws_iam_role.deploy.id
   policy = data.aws_iam_policy_document.state[0].json
+}
+
+# ---------------------------------------------------------------------------
+# Global Accelerator, one per environment (optional)
+#
+# Two static anycast IPv4 addresses that stay in front of that environment's
+# ALB. Here rather than in the environment stack for the same reason as the NAT
+# EIPs above: the addresses have to outlive `terraform destroy`.
+#
+# The environment's UI is published in an internal zone this account does not
+# own (openmetadata-dev.ffdb.com), so repointing it is a ticket rather than a
+# command -- and the ALB's hostname carries a per-load-balancer hash that AWS
+# reassigns whenever the load balancer is recreated. Held here, the addresses
+# survive the dev teardown loop, so that record is written once and the fixed
+# pair is also something a forward-proxy steering bypass can be written against.
+#
+# Only the ACCELERATOR lives here. Its listener and endpoint group stay in the
+# environment stack (terraform/global_accelerator.tf): the listener's ports
+# follow that environment's TLS configuration, and the endpoint group points at
+# an ALB that does not exist yet. Destroying an environment removes both and
+# leaves the accelerator holding its addresses with nothing behind it, which is
+# exactly the intended resting state.
+#
+# The environment stack finds this by name -- "<prefix>-<environment>" -- via
+# app_accelerator_name. Setting that name without applying this first fails the
+# plan with "no matching Global Accelerator Accelerator found", which is the
+# same failure mode as an unbootstrapped NAT EIP.
+#
+# Cost: ~$18/month per accelerator, charged whether or not an environment is
+# currently deployed, plus a per-GB data transfer premium when it is. Off by
+# default for that reason.
+# ---------------------------------------------------------------------------
+resource "aws_globalaccelerator_accelerator" "app" {
+  provider = aws.global_accelerator
+
+  for_each = var.create_global_accelerator ? toset(var.environment_names) : toset([])
+
+  name            = "${var.global_accelerator_name_prefix}-${each.key}"
+  ip_address_type = "IPV4"
+  enabled         = true
+
+  tags = {
+    Environment = each.key
+    ManagedBy   = "openmetadata-infra/bootstrap"
+  }
 }

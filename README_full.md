@@ -66,9 +66,11 @@ openmetadata-infra/                     # repo root
 ├─ terraform/                        # the Terraform root module that gets deployed
 │  ├─ core_addons.tf                # vpc-cni / kube-proxy / coredns EKS addons
 │  ├─ lb_controller.tf              # AWS Load Balancer Controller + IRSA (toggled)
-│  └─ nlb_tls.tf                    # ACM cert + Route 53 alias for HTTPS (toggled)
+│  ├─ alb_ingress.tf                # Ingress -> internet-facing ALB for the UI (toggled)
+│  ├─ alb_tls.tf                    # ACM cert + Route 53 alias for HTTPS (toggled)
+│  └─ global_accelerator.tf         # GA listener + endpoint group (accelerator lives in bootstrap/)
 ├─ backend.tf                        # S3 backend block (values via -backend-config)
-├─ bootstrap/                        # one-time: GitHub OIDC provider + deploy role
+├─ bootstrap/                        # one-time: OIDC provider, deploy role, NAT EIPs, accelerator
 ├─ config/
 │  ├─ dev.auto.tfvars                # teardown-safe, cheaper, "-dev" names
 │  └─ production.auto.tfvars         # production-safe defaults
@@ -183,7 +185,7 @@ After a successful apply, the `update_kubeconfig` output prints the
 `environment=dev, action=destroy` to remove — no approvals, and the dev RDS
 settings let destroy complete cleanly.
 
-> With `app_expose_via_nlb = true`, delete the LoadBalancer Service **before**
+> With `app_expose_via_alb = true`, delete the Ingress **before**
 > dispatching destroy — see [Destroying](#destroying--clean-up-the-load-balancer-first).
 > Skipping it costs a 20-minute timeout and a manual cleanup.
 
@@ -221,7 +223,7 @@ the run wastes 20 minutes before telling you. Note the private subnets delete
 fine — only the public ones are held, which is the signature of an
 internet-facing load balancer.
 
-This only bites when `app_expose_via_nlb = true`. With the default `false` there
+This only bites when `app_expose_via_alb = true`. With the default `false` there
 is no load balancer and destroy is unremarkable.
 
 ### The graceful path (cluster still healthy)
@@ -355,48 +357,64 @@ aws eks associate-access-policy --cluster-name $CLUSTER --principal-arn "$ME" \
 The API endpoint is public (`public_access_cidrs = ["0.0.0.0/0"]`), so this
 works from anywhere.
 
-### dev — internet-facing NLB
+### dev — internet-facing ALB
 
-`dev.auto.tfvars` sets `app_expose_via_nlb = true`, which installs the AWS Load
-Balancer Controller and creates a second Service, `openmetadata-public`, of type
-`LoadBalancer` (`terraform/nlb_service.tf`):
+`dev.auto.tfvars` sets `app_expose_via_alb = true`, which installs the AWS Load
+Balancer Controller and creates an Ingress, `openmetadata-public`, that the
+controller turns into an ALB (`terraform/alb_ingress.tf`):
 
 ```bash
-kubectl get svc -n openmetadata openmetadata-public \
+kubectl get ingress -n openmetadata openmetadata-public \
   -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
 ```
 
 Then `http://<hostname>:8585` without TLS, or `https://<domain>` with it. Either
 way the pods are reached on 8585.
 
-The chart's own Service is left as `ClusterIP` on 8585 and is not touched. An
-NLB listener port always equals the Service port, so serving 443 by moving the
-chart's Service would also move the cluster-internal address — and that address
-is baked into things that outlive an apply: the module hardcodes
-`metadataApiEndpoint: http://openmetadata.<ns>.svc:8585/api`, and every
-ingestion pipeline already deployed carries the host:port it was created with,
-inside its Airflow DAG configuration. Owning a separate Service decouples the
-public listener from all of that.
+This was an NLB until 2026-09-04, and the switch removed a structural
+awkwardness. An NLB listener port always equals the Service port, so serving 443
+meant owning a **second** Service purely to hold the listener — the chart's own
+Service had to stay on 8585 because that address outlives an apply: the module
+hardcodes `metadataApiEndpoint: http://openmetadata.<ns>.svc:8585/api`, and
+every deployed ingestion pipeline carries the host:port it was created with
+inside its Airflow DAG configuration. An ALB takes its listener ports from the
+`listen-ports` annotation and its backend port from the rule, so the Ingress
+points straight at the chart's ClusterIP Service and the second Service is gone.
+
+Three other things changed with it:
+
+- **Health checks are HTTP, not TCP.** An NLB target group with a TCP check
+  reports healthy as soon as something holds the socket open, so a wedged JVM
+  that accepts connections and answers nothing still passed — indistinguishable
+  from a network fault at the client, and it cost a debugging session. The ALB
+  checks `GET /` and accepts 200–399. Not `/healthcheck`: OpenMetadata is a
+  Dropwizard service and that path lives on the **admin** port 8586, which would
+  need a second target-group port and another security group rule.
+- **Stickiness is cookie-based.** OpenMetadata stores sessions in-memory, so
+  OIDC logins fail across replicas with "Missing state parameter" and the
+  documented workaround is sticky sessions. An NLB can only do source-IP
+  affinity, and behind a corporate proxy the whole company shares a few egress
+  addresses — that would have pinned everyone onto one pod.
+- **Cross-zone is no longer a footgun.** The NLB needed
+  `load_balancing.cross_zone.enabled=true` set explicitly, because it is off by
+  default and each node only reaches targets in its own AZ: with one replica,
+  every other node had nothing to forward to and clients resolving there hung
+  with no SYN-ACK — "works for some people and not others", changing with each
+  DNS lookup and each reschedule. An ALB has cross-zone on by default and can
+  only turn it off per target group.
 
 Allow a couple of minutes after apply — Terraform returns when the Helm release
-succeeds (the module sets `wait = false`), and the Service resource then blocks
-until the controller reports a hostname, which is briefly unresolvable
-afterwards.
-
-Cross-zone load balancing is switched on explicitly
-(`load_balancing.cross_zone.enabled=true`). An NLB has it **off** by default and
-gets one node per subnet, so with a single OpenMetadata replica every node
-outside the pod's AZ has nothing to forward to. Clients that resolve to one of
-those nodes hang with no SYN-ACK, and which clients those are changes with each
-DNS lookup and each time the pod reschedules — the failure reads as "the UI
-works for some people and not others". Cross-AZ traffic is billed, which at one
-replica is cents.
+succeeds (the module sets `wait = false`), and the Ingress resource then blocks
+until the controller reports an address, which is briefly unresolvable
+afterwards. Controller rejections (a malformed `inbound-cidrs` entry, an
+unresolvable subnet, a duplicate load balancer name) appear only as **warning
+events on the Ingress**, which is what that wait prints on timeout.
 
 The hostname is also readable without cluster access, which is often quicker:
 
 ```bash
 aws elbv2 describe-load-balancers --region us-east-1 \
-  --query "LoadBalancers[?Type=='network'&&Scheme=='internet-facing'].DNSName" --output text
+  --query "LoadBalancers[?Type=='application'&&Scheme=='internet-facing'].DNSName" --output text
 ```
 
 `terraform output openmetadata_url` prints the right URL — or the right command
@@ -404,13 +422,13 @@ to find it — for whichever exposure mode is configured.
 
 Initial login is `admin@open-metadata.org` / `admin`, from the module's
 `initial_admins = "[admin]"` and `principal_domain = "open-metadata.org"`.
-**Change it over `port-forward`, not over the NLB** — until TLS is configured
+**Change it over `port-forward`, not over the load balancer** — until TLS is configured
 that password would otherwise cross the internet in cleartext, starting with
 the well-known default.
 
-### dev — HTTPS on the NLB
+### dev — HTTPS on the ALB
 
-Set both variables in `config/dev.auto.tfvars` and TLS terminates on the NLB
+Set both variables in `config/dev.auto.tfvars` and TLS terminates on the ALB
 listener with an ACM certificate:
 
 ```hcl
@@ -419,23 +437,29 @@ app_tls_route53_zone_name = "example.com"
 ```
 
 The URL becomes `https://openmetadata.example.com` — with a certificate
-attached, `openmetadata-public` listens on 443 as well as 8585. What Terraform
-creates (`terraform/nlb_tls.tf`), all conditional on those variables:
+attached, the ALB listens HTTPS on 443 as well as 8585. What Terraform creates
+(`terraform/alb_tls.tf`), all conditional on those variables:
 
 | Resource | Purpose |
 |---|---|
 | `aws_acm_certificate` | DNS-validated cert for the FQDN |
 | `aws_route53_record.app_cert_validation` | Validation CNAMEs, `allow_overwrite` for cert rotation |
 | `aws_acm_certificate_validation` | Blocks until ACM reports ISSUED |
-| `data.aws_lb` | Reads the NLB back by the controller's resource tags |
-| `aws_route53_record.app` | Alias A record → NLB |
+| `data.aws_lb` | Reads the ALB back by the controller's resource tags |
+| `aws_route53_record.app` | Alias A record → accelerator, or the ALB when there is none |
 
-The certificate reaches the NLB as the
-`service.beta.kubernetes.io/aws-load-balancer-ssl-cert` annotation on
-`openmetadata-public`, paired with `ssl-ports` listing the Service's port names
-(the controller matches either a name or a number). It references the
-**validation** resource, not the certificate, so the Service never carries an
-unissued ARN.
+The certificate reaches the ALB as the
+`alb.ingress.kubernetes.io/certificate-arn` annotation on the Ingress, with
+`listen-ports` naming the HTTPS ports. It references the **validation**
+resource, not the certificate, so the listener is never created with an unissued
+ARN.
+
+The lookup finds the load balancer by tag, and the tag prefix is
+`ingress.k8s.aws/*` — the controller names its tags after the kind of object
+that asked for the load balancer, so the `service.k8s.aws/*` keys that worked
+for the NLB match nothing now. `data.aws_lb` errors rather than returning empty
+when nothing matches, so that mistake is at least loud; the same key appears in
+`deploy.yml`, where it was silent and reported a healthy ALB as "not ready".
 
 Three things to know before enabling it:
 
@@ -446,13 +470,13 @@ Three things to know before enabling it:
   Such a client also arrives from the *proxy's* egress address, so
   `app_lb_allowed_cidrs` has to hold the vendor's published ranges, and the
   certificate the user's browser validates is the proxy's, not this one.
-- **Only the listeners differ.** `targetPort` stays the pod's `http` port, so
-  targets, health checks, and the backend security group rules the controller
-  manages are all still on 8585 — as is the chart's own ClusterIP Service,
-  which is what the cluster talks to.
-- **Failures surface on the Service, not the lookup.** `kubernetes_service_v1`
-  waits up to 10 minutes for the controller to report a hostname and prints the
-  Service's warning events if it doesn't, so a controller problem reads as a
+- **Only the listeners differ.** The backend port stays 8585, so targets,
+  health checks, and the backend security group rules the controller manages are
+  all still on 8585 — as is the chart's own ClusterIP Service, which is what the
+  cluster talks to.
+- **Failures surface on the Ingress, not the lookup.** `kubernetes_ingress_v1`
+  waits up to 10 minutes for the controller to report an address and prints the
+  Ingress's warning events if it doesn't, so a controller problem reads as a
   controller problem instead of a missing load balancer later on.
 
 The hosted zone must already exist and be **public** — this repo does not create
@@ -461,7 +485,7 @@ it, and DNS validation needs it to be authoritative for the domain.
 ### A domain outside Route 53 — internal-only zones
 
 `app_tls_domain_name` + `app_tls_route53_zone_name` only work for a **public
-Route 53 hosted zone in this account**: `nlb_tls.tf` looks the zone up with a
+Route 53 hosted zone in this account**: `alb_tls.tf` looks the zone up with a
 data source and ACM proves ownership by publishing a validation record into it.
 For a zone held elsewhere — an internal `ffdb.com`, say — that path cannot be
 used at all.
@@ -577,7 +601,8 @@ version.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `app_expose_via_nlb` | `false` | Install the LB Controller and switch the Service to `LoadBalancer` |
+| `app_expose_via_alb` | `false` | Install the LB Controller and create the Ingress that becomes the ALB |
+| `app_accelerator_name` | `""` | Name of a bootstrap-owned accelerator to front the ALB (~$18/mo + DT premium) |
 | `app_lb_allowed_cidrs` | `[]` | CIDRs allowed to reach the NLB. **Required** when the toggle is on |
 | `app_tls_domain_name` | `""` | FQDN to serve over HTTPS. Empty leaves the NLB on plain HTTP |
 | `app_tls_route53_zone_name` | `""` | Public Route 53 zone owning that FQDN. Required with the above **unless** `app_tls_certificate_arn` is set |
@@ -590,7 +615,7 @@ version.
 Validation rules fail the plan rather than let a broken or unsafe config
 through: an empty `app_lb_allowed_cidrs` while the NLB toggle is on, `0.0.0.0/0`
 anywhere in that list, an entry that is not CIDR notation, a TLS domain or
-certificate ARN without `app_expose_via_nlb`, a TLS domain with neither a hosted
+certificate ARN without `app_expose_via_alb`, a TLS domain with neither a hosted
 zone nor a certificate ARN, a certificate ARN that is not an ACM ARN, and a
 scheme that is neither `internet-facing` nor `internal`.
 
@@ -598,42 +623,95 @@ scheme that is neither `internet-facing` nor `internal`.
 variable — hardcoding `service.type` would publish production on its next apply.
 That's why the toggle defaults to `false` and only dev opts in.
 
-Source ranges are applied as `spec.loadBalancerSourceRanges` on the Service in
-`nlb_service.tf` — the native field, which the controller reads first and turns
-into the NLB's security group rules. (An earlier revision used the
-`service.beta.kubernetes.io/load-balancer-source-ranges` annotation because the
-values went through the chart; owning the Service outright removed that
-constraint.) Enforcement needs a controller that manages NLB security groups
-(v2.6+).
+Source ranges are applied as the `alb.ingress.kubernetes.io/inbound-cidrs`
+annotation in `alb_ingress.tf`, which the controller turns into the ALB's
+managed security group rules. An Ingress has no equivalent of the Service's
+`spec.loadBalancerSourceRanges`, so — unlike that field — **nothing validates
+the syntax at admission**: Kubernetes accepts a malformed entry and the
+controller rejects it later, reporting only a warning event on the Ingress while
+the apply sits waiting for an address. `variables.tf` therefore checks CIDR
+notation itself, at plan time.
 
-> ⚠️ **Without `app_tls_domain_name`, the NLB serves plain HTTP.** Credentials —
+With Global Accelerator in front, this list only keeps working because the
+endpoint group sets `client_ip_preservation_enabled = true`. Turn that off and
+the ALB sees the accelerator's addresses instead of the client's, the allowlist
+matches nothing, and it stops limiting access at all — with no error anywhere to
+say so.
+
+> ⚠️ **Without `app_tls_domain_name`, the ALB serves plain HTTP.** Credentials —
 > including that default admin password — cross the internet in the clear.
 > IP-allowlisting limits *who can connect*; it encrypts nothing, and browsers
 > correctly flag the login page as "Not secure". Configure TLS above, or use
 > `port-forward`, before typing a password you care about.
 
-### If the NLB hostname changes on every apply
+### Global Accelerator
 
-Fixed, but worth recognising if it ever returns. The symptom is a new
-`*.elb.amazonaws.com` hostname after an apply that changed nothing relevant,
-plus a few minutes of downtime while the replacement's targets pass health
-checks. In a plan it looks like this, on `kubernetes_service_v1.app_public`:
+`app_accelerator_name` puts two static anycast IPv4 addresses in front of the
+ALB. Enabled in dev on 2026-09-04.
 
-```
-- load_balancer_class = "service.k8s.aws/nlb" -> null # forces replacement
-```
+The accelerator is split across two states, deliberately:
 
-The `aws-load-balancer-type: external` annotation makes the controller's
-mutating webhook stamp `spec.loadBalancerClass` onto the Service at admission.
-If the Terraform config does not also declare it, every plan sees a field in
-state that is absent from config and moves to remove it — and `loadBalancerClass`
-is immutable, so removing it means replacing the Service. The controller then
-deletes the load balancer along with it, and AWS hashes a new hostname for the
-replacement.
+| Where | Resource | Purpose |
+|---|---|---|
+| `bootstrap/` | `aws_globalaccelerator_accelerator` | The two static addresses and a stable hostname |
+| `terraform/` | `data.aws_globalaccelerator_accelerator` | Finds it by name |
+| `terraform/` | `aws_globalaccelerator_listener` | TCP, on the same ports the ALB listens on |
+| `terraform/` | `aws_globalaccelerator_endpoint_group` | One region, one endpoint: the ALB, by ARN |
+| `terraform/` | `data.aws_ec2_managed_prefix_list` | GA's published ranges, added to the ALB's security group |
 
-`nlb_service.tf` declares `load_balancer_class` explicitly so config matches
-what the webhook writes. Any controller-set immutable field left out of the
-config produces the same loop.
+The accelerator is in `bootstrap/` because the addresses have to outlive
+`terraform destroy` — the same reason the NAT EIPs are there. The listener and
+endpoint group stay in the environment stack because both are properties of the
+environment: the listener's ports follow its TLS configuration, and the endpoint
+group points at an ALB that does not exist until it is applied. Tearing an
+environment down removes those two and leaves the accelerator holding its
+addresses with nothing behind it, which is the intended resting state.
+
+Apply `bootstrap/` with `create_global_accelerator = true` first. Setting
+`app_accelerator_name` without it fails the plan with "no matching Global
+Accelerator Accelerator found" — the same failure mode as an unbootstrapped NAT
+EIP.
+
+What it is for: `openmetadata-dev.ffdb.com` lives in an internal zone this
+account does not own, so repointing it is a ticket rather than a command, and
+the ALB's hostname carries a per-load-balancer hash that AWS reassigns whenever
+the load balancer is recreated. Pointed at the accelerator, that record is
+written once. The fixed pair is also something a forward-proxy steering bypass
+can be written against, which a rotating set of `*.elb.amazonaws.com` addresses
+is not.
+
+Four things to know:
+
+- **The control plane is us-west-2 only.** Whatever region the endpoints are in.
+  Hence the aliased `aws.global_accelerator` provider in `providers.tf`, and
+  hence a `describe-accelerator` against `us-east-1` returning nothing — which
+  reads as "there is no accelerator".
+- **Client IP preservation is what keeps the allowlist alive.** See the section
+  above. Verify it rather than trusting the default:
+  ```bash
+  aws globalaccelerator describe-endpoint-group --region us-west-2 \
+    --endpoint-group-arn <arn> \
+    --query 'EndpointGroup.EndpointDescriptions[].ClientIPPreservationEnabled'
+  ```
+- **Do not point DNS at the ALB while an accelerator exists.** It resolves, it
+  serves the right certificate, and it bypasses the accelerator entirely.
+  Nothing reports it. `alb_tls.tf` handles this for records Terraform owns by
+  aliasing to the accelerator when one is enabled; the externally-managed record
+  is on you — `terraform output app_dns_publish_instruction` states which to
+  publish.
+- **The addresses survive `destroy`, but not un-bootstrapping.** A teardown of
+  the environment leaves them reserved. Destroying `bootstrap/`, or flipping
+  `create_global_accelerator` back to false, releases them — and AWS does not
+  give the same pair back. Note they are billed the whole time an environment is
+  torn down, which is the price of holding them.
+
+It does **not** address the September 2026 outage. That was Netskope terminating
+TLS on the client side and never reaching AWS at all; an accelerator changes
+where traffic enters the AWS network and has no say over what a proxy on the
+endpoint does with port 443. It is also not multi-region failover — one endpoint
+group, one region, one ALB, nothing to fail over to.
+
+Cost: roughly $18/month plus a per-GB data transfer premium, on top of the ALB.
 
 ### Known gaps
 
@@ -649,42 +727,78 @@ config produces the same loop.
 - **Authentication is still the chart default** — a single `admin` account with a
   well-known password. TLS protects the transport, not the auth model. SSO is the
   remaining gap for any real use.
-- **No TLS on internal hops.** NLB→pod traffic is plain TCP inside the VPC, and
+- **No TLS on internal hops.** ALB→pod traffic is plain HTTP inside the VPC, and
   the OpenSearch/RDS connections use the module's defaults.
+- **Sessions are per-pod.** Cookie stickiness is configured, but OpenMetadata
+  keeps sessions in memory, so a pod restart logs its users out and OIDC would
+  break outright across replicas without that stickiness.
+- **The accelerator is billed while idle.** It is held in `bootstrap/` so its
+  addresses survive teardown, which means ~$18/month continues whether or not an
+  environment is deployed.
 
 ## Production exposure — what's still missing
 
 Production deliberately has **no** UI exposure configured: its tfvars omit
-`app_expose_via_nlb`, so the Service stays `ClusterIP` and the only access is
-`kubectl port-forward`. Nothing stops you enabling the NLB + TLS variables there
-— they are per-environment — and for an internal tool behind a tight allowlist
-that may be enough. What it still doesn't give you:
+`app_expose_via_alb`, so nothing but the chart's `ClusterIP` Service exists and
+the only access is `kubectl port-forward`. The variables are per-environment, so
+enabling the ALB + TLS there is a tfvars change and nothing more.
 
-1. **HTTP→HTTPS redirect.** The NLB serves 443, but it cannot redirect plain
-   HTTP to HTTPS — port 80 is not served at all, so a user who types the bare
-   hostname gets a connection refused. An ALB Ingress does the redirect in a
-   listener rule.
-2. **Authentication.** The chart's default is a single `admin` account with a
-   well-known password. This is the significant gap — TLS protects the transport,
-   not the auth model. OpenMetadata supports OIDC/SAML via
-   `openmetadata.config.authentication.*`; configure it and remove the default
-   admin. An ALB can also carry a Cognito or OIDC authenticate action, putting
-   login in front of the app entirely.
-3. **WAF and managed rules.** Attachable to an ALB, not to an NLB. This is also
-   where you stop maintaining `/32`s by hand — the dev allowlist is two dynamic
-   ISP addresses and will keep drifting.
-4. **Layer-7 anything** — path routing, header rules, request logging to S3,
-   per-route timeouts. An NLB is TCP only.
+Dev's move from an NLB to an ALB Ingress closed most of what this section used
+to list as future work. Layer 7 is now available, health checks are HTTP rather
+than TCP, cross-zone is no longer a manual switch, and WAF is attachable. What
+is still open:
 
-Moving to an ALB Ingress reuses most of what's already here. The AWS Load
-Balancer Controller in `lb_controller.tf` serves Ingresses as well as Services,
-and the ACM certificate plus Route 53 alias in `nlb_tls.tf` transfer directly.
-The change is swapping the Service annotations for chart Ingress values —
-`ingress.enabled`, `ingress.className: alb`, the host rule, and
-`alb.ingress.kubernetes.io/*` for `scheme`, `target-type: ip`,
-`certificate-arn`, `listen-ports` and the redirect action — all of which fit
-through `app_extra_helm_values` with no module change. The alias record would
-then point at the ALB instead of the NLB.
+1. **Authentication.** The chart's default is a single `admin` account with a
+   well-known password, and `app_lb_allowed_cidrs` is the only thing limiting
+   who reaches it — currently ~66,000 addresses. This is *the* gap: TLS protects
+   the transport, not the auth model.
+
+   Upstream's own position is that basic auth is the no-security posture
+   ("Enabling Security is only required for your Production installation") and
+   that it **cannot be combined with SSO** — so it is a cutover, not a gradual
+   migration. The recommended shape is OIDC as a *confidential* client against
+   your existing IdP:
+
+   ```yaml
+   authentication:
+     clientType: confidential
+     oidcConfiguration:
+       id: <client id>
+       secret: <client secret>
+       discoveryUri: https://<idp>/.well-known/openid-configuration
+   ```
+
+   Two practical notes. The module's `helm_values.tftpl` templates only
+   `authorizer.initialAdmins` and `authorizer.principalDomain` — there is no
+   `authentication:` block — so this has to arrive through the module's
+   `helm_values` (`type = any`), **not** `app_extra_helm_values`, which reaches
+   Helm as `--set` and retypes an all-digit or `true`/`false` value. And
+   sessions are in-memory, so multi-replica OIDC needs the cookie stickiness
+   already configured on the Ingress.
+
+   An ALB listener OIDC action (`alb.ingress.kubernetes.io/auth-type: oidc`) is
+   the cheaper stopgap and is deliberately **not** enabled — it authenticates
+   browsers only, 302-redirects any API client, and still leaves everyone
+   sharing the one admin account, so there is no per-user identity, ownership or
+   RBAC. Pick one or the other, never both: two redirect flows with two session
+   lifetimes produce login loops that look like an IdP fault. See the note at
+   the bottom of `alb_ingress.tf`.
+2. **HTTP→HTTPS redirect.** Port 80 is still not served, so a user who types the
+   bare hostname gets a connection refused. The ALB does this in a listener rule
+   (`ssl-redirect`), which is now a one-annotation change rather than an
+   architecture one.
+3. **WAF and managed rules.** Now attachable, since the load balancer is an ALB.
+   This is also where you stop maintaining `/32`s by hand — the dev allowlist
+   still carries dynamic ISP addresses that will keep drifting.
+4. **Internal rather than internet-facing.** Everyone who uses this is on the
+   corporate network, so the correct posture is an internal load balancer and no
+   public exposure at all. The blocker is routing, not configuration: nothing
+   carries `172.72.0.0/16` into this VPC today (no Site-to-Site VPN, Direct
+   Connect, Transit Gateway or peering), which is why dev reverted to
+   internet-facing. Confirm with the "Is anything routed into this VPC?" section
+   of `show-exposure` before trying again — and note that `internal` is
+   mutually exclusive with Global Accelerator, which cannot forward to a private
+   load balancer.
 
 Two further considerations for production specifically:
 

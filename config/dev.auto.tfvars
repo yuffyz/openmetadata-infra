@@ -16,9 +16,16 @@ azs_to_use       = 2
 app_version      = "1.12.13"
 
 # --- OpenMetadata UI exposure ----------------------------------------------
-# Published on an internet-facing NLB, reachable only from the CIDRs below.
-# This creates a second Service, openmetadata-public, which owns the NLB; the
-# chart's own Service stays ClusterIP on 8585 for in-cluster traffic.
+# Published on an internet-facing ALB, reachable only from the CIDRs below.
+# This creates an Ingress, openmetadata-public, which the AWS Load Balancer
+# Controller turns into the ALB; it points straight at the chart's own
+# ClusterIP Service on 8585, which is unchanged.
+#
+# Was an NLB until 2026-09-04. The ALB brings an HTTP health check (a TCP one
+# passes against a JVM that accepts connections and answers nothing -- that
+# cost a day of debugging), cookie session stickiness for OpenMetadata's
+# in-memory session store, and the option of WAF or listener OIDC later.
+# alb_ingress.tf has the details.
 #
 # The address that arrives at the NLB is whatever the client egresses from. A
 # coworker behind a corporate proxy (Netskope, Zscaler) arrives as the proxy,
@@ -28,7 +35,7 @@ app_version      = "1.12.13"
 # Without TLS the UI is plain HTTP on 8585 with a default admin account, so
 # Terraform refuses both 0.0.0.0/0 and an empty list -- keep this list tight.
 #
-# Adds roughly $0.55-0.70/day for the NLB, plus LCUs.
+# Adds roughly $0.55-0.70/day for the ALB, plus LCUs.
 #
 # Reconciled against the live security group, which had drifted to 15 CIDRs
 # while this file still listed 2. Applying the old list would have removed
@@ -43,7 +50,7 @@ app_version      = "1.12.13"
 #
 # Without this, the UI is still reachable via:
 #   kubectl port-forward -n openmetadata svc/openmetadata 8585:8585
-app_expose_via_nlb = true
+app_expose_via_alb = true
 app_lb_allowed_cidrs = [
   # Corporate VPN / proxy egress pools. Broad on purpose: clients egress from a
   # rotating pool, so a /32 per complaint never converges. Together these permit
@@ -59,12 +66,46 @@ app_lb_allowed_cidrs = [
   "24.63.41.112/32",
 ]
 
-# > ⚠️ With an internet-facing NLB, this list is the ONLY thing limiting who can
+# > ⚠️ With an internet-facing ALB, this list is the ONLY thing limiting who can
 # > reach the UI, and it currently admits ~66k addresses. TLS encrypts the
 # > transport; it does nothing for the auth model, and the chart still ships a
 # > single `admin` account with a well-known password. Change that password and
 # > configure OIDC/SAML (`openmetadata.config.authentication.*`) before treating
 # > this as safe.
+# >
+# > Upstream's own position is that basic auth is the no-security posture:
+# > "Enabling Security is only required for your Production installation", and
+# > it cannot be combined with SSO -- so this is a cutover, not a migration.
+# > The module templates only authorizer.initialAdmins and
+# > authorizer.principalDomain, so the authentication block has to arrive
+# > through the module's helm_values, not app_extra_helm_values (which reaches
+# > Helm as --set and retypes strings).
+
+# --- Global Accelerator ------------------------------------------------------
+# Two static anycast IPs in front of the ALB, so the ffdb.com record below is
+# written once instead of re-ticketed every time the load balancer is replaced,
+# and so the network team has a fixed pair to write a proxy steering bypass
+# against.
+#
+# This NAMES an accelerator that bootstrap/ owns; it does not create one. Apply
+# bootstrap/ with create_global_accelerator = true first, or the plan fails with
+# "no matching Global Accelerator Accelerator found". The name is
+# "<global_accelerator_name_prefix>-<environment>".
+#
+# It lives in bootstrap/ for the same reason the NAT EIP does: the addresses
+# have to outlive this environment. Created in this stack, `terraform destroy`
+# would take them with it and the rebuild would hand out a new pair -- moving
+# the DNS staleness from the ALB's hostname to the accelerator rather than
+# removing it. Only the listener and endpoint group are created here, and a
+# teardown leaves the addresses reserved with nothing behind them.
+#
+# It is NOT a fix for the September 2026 outage -- that was Netskope
+# terminating TLS on the client side and never reaching AWS, which an
+# accelerator has no say over. See global_accelerator.tf.
+#
+# Adds ~$18/month plus a per-GB data transfer premium, billed by bootstrap/
+# whether or not this environment is currently deployed.
+app_accelerator_name = "openmetadata-dev"
 
 # HTTPS on the NLB. Set both to terminate TLS with an ACM certificate and get a
 # Route 53 alias record; leave them empty and the NLB stays plain HTTP (browsers
@@ -103,48 +144,43 @@ app_lb_allowed_cidrs = [
 app_tls_domain_name     = "openmetadata-dev.ffdb.com"
 app_tls_certificate_arn = "arn:aws:acm:us-east-1:146445314234:certificate/a443aeb2-67db-4105-8c05-b9ca0020e654"
 
-# --- DNS: pointed by hand, straight at the load balancer --------------------
+# --- DNS: pointed by hand, now at the accelerator ---------------------------
 # openmetadata-dev.ffdb.com is published in an internal zone this account does
-# not own, and it is pointed manually. Terraform publishes no record for it and
-# no intermediate target -- the manual CNAME goes directly to the NLB:
+# not own, and it is pointed manually. Terraform publishes no record for it.
 #
-#   openmetadata-dev.ffdb.com.  CNAME  <name>.elb.amazonaws.com.
+# With the accelerator enabled above, the record is an A record to its two
+# static addresses rather than a CNAME to the load balancer:
 #
-# A CNAME, not an A record: the addresses belong to the load balancer and do
-# not survive it being replaced.
+#   openmetadata-dev.ffdb.com.  A  <both addresses from app_static_ips>
 #
-# Get the current hostname with either of:
+# Get them, and a plain statement of what to publish, from:
 #
-#   aws elbv2 describe-load-balancers --region us-east-1 \
-#     --query "LoadBalancers[?LoadBalancerName=='open-metadata-dev-omd'].DNSName" \
-#     --output text
+#   terraform output app_static_ips
+#   terraform output app_dns_publish_instruction
 #
-#   kubectl get svc -n openmetadata openmetadata-public \
-#     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+# Do NOT point this at the ALB's hostname while the accelerator exists. It
+# resolves, it serves the right certificate, and it quietly bypasses the
+# accelerator entirely -- there is no error anywhere to reveal it.
 #
 # TLS is unaffected. Clients send openmetadata-dev.ffdb.com in SNI regardless
-# of what the CNAME resolves to, and the certificate above is a *.ffdb.com
+# of what the record resolves to, and the certificate above is a *.ffdb.com
 # wildcard, so it matches.
 #
-# > ⚠️ This target is stable across `apply` but NOT across `destroy`.
-# >
-# > The load balancer is owned by the AWS Load Balancer Controller and follows
-# > the Service. Its hostname is <name>-<hash>.elb.<region>.amazonaws.com, and
-# > AWS assigns that hash per load balancer at creation -- the
-# > aws-load-balancer-name annotation fixes the name, not the hash. A teardown
-# > deletes the load balancer, and the rebuild gets a NEW hostname. Changing
-# > app_lb_scheme does the same, for the same reason.
-# >
-# > After any of those the manual record is stale and the UI is unreachable
-# > until it is repointed -- and for an externally managed zone that is a
-# > ticket, not a command. This environment is explicitly built for cheap
-# > teardown (see the header of this file), so plan for it.
-# >
-# > The alternative, left here deliberately: app_dns_alias_name publishes a
-# > Terraform-owned name in a zone this account controls and repoints it at the
-# > current load balancer on every apply. The manual record then targets a name
-# > that never changes and is written exactly once. It costs about $0.50/month.
-# > Re-enable both lines below to switch back.
+# These addresses survive `destroy`. They belong to the accelerator, the
+# accelerator belongs to bootstrap/, and bootstrap/ is not part of the dev
+# teardown loop -- so unlike the ALB hostname this record replaced, this one is
+# written once and stays correct across rebuilds.
+#
+# > ⚠️ It does NOT survive bootstrap/ being destroyed, or
+# > create_global_accelerator being set back to false. Either releases the
+# > addresses, and AWS does not give the same pair back.
+#
+# The cheaper alternative, left here deliberately: app_dns_alias_name publishes
+# a Terraform-owned name in a zone this account controls and repoints it at the
+# current front door on every apply, for about $0.50/month against the
+# accelerator's ~$18. The manual record then targets a name that never changes
+# and is written exactly once. Re-enable both lines below to use it -- it also
+# works alongside the accelerator, pointing at it rather than the ALB.
 # app_tls_route53_zone_name = "fuji-openmetadata.com"
 # app_dns_alias_name        = "dev.fuji-openmetadata.com"
 
@@ -152,7 +188,9 @@ app_tls_certificate_arn = "arn:aws:acm:us-east-1:146445314234:certificate/a443ae
 # Left at the default (internet-facing) after trying `internal` and reverting.
 #
 # `internal` gives the load balancer private addresses only, so it is reachable
-# just from inside the VPC and networks routed to it. A corporate VPN
+# just from inside the VPC and networks routed to it. It is also incompatible
+# with the accelerator named above, which cannot forward to a private load
+# balancer -- Terraform rejects the combination at plan time. A corporate VPN
 # (GlobalProtect here) puts the client on the CORPORATE network, which is not
 # this VPC: with no Site-to-Site VPN, Direct Connect, Transit Gateway or peering
 # carrying 172.72.0.0/16, packets never arrive. Every connection times out, and
@@ -160,7 +198,7 @@ app_tls_certificate_arn = "arn:aws:acm:us-east-1:146445314234:certificate/a443ae
 # internal load balancer is a no-op, because there is no path for the packet to
 # take in the first place.
 #
-# So the UI stays internet-facing and the allowlist below is what limits access.
+# So the UI stays internet-facing and the allowlist above is what limits access.
 # TLS still terminates on the listener with the imported certificate above, so
 # credentials are encrypted in transit either way.
 #

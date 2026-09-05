@@ -133,12 +133,18 @@ jobs:
 
       # Report where the UI is, in the job summary as well as the log.
       #
-      # With TLS configured the URL is known at apply time. Without it, the NLB
+      # With TLS configured the URL is known at apply time. Without it, the ALB
       # is created by the AWS Load Balancer Controller *after* Terraform
       # returns -- the upstream helm_release sets wait = false -- so the
       # hostname does not exist yet and has to be polled for. The controller
       # tags the load balancer with elbv2.k8s.aws/cluster, which is how we find
       # it without needing cluster credentials.
+      #
+      # The stack tag is ingress.k8s.aws/stack, not service.k8s.aws/stack: the
+      # controller prefixes its tags by the kind of object that asked for the
+      # load balancer, and this is provisioned from an Ingress. With the old
+      # key the filter matched nothing and every apply reported "not ready
+      # within 5 minutes" against a perfectly healthy ALB.
       #
       # Never fails the job: the apply already succeeded, and not knowing the
       # hostname yet is not a deployment failure.
@@ -149,17 +155,20 @@ jobs:
           set -uo pipefail
 
           url=$(terraform output -raw app_url 2>/dev/null || true)
-          exposed=$(terraform output -raw app_expose_via_nlb 2>/dev/null || echo "false")
+          exposed=$(terraform output -raw app_expose_via_alb 2>/dev/null || echo "false")
           cluster=$(terraform output -raw eks_cluster_name 2>/dev/null || true)
           ns=$(terraform output -raw app_namespace 2>/dev/null || echo "openmetadata")
           alias=$(terraform output -raw app_dns_alias_fqdn 2>/dev/null || true)
+          static_ips=$(terraform output -json app_static_ips 2>/dev/null \
+                         | python3 -c 'import json,sys; print(", ".join(json.load(sys.stdin)))' 2>/dev/null || true)
+          publish=$(terraform output -raw app_dns_publish_instruction 2>/dev/null || true)
 
           if [ -z "$url" ] && [ "$exposed" = "true" ] && [ -n "$cluster" ]; then
-            echo "Waiting for the load balancer controller to provision the NLB..."
+            echo "Waiting for the load balancer controller to provision the ALB..."
             for _ in $(seq 1 30); do          # up to 5 minutes
               arn=$(aws resourcegroupstaggingapi get-resources \
                       --tag-filters "Key=elbv2.k8s.aws/cluster,Values=$cluster" \
-                                    "Key=service.k8s.aws/stack,Values=$ns/openmetadata-public" \
+                                    "Key=ingress.k8s.aws/stack,Values=$ns/openmetadata-public" \
                       --resource-type-filters elasticloadbalancing:loadbalancer \
                       --query 'ResourceTagMappingList[0].ResourceARN' \
                       --output text 2>/dev/null || true)
@@ -178,6 +187,18 @@ jobs:
           {
             echo "## OpenMetadata — ${{ github.event.inputs.environment }}"
             echo
+            # The accelerator's addresses, when there is one. Printed on every
+            # apply because they are what the externally-managed ffdb.com
+            # record has to carry, and because they change if the accelerator
+            # is ever destroyed and recreated.
+            if [ -n "$static_ips" ]; then
+              echo "**Static IPs (Global Accelerator):** \`$static_ips\`"
+              echo
+            fi
+            if [ -n "$publish" ]; then
+              echo "**DNS to publish:** $publish"
+              echo
+            fi
             # The name externally-managed DNS should target. Printed on every
             # apply because the load balancer hostname it resolves to changes
             # whenever the load balancer is recreated -- pointing an outside
@@ -205,13 +226,13 @@ jobs:
               echo "First boot runs database migrations and builds search indexes, so"
               echo "503s for a few minutes are normal."
             elif [ "$exposed" = "true" ]; then
-              echo "The NLB was not ready within 5 minutes. Find it with:"
+              echo "The ALB was not ready within 5 minutes. Find it with:"
               echo
               echo '```bash'
-              echo "kubectl get svc -n $ns openmetadata-public -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
+              echo "kubectl get ingress -n $ns openmetadata-public -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
               echo '```'
             else
-              echo "Not published externally (\`app_expose_via_nlb = false\`). Reach it with:"
+              echo "Not published externally (\`app_expose_via_alb = false\`). Reach it with:"
               echo
               echo '```bash'
               echo "kubectl port-forward -n $ns svc/openmetadata 8585:8585   # then http://localhost:8585"

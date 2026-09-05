@@ -1,19 +1,22 @@
 # AWS Load Balancer Controller
 #
-# Provisions the NLB that fronts the OpenMetadata UI. Only installed when
-# var.app_expose_via_nlb is true -- a cluster with no LoadBalancer Service has
-# nothing for it to do.
+# Provisions the ALB that fronts the OpenMetadata UI. Only installed when
+# var.app_expose_via_alb is true -- a cluster with no Ingress has nothing for
+# it to do.
 #
 # EKS no longer ships in-tree load balancer provisioning as the supported path,
-# so this controller is what turns `service.type: LoadBalancer` into a real NLB
-# with IP targets. It relies on the kubernetes.io/role/elb subnet tags set in
-# vpc.tf for subnet discovery.
+# so this controller is what turns the Ingress in alb_ingress.tf into a real
+# ALB with IP targets. It relies on the kubernetes.io/role/elb subnet tags set
+# in vpc.tf for subnet discovery.
+#
+# The IRSA policy below covers both ALBs and NLBs, so nothing about the
+# permissions changed when this stack moved off the NLB.
 
 module "lb_controller_irsa" {
   source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts"
   version = "~>6.0"
 
-  count = var.app_expose_via_nlb ? 1 : 0
+  count = var.app_expose_via_alb ? 1 : 0
 
   name            = "aws-load-balancer-controller"
   use_name_prefix = false
@@ -29,7 +32,7 @@ module "lb_controller_irsa" {
 }
 
 resource "helm_release" "aws_load_balancer_controller" {
-  count = var.app_expose_via_nlb ? 1 : 0
+  count = var.app_expose_via_alb ? 1 : 0
 
   name       = "aws-load-balancer-controller"
   repository = "https://aws.github.io/eks-charts"

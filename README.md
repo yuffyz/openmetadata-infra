@@ -63,9 +63,11 @@ openmetadata-infra/                     # repo root
 ├─ terraform/                        # the Terraform root module that gets deployed
 │  ├─ core_addons.tf                # vpc-cni / kube-proxy / coredns EKS addons
 │  ├─ lb_controller.tf              # AWS Load Balancer Controller + IRSA (toggled)
-│  └─ nlb_tls.tf                    # ACM cert + Route 53 alias for HTTPS (toggled)
+│  ├─ alb_ingress.tf                # Ingress -> internet-facing ALB for the UI (toggled)
+│  ├─ alb_tls.tf                    # ACM cert + Route 53 alias for HTTPS (toggled)
+│  └─ global_accelerator.tf         # GA listener + endpoint group (accelerator lives in bootstrap/)
 ├─ backend.tf                        # S3 backend block (values via -backend-config)
-├─ bootstrap/                        # one-time: GitHub OIDC provider + deploy role
+├─ bootstrap/                        # one-time: OIDC provider, deploy role, NAT EIPs, accelerator
 ├─ config/
 │  ├─ dev.auto.tfvars                # teardown-safe, cheaper, "-dev" names
 │  └─ production.auto.tfvars         # production-safe defaults
@@ -94,11 +96,15 @@ Actions → **openmetadata-infra** → *Run workflow* → choose **environment**
 `environment=dev, action=destroy` to remove — no approvals, and the dev RDS
 settings let destroy complete cleanly.
 
-> With `app_expose_via_nlb = true`, delete the LoadBalancer Service **before**
-> dispatching destroy. The NLB is owned by the load balancer controller, not
-> Terraform, and an orphaned one blocks subnet and VPC deletion for 20 minutes.
-> Full runbook in
+> With `app_expose_via_alb = true`, delete the Ingress **before** dispatching
+> destroy. The ALB is owned by the load balancer controller, not Terraform, and
+> an orphaned one blocks subnet and VPC deletion for 20 minutes. Full runbook in
 > [README_full.md](README_full.md#destroying--clean-up-the-load-balancer-first).
+>
+> The accelerator needs no special handling and keeps its addresses. It is owned
+> by `bootstrap/`, which is not part of the teardown loop — destroy removes only
+> its listener and endpoint group, leaving the static IPs reserved for the next
+> apply. That is why the `ffdb.com` record is written once.
 
 Locally:
 
@@ -139,12 +145,16 @@ The apply job prints the URL in its run summary. To find it yourself:
 
 ```bash
 # via the cluster
-kubectl get svc -n openmetadata openmetadata-public \
+kubectl get ingress -n openmetadata openmetadata-public \
   -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
 
 # or straight from AWS, no cluster access needed
 aws elbv2 describe-load-balancers --region us-east-1 \
-  --query "LoadBalancers[?Type=='network'&&Scheme=='internet-facing'].DNSName" --output text
+  --query "LoadBalancers[?Type=='application'&&Scheme=='internet-facing'].DNSName" --output text
+
+# with the accelerator in front, these are the addresses clients actually use
+terraform output app_static_ips
+terraform output app_dns_publish_instruction
 ```
 
 Then `http://<hostname>:8585` — plain HTTP on **8585** without TLS. With TLS
@@ -335,32 +345,38 @@ walkthrough in
 ## Production exposure — what's still missing
 
 Production deliberately has **no** UI exposure configured: its tfvars omit
-`app_expose_via_nlb`, so the Service stays `ClusterIP` and the only access is
-`kubectl port-forward`. Nothing stops you enabling the NLB + TLS variables there
-— they are per-environment — and for an internal tool behind a tight allowlist
-that may be enough. What it still doesn't give you:
+`app_expose_via_alb`, so nothing but the chart's `ClusterIP` Service exists and
+the only access is `kubectl port-forward`. The variables are per-environment, so
+enabling the ALB + TLS there is a tfvars change and nothing more.
 
-1. **HTTP→HTTPS redirect.** The NLB serves 443, but it cannot redirect plain
-   HTTP to HTTPS — port 80 is not served at all. An ALB Ingress does that in a
-   listener rule.
-2. **Authentication.** The chart's default is a single `admin` account with a
-   well-known password. This is the significant gap — TLS protects the transport,
-   not the auth model. OpenMetadata supports OIDC/SAML via
-   `openmetadata.config.authentication.*`; configure it and remove the default
-   admin. An ALB can also carry a Cognito or OIDC authenticate action.
-3. **WAF and managed rules.** Attachable to an ALB, not to an NLB. This is also
-   where you stop maintaining `/32`s by hand — the dev allowlist is two dynamic
-   ISP addresses and will keep drifting.
-4. **Layer-7 anything** — path routing, header rules, request logging to S3,
-   per-route timeouts. An NLB is TCP only.
+Dev moved from an NLB to an ALB Ingress on 2026-09-04, which closed most of what
+this section used to list as future work — L7 is now available, health checks
+are HTTP rather than TCP, and stickiness is cookie-based (which OpenMetadata's
+in-memory session store needs the moment there is more than one replica). What
+is still open:
 
-Moving to an ALB Ingress reuses most of what's already here. The controller in
-`lb_controller.tf` serves Ingresses as well as Services, and the ACM certificate
-plus Route 53 alias in `nlb_tls.tf` transfer directly. The change is swapping the
-Service annotations for chart Ingress values — `ingress.enabled`,
-`ingress.className: alb`, the host rule, and `alb.ingress.kubernetes.io/*` for
-`scheme`, `target-type: ip`, `certificate-arn`, `listen-ports` and the redirect
-action — all of which fit through `app_extra_helm_values` with no module change.
+1. **Authentication.** The chart's default is a single `admin` account with a
+   well-known password, and the CIDR allowlist is the only thing limiting who
+   reaches it. This is *the* gap — TLS protects the transport, not the auth
+   model. Upstream's position is that basic auth is the no-security posture and
+   cannot be combined with SSO, so it is a cutover: configure
+   `authentication.clientType = confidential` with an `oidcConfiguration` block
+   against Entra ID and delete the default admin. Note this has to arrive
+   through the module's `helm_values`, **not** `app_extra_helm_values` — the
+   latter reaches Helm as `--set`, which retypes strings.
+
+   An ALB listener OIDC action is the cheaper stopgap, but it authenticates
+   browsers only: it 302-redirects API clients, and it leaves everyone sharing
+   the one admin account. Pick one, never both. See the note at the bottom of
+   `alb_ingress.tf`.
+2. **HTTP→HTTPS redirect.** Port 80 is still not served. The ALB can do it in a
+   listener rule (`ssl-redirect`), which the NLB could not — it is now a
+   one-annotation change rather than an architecture one.
+3. **WAF and managed rules.** Now attachable, since the load balancer is an ALB.
+   This is also where you stop maintaining `/32`s by hand — the dev allowlist
+   still carries dynamic ISP addresses that will keep drifting.
+4. **Multi-replica.** Cookie stickiness is configured, but the sessions are
+   still in-memory per pod, so a pod restart logs its users out.
 
 Also worth revisiting for production, unrelated to exposure:
 `enabled_cluster_log_types = []` disables EKS control-plane logging, and the node

@@ -98,3 +98,40 @@ aws iam create-service-linked-role \
 - **Permissions** default to `PowerUserAccess` + `IAMFullAccess` (the stack
   creates IAM roles and KMS keys). Override `permissions_policy_arns` with a
   least-privilege policy for production use.
+
+## Global Accelerator (optional)
+
+`create_global_accelerator = true` allocates one AWS Global Accelerator per
+entry in `environment_names`, named `<global_accelerator_name_prefix>-<env>`.
+Each holds two static anycast IPv4 addresses that sit in front of that
+environment's ALB.
+
+It is here, rather than in the environment stack, for the same reason as the NAT
+EIPs: the addresses have to outlive `terraform destroy`. The environment's UI is
+published in an internal zone this account does not own, so repointing it is a
+ticket rather than a command — and the ALB's hostname carries a hash AWS
+reassigns whenever the load balancer is recreated. Held here, the addresses
+survive the dev teardown loop and the external DNS record is written once.
+
+Only the accelerator lives here. Its listener and endpoint group belong to the
+environment stack (`terraform/global_accelerator.tf`), which finds this by name
+through `app_accelerator_name`. Destroying an environment removes those two and
+leaves the accelerator holding its addresses with nothing behind it — the
+intended resting state.
+
+```bash
+terraform apply -var create_global_accelerator=true
+terraform output accelerator_names        # -> set as app_accelerator_name
+terraform output accelerator_static_ips   # -> the pair to publish in DNS
+```
+
+Then in the environment's tfvars:
+
+```hcl
+app_accelerator_name = "openmetadata-dev"
+```
+
+> ⚠️ ~$18/month per accelerator, billed whether or not that environment is
+> currently deployed — that is the cost of holding the addresses. Setting this
+> back to false, or destroying this bootstrap, releases them permanently; AWS
+> does not hand the same pair back.
