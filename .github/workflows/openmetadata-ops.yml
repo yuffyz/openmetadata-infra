@@ -311,6 +311,11 @@ jobs:
           read -r -d '' SCRIPT <<'PROBE' || true
           set -u
           B="$OS_SCHEME://$OS_HOST:$OS_PORT"
+          # 4000 truncated the index list mid-row on a real run: ~124 indices at
+          # ~80 bytes each is ~10 KB, and the rows that got cut are exactly the
+          # ones you go looking for. 20000 covers it with headroom.
+          MAX_BODY=20000
+
           req() {
             m=$1; p=$2; d=${3:-}
             if [ -n "$d" ]; then
@@ -321,19 +326,32 @@ jobs:
                        -u "$OS_USER:$OS_PASS" "$B$p")
             fi
             printf '\n%-44s -> HTTP %s\n' "$m $p" "$code"
-            head -c 4000 /tmp/body; echo
+            head -c "$MAX_BODY" /tmp/body; echo
           }
 
           req GET /_cluster/health
-          # Shard count is the capacity question: two t3.small.search nodes have
-          # roughly 1 GiB of heap each, and the usual ceiling is ~20-25 shards
-          # per GiB. Hundreds of shards make the cluster time out rather than
-          # refuse, which shows up as HTTP 000/504 instead of an error body.
+          # Shard count is the capacity question. Read heap from the nodes output
+          # below rather than assuming an instance size -- dev runs
+          # t3.medium.search and production defaults to t3.small.search, so the
+          # budget differs by environment. The usual ceiling is ~20-25 shards per
+          # GiB of heap; a 2 GiB node is therefore good for roughly 50, and every
+          # OpenMetadata index is created with 5 primaries plus a replica. Well
+          # past that the cluster times out rather than refusing, which shows up
+          # as HTTP 000/504 with no error body. active_shards in the health output
+          # is the number to watch.
           req GET "/_cat/health?v"
           req GET "/_cat/nodes?v&h=name,node.role,heap.percent,ram.percent,cpu,load_1m"
           # Doc counts are the direct answer to "are the indices empty?", and
           # store.size shows which indices are worth reclaiming.
           req GET "/_cat/indices?v&h=index,health,pri,rep,docs.count,store.size&s=store.size:desc"
+          # Explore reads through the ALIAS (table_search_index and friends), never
+          # a concrete index, and _cat/indices does not list aliases -- so a
+          # healthy index list with no alias pointing at it looks fine here and
+          # still leaves Explore blank. Reindexing writes
+          # <entity>_search_index_rebuild_<epoch> and swaps the alias onto it at
+          # the end, so during a rebuild two generations coexist and only the
+          # alias says which one is live.
+          req GET "/_cat/aliases?v&h=alias,index,is_write_index&s=alias:asc"
           # Which OpenSearch user/roles the credentials map to. The FGAC master
           # user should map to all_access; anything else explains read-yes/write-no.
           req GET /_plugins/_security/api/account
@@ -349,16 +367,22 @@ jobs:
             # $(printf '...\n') loses the terminator and OpenSearch rejects the
             # body with "The bulk request must be terminated by a newline".
             # The X sentinel is appended then removed, preserving it.
-            BULK=$(printf '{"index":{"_index":"om-auth-probe"}}\n{"probe":"bulk"}\nX'); BULK=${BULK%X}
+            #
+            # The document field is "via", NOT "probe". The _doc call above puts a
+            # boolean in "probe", which dynamic mapping fixes as boolean for the
+            # index; sending the string "bulk" in the same field then fails with
+            # mapper_parsing_exception and the response reads "errors":true. That is
+            # the probe contradicting itself, not a write failure -- and it looked
+            # exactly like a broken sink on every previous run.
+            BULK=$(printf '{"index":{"_index":"om-auth-probe"}}\n{"via":"bulk"}\nX'); BULK=${BULK%X}
             req POST /_bulk "$BULK"
             req DELETE /om-auth-probe
           fi
           PROBE
 
-          # The container must be named after the pod: `kubectl run -i` attaches
-          # to the container matching the pod name, and an override that renames
-          # it makes the attach fail ("container probe not found"), fall back to
-          # log streaming, and print everything twice.
+          # Named after the pod so `kubectl logs` needs no -c. (It also used to
+          # matter because `kubectl run -i` attaches to the container matching the
+          # pod name -- see the run block below for why we no longer attach.)
           POD_NAME="om-os-probe-${GITHUB_RUN_ID}"
 
           OVERRIDES=$(SCRIPT="$SCRIPT" OS_HOST="$OS_HOST" OS_PORT="$OS_PORT" \
@@ -385,9 +409,44 @@ jobs:
           PY
           )
 
+          # Run detached and read the log afterwards, rather than `kubectl run -i
+          # --rm`. With the attach form the container routinely starts writing
+          # before kubectl has established the stream, and the FIRST responses are
+          # lost: a real run dropped /_cluster/health, /_cat/health and
+          # /_cat/nodes, which is precisely the heap and shard-count evidence this
+          # probe exists to collect -- and it fails silently, because what remains
+          # looks like a complete log. Detach-then-log returns all of it.
+          cleanup() {
+            kubectl delete pod -n "$NAMESPACE" "$POD_NAME" \
+              --ignore-not-found --wait=false >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
           kubectl run "$POD_NAME" -n "$NAMESPACE" \
-            --image=curlimages/curl:8.11.1 --restart=Never --rm -i --quiet \
-            --pod-running-timeout=3m --overrides="$OVERRIDES" || true
+            --image=curlimages/curl:8.11.1 --restart=Never \
+            --overrides="$OVERRIDES" >/dev/null || true
+
+          # Poll for a terminal phase. `kubectl wait` has no single condition
+          # covering both Succeeded and Failed, and the probe output is worth
+          # printing either way, so read the phase directly.
+          phase=""
+          for _ in $(seq 1 90); do          # ~3 minutes
+            phase=$(kubectl get pod -n "$NAMESPACE" "$POD_NAME" \
+                      -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            case "$phase" in Succeeded|Failed) break ;; esac
+            sleep 2
+          done
+
+          out=$(kubectl logs -n "$NAMESPACE" "$POD_NAME" 2>/dev/null || true)
+          if [ -n "$out" ]; then
+            printf '%s\n' "$out"
+          else
+            # No output at all means the pod never ran its command -- unschedulable,
+            # image pull failure, or a missing opensearch-credentials secret. The
+            # events say which; the logs never will.
+            echo "::warning::probe pod produced no output (phase=${phase:-unknown})"
+            kubectl describe pod -n "$NAMESPACE" "$POD_NAME" 2>&1 | sed -n '/Events:/,$p' || true
+          fi
 
           echo
           echo "Interpretation:"
@@ -396,6 +455,9 @@ jobs:
           echo "  health 200, PUT/_bulk 403                           -> authorised for reads only; check the account/roles output"
           echo "  cluster_block_exception / read_only_allow_delete    -> disk watermark, not auth; grow volume_size"
           echo "  health 401                                          -> credentials rejected outright"
+          echo "  docs present but no alias on <entity>_search_index  -> Explore blank though the data is indexed"
+          echo "  two *_rebuild_<epoch> generations for one entity     -> a reindex is mid-flight; the alias names the live one"
+          echo "  active_shards far above ~25 per GiB of node heap    -> shard pressure; reduce-replicas helps in dev"
 
       # Re-points the domain's FGAC master user at the password already held in
       # the opensearch-credentials secret.
