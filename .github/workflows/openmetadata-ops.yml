@@ -757,7 +757,7 @@ jobs:
           R="${{ vars.AWS_REGION }}"
 
           echo "::group::Declared in $TFVARS_FILE"
-          grep -nE '^[[:space:]]*(app_expose_via_alb|app_lb_scheme|app_lb_allowed_cidrs|app_tls_domain_name|app_tls_route53_zone_name|app_tls_certificate_arn)' \
+          grep -nE '^[[:space:]]*(app_expose_via_alb|app_accelerator_name|app_lb_scheme|app_lb_allowed_cidrs|app_tls_domain_name|app_tls_route53_zone_name|app_tls_certificate_arn)' \
             "$TFVARS_FILE" || echo "(no exposure variables set -- UI is ClusterIP + port-forward only)"
           echo "::endgroup::"
 
@@ -862,6 +862,52 @@ jobs:
             echo "::endgroup::"
           done
 
+          # Global Accelerator, when one is in front. Its control plane is
+          # reachable only through the us-west-2 endpoint, whatever region the
+          # endpoints live in -- a describe against us-east-1 returns nothing
+          # and reads as "no accelerator".
+          echo "::group::Global Accelerator"
+          # The accelerator is owned by bootstrap/, not by this environment, so
+          # its name comes from the tfvars rather than from the cluster name.
+          GA_NAME=$(grep -E '^[[:space:]]*app_accelerator_name' "$TFVARS_FILE" | head -1 | cut -d'"' -f2)
+          if [ -z "$GA_NAME" ]; then
+            echo "(app_accelerator_name is unset -- no accelerator in front of this environment)"
+            ACCS=""
+          else
+            echo "accelerator name from $TFVARS_FILE: $GA_NAME"
+            ACCS=$(aws globalaccelerator list-accelerators --region us-west-2 \
+                     --query "Accelerators[?Name=='${GA_NAME}'].AcceleratorArn" \
+                     --output text 2>/dev/null)
+          fi
+          if [ -n "$GA_NAME" ] && { [ -z "$ACCS" ] || [ "$ACCS" = "None" ]; }; then
+            echo "NOT FOUND: no accelerator named $GA_NAME."
+            echo "bootstrap/ has probably not been applied with create_global_accelerator = true,"
+            echo "in which case the environment plan fails the same way."
+          fi
+          for a in $ACCS; do
+            aws globalaccelerator describe-accelerator --region us-west-2 --accelerator-arn "$a" \
+              --query 'Accelerator.{Name:Name,Status:Status,Enabled:Enabled,DNS:DnsName,StaticIPs:IpSets[].IpAddresses[]}' \
+              --output json || true
+
+            for l in $(aws globalaccelerator list-listeners --region us-west-2 --accelerator-arn "$a" \
+                         --query 'Listeners[].ListenerArn' --output text 2>/dev/null); do
+              echo "-- listener: a port absent here is NOT forwarded, and presents as a hang --"
+              aws globalaccelerator describe-listener --region us-west-2 --listener-arn "$l" \
+                --query 'Listener.{Protocol:Protocol,ClientAffinity:ClientAffinity,Ports:PortRanges}' \
+                --output json || true
+
+              # ClientIPPreservationEnabled is the one to read carefully. False
+              # means the ALB sees the accelerator's addresses instead of the
+              # client's, so app_lb_allowed_cidrs matches nothing and stops
+              # limiting access at all -- with no error anywhere.
+              echo "-- endpoints: Preserve=false silently voids app_lb_allowed_cidrs --"
+              aws globalaccelerator list-endpoint-groups --region us-west-2 --listener-arn "$l" \
+                --query 'EndpointGroups[].{Region:EndpointGroupRegion,Endpoints:EndpointDescriptions[].{Id:EndpointId,Health:HealthState,Preserve:ClientIPPreservationEnabled}}' \
+                --output json || true
+            done
+          done
+          echo "::endgroup::"
+
           # An internal ALB is only reachable from inside the VPC or from a
           # network routed to it. A corporate VPN (GlobalProtect and friends)
           # puts the client on the CORPORATE network -- that is not the VPC.
@@ -931,6 +977,13 @@ jobs:
           echo "  One address per AZ -> if only one private subnet is routed, roughly half of attempts black-hole"
           echo "  A cert SAN that omits the FQDN fails TLS, not TCP -- that shows as a certificate error, never a timeout"
           echo "  ping is not a test: a load balancer does not answer ICMP. Use: nc -vz <fqdn> 443"
+          echo
+          echo "  With an accelerator in front:"
+          echo "    Preserve=false on an endpoint -> app_lb_allowed_cidrs is no longer limiting anything"
+          echo "    A DNS record pointing at the ALB hostname resolves and works, but BYPASSES the accelerator"
+          echo "    Static IPs belong to the bootstrap-owned accelerator, so they survive an environment destroy"
+          echo "    An accelerator with a listener but no endpoint group is a torn-down environment, not a fault"
+          echo
           echo "  And rule out the client before AWS: a forward proxy (Netskope) terminates TLS"
           echo "  itself, so a completed handshake proves nothing about reachability. Compare"
           echo "  proxy-on against proxy-off, and check whose certificate you were served."

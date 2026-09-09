@@ -66,9 +66,10 @@ openmetadata-infra/                     # repo root
 │  ├─ core_addons.tf                # vpc-cni / kube-proxy / coredns EKS addons
 │  ├─ lb_controller.tf              # AWS Load Balancer Controller + IRSA (toggled)
 │  ├─ alb_ingress.tf                # Ingress -> internet-facing ALB for the UI (toggled)
-│  └─ alb_tls.tf                    # ACM cert + Route 53 alias for HTTPS (toggled)
+│  ├─ alb_tls.tf                    # ACM cert + Route 53 alias for HTTPS (toggled)
+│  └─ global_accelerator.tf         # GA listener + endpoint group (accelerator lives in bootstrap/)
 ├─ backend.tf                        # S3 backend block (values via -backend-config)
-├─ bootstrap/                        # one-time: OIDC provider, deploy role, NAT EIPs
+├─ bootstrap/                        # one-time: OIDC provider, deploy role, NAT EIPs, accelerator
 ├─ config/
 │  ├─ dev.auto.tfvars                # teardown-safe, cheaper, "-dev" names
 │  └─ production.auto.tfvars         # production-safe defaults
@@ -102,9 +103,10 @@ settings let destroy complete cleanly.
 > an orphaned one blocks subnet and VPC deletion for 20 minutes. Full runbook in
 > [README_full.md](README_full.md#destroying--clean-up-the-load-balancer-first).
 >
-> DNS needs no special handling. `dev.example-openmetadata.com` and its ACM
-> certificate are both Terraform-owned, so destroy removes them and the next
-> apply recreates them — including a fresh, auto-validated certificate.
+> The accelerator needs no special handling and keeps its addresses. It is owned
+> by `bootstrap/`, which is not part of the teardown loop — destroy removes only
+> its listener and endpoint group, leaving the static IPs reserved for the next
+> apply.
 
 Locally:
 
@@ -152,6 +154,12 @@ kubectl get ingress -n openmetadata openmetadata-public \
 aws elbv2 describe-load-balancers --region us-east-1 \
   --query "LoadBalancers[?Type=='application'&&Scheme=='internet-facing'].DNSName" --output text
 
+# whatever DNS Terraform currently owns, and what (if anything) to publish
+terraform output openmetadata_url
+terraform output app_dns_publish_instruction
+
+# only non-empty while the accelerator is enabled
+terraform output app_static_ips
 ```
 
 Then `http://<hostname>:8585` — plain HTTP on **8585** without TLS. With TLS

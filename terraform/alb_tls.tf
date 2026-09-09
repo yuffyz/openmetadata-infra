@@ -88,8 +88,10 @@ resource "aws_acm_certificate_validation" "app" {
 # the Ingress resource also orders this read after the provider has waited for
 # the load balancer to come up.
 #
+# Gated on app_lb_lookup_needed, which is wider than the DNS gate: Global
+# Accelerator needs the ARN below even when Terraform publishes no DNS.
 data "aws_lb" "app" {
-  count = local.app_zone_needed ? 1 : 0
+  count = local.app_lb_lookup_needed ? 1 : 0
 
   tags = {
     "elbv2.k8s.aws/cluster"    = local.eks_cluster_name
@@ -98,8 +100,33 @@ data "aws_lb" "app" {
   }
 }
 
+# What the alias records below point at.
+#
+# The accelerator when there is one, otherwise the ALB directly. Pointing at
+# the ALB while an accelerator exists would resolve past it -- traffic would
+# take the public internet to the region and the static addresses would go
+# unused, with nothing failing visibly to say so.
+#
+# one() rather than [0] on both branches: it yields null for a zero-count
+# resource, where an index errors on whichever branch is not taken.
+locals {
+  app_dns_target_name = (local.app_ga_enabled
+    ? one(data.aws_globalaccelerator_accelerator.app[*].dns_name)
+    : one(data.aws_lb.app[*].dns_name)
+  )
+
+  app_dns_target_zone_id = (local.app_ga_enabled
+    ? one(data.aws_globalaccelerator_accelerator.app[*].hosted_zone_id)
+    : one(data.aws_lb.app[*].zone_id)
+  )
+}
+
 # Alias record rather than CNAME: no charge for queries, and it resolves at a
 # zone apex if the domain is ever moved there.
+#
+# evaluate_target_health is false on the accelerator path. Route 53 cannot
+# health-evaluate a Global Accelerator alias target the way it can an ELB one,
+# and asking it to is rejected at apply time.
 resource "aws_route53_record" "app" {
   count   = local.app_cert_managed ? 1 : 0
   zone_id = data.aws_route53_zone.app[0].zone_id
@@ -107,9 +134,9 @@ resource "aws_route53_record" "app" {
   type    = "A"
 
   alias {
-    name                   = data.aws_lb.app[0].dns_name
-    zone_id                = data.aws_lb.app[0].zone_id
-    evaluate_target_health = true
+    name                   = local.app_dns_target_name
+    zone_id                = local.app_dns_target_zone_id
+    evaluate_target_health = !local.app_ga_enabled
   }
 }
 
@@ -117,22 +144,27 @@ resource "aws_route53_record" "app" {
 #
 # Same alias mechanics as the record above, but created on either certificate
 # route and carrying a different job: this one exists purely so that a record
-# published outside this repo -- openmetadata-dev.corp.example.com, in an internal zone
-# this account does not own -- has something to CNAME to that Terraform keeps
-# current.
+# published outside this repo, in a zone this account does not own, has
+# something to CNAME to that Terraform keeps current.
 #
 #   <external name>.       CNAME  <app_dns_alias_name>.
-#   <app_dns_alias_name>.  ALIAS  <current ALB>.
+#   <app_dns_alias_name>.  ALIAS  <accelerator, or current ALB>.
+#
+# UNUSED IN DEV since 2026-09-09. The UI moved to dev.example-openmetadata.com, in
+# a public Route 53 zone this account owns, so aws_route53_record.app above IS
+# the user-facing record and there is no external zone left needing a stable
+# target. Kept for a domain that genuinely cannot move -- the previous
+# arrangement, openmetadata-dev.corp.example.com in an internal zone, was exactly that.
 #
 # The second hop is rewritten by every apply; the first is written once. That
-# is the whole point -- the load balancer is owned by the AWS Load Balancer
-# Controller and its hostname carries a hash AWS assigns per load balancer, so
-# it cannot be held stable directly.
+# is the whole point -- with no accelerator the front door is owned by the AWS
+# Load Balancer Controller and its hostname carries a hash AWS assigns per load
+# balancer, so it cannot be held stable directly.
 #
-# Unused in dev as of 2026-09-09: the UI moved to a name in a PUBLIC Route 53
-# zone this account owns, so Terraform publishes the user-facing record itself
-# (aws_route53_record.app above) and there is no external zone left needing a
-# stable target. Kept for a domain that genuinely cannot move.
+# With Global Accelerator enabled this record is belt-and-braces: the
+# accelerator's own addresses and hostname are already stable, so the external
+# zone can point straight at those instead. Keeping it costs ~$0.50/month and
+# means the external record survives the accelerator being replaced too.
 #
 # TLS is unaffected either way. The client resolves through the chain but still
 # sends the external name in SNI, and the ALB still answers with the
@@ -144,8 +176,8 @@ resource "aws_route53_record" "app_stable" {
   type    = "A"
 
   alias {
-    name                   = data.aws_lb.app[0].dns_name
-    zone_id                = data.aws_lb.app[0].zone_id
-    evaluate_target_health = true
+    name                   = local.app_dns_target_name
+    zone_id                = local.app_dns_target_zone_id
+    evaluate_target_health = !local.app_ga_enabled
   }
 }

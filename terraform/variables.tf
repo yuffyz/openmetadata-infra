@@ -202,7 +202,6 @@ variable "app_tls_domain_name" {
     condition     = var.app_tls_domain_name == "" || var.app_expose_via_alb
     error_message = "app_tls_domain_name requires app_expose_via_alb = true -- TLS terminates on the ALB, so there must be one."
   }
-
 }
 
 variable "app_tls_route53_zone_name" {
@@ -229,10 +228,11 @@ variable "app_tls_route53_zone_name" {
   #   InvalidChangeBatch: RRSet with DNS name dev.a.com. is not permitted in
   #   zone b.com.
   #
-  # It lives on THIS variable rather than on app_tls_domain_name, where it reads
-  # more naturally, because the validation above already refers to the domain.
-  # Adding the mirror-image check there makes the two variables' validations
-  # reference each other and Terraform refuses the whole configuration:
+  # It lives on THIS variable rather than on app_tls_domain_name, where it would
+  # read more naturally, because the validation above already refers to the
+  # domain. Adding the mirror-image check there makes the two variables'
+  # validations reference each other and Terraform refuses the configuration
+  # outright:
   #   Error: Cycle: var.app_tls_route53_zone_name (validation),
   #          var.app_tls_domain_name (validation)
   #
@@ -255,6 +255,10 @@ variable "app_tls_route53_zone_name" {
 # load-balancer-name annotation does not help: it fixes the NAME, while the
 # hash is per load balancer.
 #
+# app_accelerator_name addresses the same problem differently, and more
+# expensively. If both are on, this record points at the accelerator
+# rather than the ALB -- see the target locals in alb_tls.tf.
+#
 # Setting this creates a record in app_tls_route53_zone_name that Terraform
 # repoints at the current load balancer on every apply. Point the external
 # domain at THIS name, once, and it never needs repointing again:
@@ -266,7 +270,7 @@ variable "app_tls_route53_zone_name" {
 # unaffected: the client still sends the external name in SNI and the ALB still
 # serves the certificate for that name, so the extra hop is invisible to it.
 variable "app_dns_alias_name" {
-  description = "FQDN inside app_tls_route53_zone_name that Terraform keeps pointed at the current ALB, giving external DNS a target that survives load balancer replacement. Only needed when the user-facing name lives in a zone this account does not own; unnecessary when app_tls_domain_name is itself in app_tls_route53_zone_name. Empty disables it."
+  description = "FQDN inside app_tls_route53_zone_name that Terraform keeps pointed at the current front door -- the accelerator when app_accelerator_name is set, otherwise the ALB -- giving external DNS a target that survives load balancer replacement. Empty disables it."
   type        = string
   default     = ""
 
@@ -309,10 +313,11 @@ variable "app_dns_alias_name" {
 #
 # Setting this skips certificate issuance, DNS validation and the Route 53 alias
 # record entirely. Creating the DNS record is then yours: a CNAME from your FQDN
-# to the load balancer's *.elb.amazonaws.com name, or better, to
-# app_dns_alias_name so it never needs repointing. A CNAME, never an A record --
-# an ALB's addresses are not stable at all, so an A record to one of them breaks
-# without warning.
+# to the load balancer's *.elb.amazonaws.com name, or -- with
+# app_accelerator_name set -- an A record to the accelerator's two
+# static addresses, which is the pair `terraform output app_static_ips`
+# reports. Prefer a CNAME for the bare-ALB case: an ALB's addresses are not
+# stable at all, so an A record to one of them breaks without warning.
 variable "app_tls_certificate_arn" {
   description = "ARN of an existing ACM certificate to terminate TLS with, in the same region as the ALB. Use for domains outside Route 53 (e.g. an internal-only zone) with a certificate imported from your own PKI. When set, Terraform issues no certificate and creates no record for app_tls_domain_name -- that name is yours to publish. It does still create app_dns_alias_name, if set, to give that record a stable target."
   type        = string
@@ -334,7 +339,10 @@ variable "app_tls_certificate_arn" {
 # the VPC and whatever is routed to it (VPN, Direct Connect, Transit Gateway).
 # The private subnets already carry kubernetes.io/role/internal-elb, so the
 # controller can place an internal load balancer without further tagging.
-
+#
+# internal is incompatible with app_accelerator_name, which names an
+# internet-facing service that cannot front a private load balancer -- see the
+# validation on that variable.
 #
 # > ⚠️ Changing this REPLACES the load balancer. Scheme is one of the two
 # > changes the controller treats as requiring replacement
@@ -348,6 +356,44 @@ variable "app_lb_scheme" {
   validation {
     condition     = contains(["internet-facing", "internal"], var.app_lb_scheme)
     error_message = "app_lb_scheme must be \"internet-facing\" or \"internal\"."
+  }
+}
+
+# --- Global Accelerator -----------------------------------------------------
+#
+# Two static anycast addresses in front of the ALB, so the record in the
+# externally-managed corp.example.com zone can be written once instead of re-ticketed
+# every time the load balancer is replaced. The listener and endpoint group,
+# and the full rationale -- including what this does NOT solve -- are in
+# global_accelerator.tf.
+#
+# The accelerator ITSELF is not created here. It belongs to bootstrap/, because
+# the addresses have to outlive `terraform destroy` in an environment built for
+# cheap teardown; created here, a rebuild would hand out a new pair and the
+# external DNS record would be stale again. This variable names the
+# bootstrap-owned accelerator to attach to, exactly as stable_nat_eip_name names
+# the bootstrap-owned NAT address.
+#
+# > ⚠️ Roughly $18/month for the accelerator plus a per-GB data transfer
+# > premium. The accelerator is billed by bootstrap/ whether or not this
+# > environment is currently deployed.
+variable "app_accelerator_name" {
+  description = "Name of a bootstrap-owned AWS Global Accelerator to put in front of the ALB, giving two static anycast IPs that survive this environment being destroyed. Apply bootstrap/ with create_global_accelerator = true first; the name is \"<global_accelerator_name_prefix>-<environment>\". Empty disables it. Requires app_expose_via_alb and an internet-facing scheme."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.app_accelerator_name == "" || var.app_expose_via_alb
+    error_message = "app_accelerator_name requires app_expose_via_alb = true -- there is no load balancer for the accelerator to forward to otherwise."
+  }
+
+  # Global Accelerator is an internet-facing service: its endpoints must be
+  # publicly addressable, and it rejects an internal load balancer. Caught here
+  # because the alternative is an AccessDeniedException several minutes into an
+  # apply, naming the endpoint group rather than the scheme that caused it.
+  validation {
+    condition     = var.app_accelerator_name == "" || var.app_lb_scheme == "internet-facing"
+    error_message = "app_accelerator_name requires app_lb_scheme = \"internet-facing\" -- an accelerator cannot forward to an internal load balancer."
   }
 }
 

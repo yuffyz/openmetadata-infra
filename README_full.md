@@ -68,9 +68,10 @@ openmetadata-infra/                     # repo root
 │  ├─ core_addons.tf                # vpc-cni / kube-proxy / coredns EKS addons
 │  ├─ lb_controller.tf              # AWS Load Balancer Controller + IRSA (toggled)
 │  ├─ alb_ingress.tf                # Ingress -> internet-facing ALB for the UI (toggled)
-│  └─ alb_tls.tf                    # ACM cert + Route 53 alias for HTTPS (toggled)
+│  ├─ alb_tls.tf                    # ACM cert + Route 53 alias for HTTPS (toggled)
+│  └─ global_accelerator.tf         # GA listener + endpoint group (accelerator lives in bootstrap/)
 ├─ backend.tf                        # S3 backend block (values via -backend-config)
-├─ bootstrap/                        # one-time: OIDC provider, deploy role, NAT EIPs
+├─ bootstrap/                        # one-time: OIDC provider, deploy role, NAT EIPs, accelerator
 ├─ config/
 │  ├─ dev.auto.tfvars                # teardown-safe, cheaper, "-dev" names
 │  └─ production.auto.tfvars         # production-safe defaults
@@ -446,7 +447,7 @@ attached, the ALB listens HTTPS on 443 as well as 8585. What Terraform creates
 | `aws_route53_record.app_cert_validation` | Validation CNAMEs, `allow_overwrite` for cert rotation |
 | `aws_acm_certificate_validation` | Blocks until ACM reports ISSUED |
 | `data.aws_lb` | Reads the ALB back by the controller's resource tags |
-| `aws_route53_record.app` | Alias A record → the current ALB |
+| `aws_route53_record.app` | Alias A record → accelerator, or the ALB when there is none |
 
 The certificate reaches the ALB as the
 `alb.ingress.kubernetes.io/certificate-arn` annotation on the Ingress, with
@@ -489,6 +490,15 @@ Route 53 hosted zone in this account**: `alb_tls.tf` looks the zone up with a
 data source and ACM proves ownership by publishing a validation record into it.
 For a zone held elsewhere — an internal `corp.example.com`, say — that path cannot be
 used at all.
+
+> **Dev no longer uses this route.** As of 2026-09-09 the UI is
+> `https://dev.example-openmetadata.com`, in a public Route 53 zone this account
+> owns, so Terraform issues the certificate and publishes the record itself. The
+> rest of this section documents the imported-certificate route for a future
+> name that genuinely cannot move — and records what dev escaped: a certificate
+> that does not auto-renew, and a DNS repoint that was a ticket rather than a
+> command. `openmetadata-dev.corp.example.com` has been retired and no longer resolves
+> to a working TLS endpoint.
 
 The blocker is not Route 53, it is ACM. **A public certificate can never be
 issued for an internal-only name**, because ACM validates by resolving a record
@@ -602,6 +612,7 @@ version.
 | Variable | Default | Purpose |
 |---|---|---|
 | `app_expose_via_alb` | `false` | Install the LB Controller and create the Ingress that becomes the ALB |
+| `app_accelerator_name` | `""` | Name of a bootstrap-owned accelerator to front the ALB (~$18/mo + DT premium). Off in dev |
 | `app_lb_allowed_cidrs` | `[]` | CIDRs allowed to reach the NLB. **Required** when the toggle is on |
 | `app_tls_domain_name` | `""` | FQDN to serve over HTTPS. Empty leaves the NLB on plain HTTP |
 | `app_tls_route53_zone_name` | `""` | Public Route 53 zone owning that FQDN. Required with the above **unless** `app_tls_certificate_arn` is set |
@@ -631,62 +642,97 @@ controller rejects it later, reporting only a warning event on the Ingress while
 the apply sits waiting for an address. `variables.tf` therefore checks CIDR
 notation itself, at plan time.
 
+With Global Accelerator in front, this list only keeps working because the
+endpoint group sets `client_ip_preservation_enabled = true`. Turn that off and
+the ALB sees the accelerator's addresses instead of the client's, the allowlist
+matches nothing, and it stops limiting access at all — with no error anywhere to
+say so.
+
 > ⚠️ **Without `app_tls_domain_name`, the ALB serves plain HTTP.** Credentials —
 > including that default admin password — cross the internet in the clear.
 > IP-allowlisting limits *who can connect*; it encrypts nothing, and browsers
 > correctly flag the login page as "Not secure". Configure TLS above, or use
 > `port-forward`, before typing a password you care about.
 
-### DNS and TLS: a Route 53 zone this account owns
+### Global Accelerator
 
-As of 2026-09-09 the dev UI is **https://dev.example-openmetadata.com**, and
-Terraform owns every link in the chain:
+`app_accelerator_name` puts two static anycast IPv4 addresses in front of the
+ALB.
 
-| Resource | Purpose |
-|---|---|
-| `aws_acm_certificate` | Issued for the FQDN, DNS-validated |
-| `aws_route53_record.app_cert_validation` | The validation records, in the zone below |
-| `aws_acm_certificate_validation` | Blocks until ACM reports ISSUED |
-| `data.aws_route53_zone` | `example-openmetadata.com`, looked up — **not** created here |
-| `aws_route53_record.app` | Alias A record → the current ALB |
+> **Currently OFF in dev** (`app_accelerator_name` commented out), deliberately.
+> The code is complete and stays in place; the ALB is being proven on its own
+> first. Stacking a new load balancer and a new network hop in one change makes
+> the two indistinguishable when something times out — which is precisely the
+> failure mode that cost a day here. Turn it on afterwards and re-test.
+>
+> To enable: run `openmetadata-bootstrap` with `global_accelerator` ticked, set
+> `app_accelerator_name` from `terraform output accelerator_names`, and apply.
+> The Route 53 alias repoints itself from the ALB to the accelerator — see the
+> target locals in `alb_tls.tf`. The certificate and hostname do not change.
 
-```hcl
-app_tls_domain_name       = "dev.example-openmetadata.com"
-app_tls_route53_zone_name = "example-openmetadata.com"
-```
+The accelerator is split across two states, deliberately:
 
-This replaced two mechanisms at once, and it is worth recording why both went:
+| Where | Resource | Purpose |
+|---|---|---|
+| `bootstrap/` | `aws_globalaccelerator_accelerator` | The two static addresses and a stable hostname |
+| `terraform/` | `data.aws_globalaccelerator_accelerator` | Finds it by name |
+| `terraform/` | `aws_globalaccelerator_listener` | TCP, on the same ports the ALB listens on |
+| `terraform/` | `aws_globalaccelerator_endpoint_group` | One region, one endpoint: the ALB, by ARN |
+| `terraform/` | `data.aws_ec2_managed_prefix_list` | GA's published ranges, added to the ALB's security group |
 
-**`openmetadata-dev.corp.example.com`** lived in an internal zone this account does not
-own. Terraform could publish nothing there, so every load balancer replacement
-meant a ticket, and the name was served by a `*.corp.example.com` certificate imported
-from our own PKI — which does **not** auto-renew, and which nothing in this
-stack warned about before expiry.
+The accelerator is in `bootstrap/` because the addresses have to outlive
+`terraform destroy` — the same reason the NAT EIPs are there. The listener and
+endpoint group stay in the environment stack because both are properties of the
+environment: the listener's ports follow its TLS configuration, and the endpoint
+group points at an ALB that does not exist until it is applied. Tearing an
+environment down removes those two and leaves the accelerator holding its
+addresses with nothing behind it, which is the intended resting state.
 
-**A Global Accelerator** held two static anycast IPs in `bootstrap/` so that the
-corp.example.com record could be written once and stay correct. It worked, but it cost
-~$18/month plus a data-transfer premium, billed whether or not the environment
-was deployed, and it existed solely to work around the external zone.
+Apply `bootstrap/` with `create_global_accelerator = true` first. Setting
+`app_accelerator_name` without it fails the plan with "no matching Global
+Accelerator Accelerator found" — the same failure mode as an unbootstrapped NAT
+EIP.
 
-Moving the name into a zone we control removes the need for both: ACM issues and
-auto-renews, the alias record follows the load balancer on every apply, and
-there is nothing to re-ticket. The hosted zone costs about $0.50/month.
+What it was for: `openmetadata-dev.corp.example.com` lived in an internal zone this
+account does not own, so repointing it is a ticket rather than a command, and
+the ALB's hostname carries a per-load-balancer hash that AWS reassigns whenever
+the load balancer is recreated. Pointed at the accelerator, that record is
+written once. The fixed pair is also something a forward-proxy steering bypass
+can be written against, which a rotating set of `*.elb.amazonaws.com` addresses
+is not.
 
-> ⚠️ **`openmetadata-dev.corp.example.com` no longer works.** The ALB serves only the
-> certificate for `dev.example-openmetadata.com`, so the old hostname now fails the
-> TLS handshake rather than returning a readable error. Withdraw the internal
-> record and repoint anyone holding the bookmark.
+Four things to know:
 
-Two things to know:
+- **The control plane is us-west-2 only.** Whatever region the endpoints are in.
+  Hence the aliased `aws.global_accelerator` provider in `providers.tf`, and
+  hence a `describe-accelerator` against `us-east-1` returning nothing — which
+  reads as "there is no accelerator".
+- **Client IP preservation is what keeps the allowlist alive.** See the section
+  above. Verify it rather than trusting the default:
+  ```bash
+  aws globalaccelerator describe-endpoint-group --region us-west-2 \
+    --endpoint-group-arn <arn> \
+    --query 'EndpointGroup.EndpointDescriptions[].ClientIPPreservationEnabled'
+  ```
+- **Do not point DNS at the ALB while an accelerator exists.** It resolves, it
+  serves the right certificate, and it bypasses the accelerator entirely.
+  Nothing reports it. `alb_tls.tf` handles this for records Terraform owns by
+  aliasing to the accelerator when one is enabled; the externally-managed record
+  is on you — `terraform output app_dns_publish_instruction` states which to
+  publish.
+- **The addresses survive `destroy`, but not un-bootstrapping.** A teardown of
+  the environment leaves them reserved. Destroying `bootstrap/`, or flipping
+  `create_global_accelerator` back to false, releases them — and AWS does not
+  give the same pair back. Note they are billed the whole time an environment is
+  torn down, which is the price of holding them.
 
-- **The zone must already exist, as a PUBLIC hosted zone in this account.**
-  `data.aws_route53_zone` looks it up and does not create it, and ACM validates
-  by resolving a record from the public internet — so a private zone, or one
-  held in another account, can never issue.
-- **`app_dns_alias_name` is now unnecessary** and left unset. Its whole purpose
-  was to give an externally-managed zone a stable CNAME target. With the
-  user-facing name inside our own zone, `aws_route53_record.app` *is* that
-  record. The variable stays for a future domain that genuinely cannot move.
+It does **not** address the September 2026 outage. That was Netskope terminating
+TLS on the client side and never reaching AWS at all; an accelerator changes
+where traffic enters the AWS network and has no say over what a proxy on the
+endpoint does with port 443. It is also not multi-region failover — one endpoint
+group, one region, one ALB, nothing to fail over to.
+
+Cost: roughly $18/month plus a per-GB data transfer premium, on top of the ALB.
 
 ### Known gaps
 
@@ -707,6 +753,9 @@ Two things to know:
 - **Sessions are per-pod.** Cookie stickiness is configured, but OpenMetadata
   keeps sessions in memory, so a pod restart logs its users out and OIDC would
   break outright across replicas without that stickiness.
+- **The accelerator is billed while idle.** It is held in `bootstrap/` so its
+  addresses survive teardown, which means ~$18/month continues whether or not an
+  environment is deployed.
 
 ## Production exposure — what's still missing
 
@@ -768,7 +817,9 @@ is still open:
    carries `172.72.0.0/16` into this VPC today (no Site-to-Site VPN, Direct
    Connect, Transit Gateway or peering), which is why dev reverted to
    internet-facing. Confirm with the "Is anything routed into this VPC?" section
-   of `show-exposure` before trying again.
+   of `show-exposure` before trying again — and note that `internal` is
+   mutually exclusive with Global Accelerator, which cannot forward to a private
+   load balancer.
 
 Two further considerations for production specifically:
 
