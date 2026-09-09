@@ -68,11 +68,6 @@ on:
         description: "Stable NAT egress EIPs, one per environment (~$0.12/day each)"
         type: boolean
         default: false
-      global_accelerator:
-        description: "Global Accelerator per environment, holds the static IPs (~$18/mo each)"
-        type: boolean
-        default: false
-
       allow_destroy:
         description: 'Type "destroy" to permit a plan that deletes resources'
         type: string
@@ -142,8 +137,9 @@ jobs:
       # collision rather than a missing state file.
       #
       # Catching it here also stops the more damaging version: an empty state
-      # plus a ticked global_accelerator would provision a SECOND accelerator
-      # with different static addresses, silently, at ~$18/month.
+      # plus a ticked nat_eips would allocate a SECOND set of Elastic IPs,
+      # silently, billed whether attached or not and matching nothing that has
+      # already been allowlisted downstream.
       - name: Guard against unmigrated local state
         working-directory: ${{ env.TF_DIR }}
         run: |
@@ -156,7 +152,7 @@ jobs:
           fi
 
           if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
-            echo "::error::Remote state at ${STATE_KEY} is EMPTY, but IAM role ${ROLE_NAME} already exists in this account. bootstrap/ has been applied before with LOCAL state and it has not been migrated. Applying now would try to recreate resources that exist (and could provision a second Global Accelerator with new addresses). Migrate the local state first -- the exact commands are in the header of this workflow file and in bootstrap/README.md."
+            echo "::error::Remote state at ${STATE_KEY} is EMPTY, but IAM role ${ROLE_NAME} already exists in this account. bootstrap/ has been applied before with LOCAL state and it has not been migrated. Applying now would try to recreate resources that already exist (and could allocate a second set of NAT Elastic IPs). Migrate the local state first -- the exact commands are in the header of this workflow file and in bootstrap/README.md."
             exit 1
           fi
           echo "Empty state and no existing deploy role: this is a genuine first run."
@@ -173,7 +169,6 @@ jobs:
           IN_BUCKET: ${{ github.event.inputs.state_bucket }}
           IN_SLR: ${{ github.event.inputs.opensearch_service_linked_role }}
           IN_NAT: ${{ github.event.inputs.nat_eips }}
-          IN_GA: ${{ github.event.inputs.global_accelerator }}
         run: |
           set -euo pipefail
 
@@ -188,8 +183,7 @@ jobs:
             "oidc_provider"                  "$IN_OIDC" \
             "state_bucket"                   "$IN_BUCKET" \
             "opensearch_service_linked_role" "$IN_SLR" \
-            "nat_eips"                       "$IN_NAT" \
-            "global_accelerator"             "$IN_GA"
+            "nat_eips"                       "$IN_NAT"
           echo
           echo "Anything false above is planned as ABSENT, not as unchanged."
 
@@ -205,15 +199,14 @@ jobs:
             -var="create_oidc_provider=${IN_OIDC}" \
             -var="create_state_bucket=${IN_BUCKET}" \
             -var="create_opensearch_service_linked_role=${IN_SLR}" \
-            -var="create_nat_eips=${IN_NAT}" \
-            -var="create_global_accelerator=${IN_GA}"
+            -var="create_nat_eips=${IN_NAT}"
 
       # Refuse to hand an apply a plan that deletes things, unless the operator
       # typed the confirmation. The selection model makes an accidental delete
       # easy -- forget to tick nat_eips and its EIPs are planned away -- and
-      # some of these deletions are not recoverable: releasing an accelerator or
-      # an EIP means AWS will not give the same addresses back, and every
-      # external DNS record and firewall allowlist pointing at them goes stale.
+      # some of these deletions are not recoverable: releasing an EIP means AWS
+      # will not give the same address back, and every firewall allowlist and
+      # network policy naming it goes stale.
       - name: Guard against destructive plans
         working-directory: ${{ env.TF_DIR }}
         env:
@@ -246,7 +239,7 @@ jobs:
             exit 0
           fi
 
-          echo "::error::This plan deletes the resources listed above and allow_destroy was not set to \"destroy\". Almost always the cause is a service left unticked that should have stayed on -- the selection is the full desired state, not a delta. Re-run with every service you want to KEEP ticked. If the deletion is genuinely intended, re-run with allow_destroy=destroy, and note that releasing an Elastic IP or a Global Accelerator loses those addresses permanently."
+          echo "::error::This plan deletes the resources listed above and allow_destroy was not set to \"destroy\". Almost always the cause is a service left unticked that should have stayed on -- the selection is the full desired state, not a delta. Re-run with every service you want to KEEP ticked. If the deletion is genuinely intended, re-run with allow_destroy=destroy, and note that releasing an Elastic IP loses that address permanently."
           exit 1
 
       - name: Save plan
@@ -310,13 +303,10 @@ jobs:
             echo "| Output | Value |"
             echo "|---|---|"
             printf '| Deploy role ARN | `%s` |\n' "$(terraform output -raw role_arn 2>/dev/null || echo '-')"
-            printf '| Accelerator names | `%s` |\n'     "$(get accelerator_names)"
-            printf '| Accelerator static IPs | `%s` |\n' "$(get accelerator_static_ips)"
             printf '| NAT egress IPs | `%s` |\n'        "$(get nat_egress_ips)"
             echo
             echo "Next steps, where relevant:"
-            echo "- Set \`app_accelerator_name\` in that environment's tfvars to the accelerator name above."
-            echo "- Publish the static IPs for the externally-managed DNS record."
+            echo "- Set \`stable_nat_eip_name\` in that environment's tfvars to the matching \`<prefix>-<env>-nat\` name."
             echo "- Allowlist the NAT egress IPs wherever the pods must reach out (Snowflake network policies, partner firewalls)."
           } >> "$GITHUB_STEP_SUMMARY"
 

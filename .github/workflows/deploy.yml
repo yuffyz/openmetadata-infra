@@ -159,9 +159,6 @@ jobs:
           cluster=$(terraform output -raw eks_cluster_name 2>/dev/null || true)
           ns=$(terraform output -raw app_namespace 2>/dev/null || echo "openmetadata")
           alias=$(terraform output -raw app_dns_alias_fqdn 2>/dev/null || true)
-          static_ips=$(terraform output -json app_static_ips 2>/dev/null \
-                         | python3 -c 'import json,sys; print(", ".join(json.load(sys.stdin)))' 2>/dev/null || true)
-          publish=$(terraform output -raw app_dns_publish_instruction 2>/dev/null || true)
 
           if [ -z "$url" ] && [ "$exposed" = "true" ] && [ -n "$cluster" ]; then
             echo "Waiting for the load balancer controller to provision the ALB..."
@@ -187,18 +184,6 @@ jobs:
           {
             echo "## OpenMetadata — ${{ github.event.inputs.environment }}"
             echo
-            # The accelerator's addresses, when there is one. Printed on every
-            # apply because they are what the externally-managed corp.example.com
-            # record has to carry, and because they change if the accelerator
-            # is ever destroyed and recreated.
-            if [ -n "$static_ips" ]; then
-              echo "**Static IPs (Global Accelerator):** \`$static_ips\`"
-              echo
-            fi
-            if [ -n "$publish" ]; then
-              echo "**DNS to publish:** $publish"
-              echo
-            fi
             # The name externally-managed DNS should target. Printed on every
             # apply because the load balancer hostname it resolves to changes
             # whenever the load balancer is recreated -- pointing an outside

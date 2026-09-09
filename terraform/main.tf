@@ -65,16 +65,9 @@ locals {
   # so their record is written once and never again.
   app_dns_alias_managed = var.app_expose_via_alb && var.app_dns_alias_name != "" && var.app_tls_route53_zone_name != ""
 
-  # Either DNS path needs the hosted zone looked up, so the Route 53 data
-  # source in alb_tls.tf is gated on this rather than on one route.
+  # Either DNS path needs the hosted zone and the load balancer looked up, so
+  # the data sources in alb_tls.tf are gated on this rather than on one route.
   app_zone_needed = local.app_cert_managed || local.app_dns_alias_managed
-
-  # The load balancer lookup is separate from, and wider than, app_zone_needed.
-  # Global Accelerator needs the ALB's ARN for its endpoint group even when
-  # Terraform publishes no DNS at all -- which is exactly the dev case, where
-  # the record lives in an internal zone this account does not own. Gating the
-  # lookup on DNS alone left the endpoint group with nothing to point at.
-  app_lb_lookup_needed = local.app_zone_needed || local.app_ga_enabled
 
   # The ARN that reaches the Ingress's certificate-arn annotation. On the
   # managed route it references the VALIDATION resource, not the certificate,

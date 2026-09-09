@@ -48,9 +48,8 @@
 #   were not on an NLB. Neither is enabled here -- see the note at the bottom.
 
 locals {
-  # Ports the ALB publishes, and the ports Global Accelerator forwards. Named
-  # because listen-ports is JSON keyed by protocol and the name keeps the two
-  # lists from drifting apart.
+  # Ports the ALB publishes. Named because listen-ports is JSON keyed by
+  # protocol, and a name cannot be mistyped as an integer the way "443" can.
   app_public_ports = local.app_tls_enabled ? [
     { name = "https", port = 443 },
     { name = "http", port = 8585 },
@@ -132,25 +131,6 @@ resource "kubernetes_ingress_v1" "app_public" {
       local.app_tls_enabled ? {
         "alb.ingress.kubernetes.io/certificate-arn" = local.app_cert_arn
         "alb.ingress.kubernetes.io/ssl-policy"      = "ELBSecurityPolicy-TLS13-1-2-2021-06"
-      } : {},
-
-      # Global Accelerator's published address ranges, added to the same
-      # managed security group as inbound-cidrs.
-      #
-      # Whether this is strictly required depends on the client IP
-      # preservation mode of the endpoint group (global_accelerator.tf sets it
-      # true, so client addresses arrive intact and inbound-cidrs is what
-      # admits them). It is here because it is additive and safe -- an
-      # accelerator can only target endpoints in its own account, so
-      # permitting these ranges does not widen access to anyone else -- and
-      # because getting it wrong presents as the same silent SYN black-hole we
-      # already spent a day on.
-      #
-      # > Verify with a real connection through the accelerator after the
-      # > first apply. If it works, consider dropping this to keep the group
-      # > tight.
-      local.app_ga_enabled ? {
-        "alb.ingress.kubernetes.io/security-group-prefix-lists" = one(data.aws_ec2_managed_prefix_list.global_accelerator[*].id)
       } : {}
     )
   }
@@ -183,8 +163,8 @@ resource "kubernetes_ingress_v1" "app_public" {
   }
 
   # Defaults to true, so this blocks until the controller reports an address
-  # (10m). That is what guarantees the ALB exists before alb_tls.tf and
-  # global_accelerator.tf read it back, and on timeout the provider prints the
+  # (10m). That is what guarantees the ALB exists before alb_tls.tf reads it
+  # back, and on timeout the provider prints the
   # Ingress's warning events -- which is where controller errors such as an
   # unresolvable subnet, a rejected annotation, or a duplicate load balancer
   # name surface.

@@ -34,58 +34,19 @@ output "app_dns_managed" {
 # The stable target for a domain managed outside this repo.
 #
 # Point the external record here once. Terraform repoints this name at the
-# current front door on every apply, so the external record never has to
-# change again:
+# current ALB on every apply, so the external record never has to change again:
 #
-#   openmetadata-dev.corp.example.com.  CNAME  <this value>.
+#   <external name>.  CNAME  <this value>.
+#
+# Empty in dev since the UI moved to a Route 53 name this account owns.
 output "app_dns_alias_fqdn" {
-  description = "Stable hostname Terraform keeps pointed at the current front door (the accelerator when enabled, otherwise the ALB). CNAME an externally-managed domain at this name once and it never needs repointing, because it survives the load balancer being recreated. Empty when app_dns_alias_name is unset."
+  description = "Stable hostname Terraform keeps pointed at the current ALB. CNAME an externally-managed domain at this name once and it never needs repointing, because it survives the load balancer being recreated. Empty when app_dns_alias_name is unset -- which it is whenever app_tls_domain_name already lives in a zone this account owns."
   value       = local.app_dns_alias_managed ? var.app_dns_alias_name : ""
 }
 
 output "app_lb_scheme" {
   description = "Scheme of the UI load balancer. internal means private addresses, reachable only from the VPC and networks routed to it."
   value       = var.app_expose_via_alb ? var.app_lb_scheme : ""
-}
-
-# --- Global Accelerator ------------------------------------------------------
-
-# The pair to put in the corp.example.com ticket, and the pair to give the network team
-# for a proxy steering bypass.
-#
-# These survive `terraform destroy` of this environment: the accelerator is
-# owned by bootstrap/, and only its listener and endpoint group live here. A
-# teardown leaves the addresses reserved with nothing behind them, and the next
-# apply reattaches them -- so the external DNS record is written once and never
-# re-ticketed. Same arrangement, and same reason, as the NAT EIP.
-output "app_static_ips" {
-  description = "The accelerator's two static anycast IPv4 addresses. Publish an A record with both. Empty when app_accelerator_name is empty. Owned by bootstrap/, so they survive this environment being destroyed and rebuilt."
-  value       = try(one(data.aws_globalaccelerator_accelerator.app[*].ip_sets[0].ip_addresses), [])
-}
-
-output "app_accelerator_dns_name" {
-  description = "The accelerator's own hostname, an alternative CNAME target to app_static_ips for a zone that would rather not pin addresses. Empty when app_accelerator_name is empty."
-  value       = try(one(data.aws_globalaccelerator_accelerator.app[*].dns_name), "")
-}
-
-# What to actually publish, resolved down to one answer.
-#
-# Exists because "which of these four outputs do I give the DNS team" was a
-# real question every time, and getting it wrong is a silent failure: pointing
-# the record at the ALB while an accelerator is enabled resolves past the
-# accelerator, and nothing anywhere reports that.
-output "app_dns_publish_instruction" {
-  description = "Human-readable statement of the DNS record to publish for app_tls_domain_name in the externally-managed zone. Accounts for whether an accelerator is in front and whether Terraform already owns the record."
-  value = (!var.app_expose_via_alb
-    ? "Nothing to publish -- the UI is not exposed. Reach it with: kubectl port-forward -n ${local.namespace} svc/openmetadata 8585:8585"
-    : local.app_cert_managed
-    ? "Nothing to do -- Terraform owns ${var.app_tls_domain_name} in Route 53."
-    : local.app_dns_alias_managed
-    ? "CNAME ${var.app_tls_domain_name} -> ${var.app_dns_alias_name} (written once; Terraform repoints the second hop)"
-    : local.app_ga_enabled
-    ? "A record ${var.app_tls_domain_name} -> the two addresses in app_static_ips (owned by bootstrap/, so this is written once)"
-    : "CNAME ${var.app_tls_domain_name} -> the hostname from: kubectl get ingress -n ${local.namespace} openmetadata-public -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' (changes whenever the ALB is replaced)"
-  )
 }
 
 # --- machine-readable outputs, consumed by deploy.yml ------------------------

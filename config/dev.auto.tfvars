@@ -73,6 +73,9 @@ app_lb_allowed_cidrs = [
 # > configure OIDC/SAML (`openmetadata.config.authentication.*`) before treating
 # > this as safe.
 # >
+# > This matters more now, not less: the UI is on a public Route 53 name, so
+# > the hostname is discoverable rather than buried in an internal zone.
+# >
 # > Upstream's own position is that basic auth is the no-security posture:
 # > "Enabling Security is only required for your Production installation", and
 # > it cannot be combined with SSO -- so this is a cutover, not a migration.
@@ -81,116 +84,59 @@ app_lb_allowed_cidrs = [
 # > through the module's helm_values, not app_extra_helm_values (which reaches
 # > Helm as --set and retypes strings).
 
-# --- Global Accelerator ------------------------------------------------------
-# Two static anycast IPs in front of the ALB, so the corp.example.com record below is
-# written once instead of re-ticketed every time the load balancer is replaced,
-# and so the network team has a fixed pair to write a proxy steering bypass
-# against.
+# --- HTTPS and DNS: a public Route 53 zone this account owns -----------------
+# The UI is https://dev.example-openmetadata.com. Terraform owns the whole chain:
+# ACM issues and DNS-validates the certificate, and an A-alias record points at
+# the current ALB, repointed on every apply.
 #
-# This NAMES an accelerator that bootstrap/ owns; it does not create one. Apply
-# bootstrap/ with create_global_accelerator = true first, or the plan fails with
-# "no matching Global Accelerator Accelerator found". The name is
-# "<global_accelerator_name_prefix>-<environment>".
+# This replaced two things on 2026-09-09:
 #
-# It lives in bootstrap/ for the same reason the NAT EIP does: the addresses
-# have to outlive this environment. Created in this stack, `terraform destroy`
-# would take them with it and the rebuild would hand out a new pair -- moving
-# the DNS staleness from the ALB's hostname to the accelerator rather than
-# removing it. Only the listener and endpoint group are created here, and a
-# teardown leaves the addresses reserved with nothing behind them.
+#   openmetadata-dev.corp.example.com  -- an internal zone this account does not own, so
+#     every load balancer replacement meant a ticket rather than a command. It
+#     was served by a *.corp.example.com certificate imported from our own PKI, which
+#     does NOT auto-renew and which nothing in this stack warns about.
 #
-# It is NOT a fix for the September 2026 outage -- that was Netskope
-# terminating TLS on the client side and never reaching AWS, which an
-# accelerator has no say over. See global_accelerator.tf.
+#   A Global Accelerator  -- two static anycast IPs, held in bootstrap/ so that
+#     the corp.example.com record could be written once. ~$18/month plus a per-GB data
+#     transfer premium, billed whether or not this environment was deployed, and
+#     it existed only to work around the external zone.
 #
-# Adds ~$18/month plus a per-GB data transfer premium, billed by bootstrap/
-# whether or not this environment is currently deployed.
-app_accelerator_name = "openmetadata-dev"
+# Both problems disappear once the name lives in a zone we control: ACM
+# auto-renews, the alias record follows the load balancer on its own, and there
+# is nothing left to re-ticket. Cost is the hosted zone, about $0.50/month.
+#
+# > ⚠️ openmetadata-dev.corp.example.com NO LONGER WORKS. The ALB serves only the
+# > certificate for the name below, so that hostname now fails TLS rather than
+# > returning a useful error. Withdraw the internal record, and repoint anyone
+# > holding the bookmark.
+#
+# The zone must already exist as a PUBLIC hosted zone in this account --
+# Terraform looks it up with a data source and does not create it. ACM proves
+# ownership by publishing a validation record into it, so a private zone, or one
+# held in another account, can never validate.
+app_tls_domain_name       = "dev.example-openmetadata.com"
+app_tls_route53_zone_name = "example-openmetadata.com"
 
-# HTTPS on the NLB. Set both to terminate TLS with an ACM certificate and get a
-# Route 53 alias record; leave them empty and the NLB stays plain HTTP (browsers
-# will flag the login page as "Not secure", correctly -- credentials would cross
-# the internet in the clear).
+# Both left unset, deliberately.
 #
-# The zone must be an existing PUBLIC Route 53 hosted zone, in this account, for
-# a domain you control -- ACM proves ownership by publishing a validation record
-# into it, so a zone for a domain you don't own can never validate.
+# app_tls_certificate_arn imports a certificate for a name that is NOT in Route
+# 53. Setting it switches OFF issuance, validation and the record above, handing
+# DNS back to whoever owns that zone -- the arrangement this environment just
+# moved away from. See the comment on the variable for the import command if a
+# future name genuinely cannot move.
 #
-# Enabling this adds a 443 listener, so the URL is https://<domain> with no
-# port. 8585 keeps working alongside it. 443 matters for anyone behind a
-# corporate proxy: those forward 443 and 80, and typically will not proxy a
-# non-standard port at all -- the connection just hangs.
-# app_tls_domain_name       = "openmetadata.example.com"
-# app_tls_route53_zone_name = "example.com"
-
-# --- Internal-only domain (a zone that is NOT in Route 53) -------------------
-# An internal-only name cannot be served by an ACM-issued certificate: ACM
-# validates by resolving a record from the public internet, so a name that
-# resolves nowhere public can never be issued. Import a certificate from your
-# own PKI instead -- clients on the corporate network already trust that CA:
+# app_dns_alias_name publishes a second, stable name for an external zone to
+# CNAME at. Redundant here: app_tls_domain_name is already in a zone we own, so
+# Terraform publishes the user-facing record directly.
 #
-#   aws acm import-certificate --region us-east-1 \
-#     --certificate fileb://cert.pem --private-key fileb://key.pem \
-#     --certificate-chain fileb://chain.pem
-#
-# Then set the ARN below and LEAVE app_tls_route53_zone_name empty. Terraform
-# issues no certificate and creates no DNS record; publish a CNAME from the
-# FQDN to the load balancer's *.elb.amazonaws.com name in your own zone.
-# `terraform output app_dns_managed` reports false to make that explicit.
-#
-# Imported certificates do NOT auto-renew. Re-import before expiry with
-# `--certificate-arn <existing arn>` so the ARN stays stable and the listener
-# keeps working without a Terraform change.
-app_tls_domain_name     = "openmetadata-dev.corp.example.com"
-app_tls_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/a443aeb2-67db-4105-8c05-b9ca0020e654"
-
-# --- DNS: pointed by hand, now at the accelerator ---------------------------
-# openmetadata-dev.corp.example.com is published in an internal zone this account does
-# not own, and it is pointed manually. Terraform publishes no record for it.
-#
-# With the accelerator enabled above, the record is an A record to its two
-# static addresses rather than a CNAME to the load balancer:
-#
-#   openmetadata-dev.corp.example.com.  A  <both addresses from app_static_ips>
-#
-# Get them, and a plain statement of what to publish, from:
-#
-#   terraform output app_static_ips
-#   terraform output app_dns_publish_instruction
-#
-# Do NOT point this at the ALB's hostname while the accelerator exists. It
-# resolves, it serves the right certificate, and it quietly bypasses the
-# accelerator entirely -- there is no error anywhere to reveal it.
-#
-# TLS is unaffected. Clients send openmetadata-dev.corp.example.com in SNI regardless
-# of what the record resolves to, and the certificate above is a *.corp.example.com
-# wildcard, so it matches.
-#
-# These addresses survive `destroy`. They belong to the accelerator, the
-# accelerator belongs to bootstrap/, and bootstrap/ is not part of the dev
-# teardown loop -- so unlike the ALB hostname this record replaced, this one is
-# written once and stays correct across rebuilds.
-#
-# > ⚠️ It does NOT survive bootstrap/ being destroyed, or
-# > create_global_accelerator being set back to false. Either releases the
-# > addresses, and AWS does not give the same pair back.
-#
-# The cheaper alternative, left here deliberately: app_dns_alias_name publishes
-# a Terraform-owned name in a zone this account controls and repoints it at the
-# current front door on every apply, for about $0.50/month against the
-# accelerator's ~$18. The manual record then targets a name that never changes
-# and is written exactly once. Re-enable both lines below to use it -- it also
-# works alongside the accelerator, pointing at it rather than the ALB.
-# app_tls_route53_zone_name = "example-openmetadata.com"
-# app_dns_alias_name        = "dev.example-openmetadata.com"
+# app_tls_certificate_arn = ""
+# app_dns_alias_name      = ""
 
 # --- Scheme: internet-facing, deliberately ----------------------------------
 # Left at the default (internet-facing) after trying `internal` and reverting.
 #
 # `internal` gives the load balancer private addresses only, so it is reachable
-# just from inside the VPC and networks routed to it. It is also incompatible
-# with the accelerator named above, which cannot forward to a private load
-# balancer -- Terraform rejects the combination at plan time. A corporate VPN
+# just from inside the VPC and networks routed to it. A corporate VPN
 # (GlobalProtect here) puts the client on the CORPORATE network, which is not
 # this VPC: with no Site-to-Site VPN, Direct Connect, Transit Gateway or peering
 # carrying 172.72.0.0/16, packets never arrive. Every connection times out, and
