@@ -1,0 +1,324 @@
+name: openmetadata-bootstrap
+
+# Provisions the account-wide, one-time resources in bootstrap/ -- the things
+# that must exist BEFORE openmetadata-infra can deploy, and that must survive
+# an environment being destroyed.
+#
+# Tick the services to provision. `plan` is never gated; `apply` runs in the
+# "bootstrap" GitHub Environment, so reviewers can be required there.
+#
+# --- Read this before the first run ----------------------------------------
+#
+# THE SELECTION IS THE COMPLETE DESIRED STATE, NOT A DELTA. Anything left
+# unticked is passed to Terraform as create_* = false, so a resource already in
+# state that is not ticked plans as a DELETE. That is deliberate -- it is how
+# Terraform works and hiding it with -target would hide real drift -- but it
+# means you tick everything you want to KEEP, not just the thing you are adding.
+# The guard in the plan job refuses to hand an apply a plan containing deletes
+# unless you type the confirmation, so a mistake here costs a re-run, not an
+# outage.
+#
+# STATE MOVED FROM LOCAL TO S3. bootstrap/ was applied by hand with local state
+# ("it's a bootstrap"), which a workflow cannot use -- a runner starts with an
+# empty state file and would try to CREATE resources that already exist. This
+# workflow keeps bootstrap state in the same bucket as the environments, under
+# <prefix>/bootstrap/terraform.tfstate. Migrate the existing local state ONCE,
+# from the machine that holds it, before running apply here:
+#
+#   cd bootstrap
+#   cp ../backend.tf .                       # the same generic S3 backend block
+#   terraform init -migrate-state \
+#     -backend-config="bucket=<TF_STATE_BUCKET>" \
+#     -backend-config="key=<TF_STATE_PREFIX>/bootstrap/terraform.tfstate" \
+#     -backend-config="region=<TF_STATE_REGION>" \
+#     -backend-config="encrypt=true"
+#   rm backend.tf                            # not committed; injected at run time
+#
+# Skipping that is caught rather than acted on: the plan job fails if the remote
+# state is empty while the deploy role already exists in the account, because
+# that combination can only mean the local state has not been migrated.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Terraform action to run
+        type: choice
+        options:
+          - plan
+          - apply
+        default: plan
+
+      # One toggle per service. workflow_dispatch has no multi-select, and
+      # booleans render as checkboxes -- which reads better than a comma
+      # separated string and cannot be misspelled.
+      oidc_provider:
+        description: "GitHub OIDC provider (only one per account for this URL)"
+        type: boolean
+        default: false
+      state_bucket:
+        description: "Terraform state S3 bucket (leave off if it already exists)"
+        type: boolean
+        default: false
+      opensearch_service_linked_role:
+        description: "OpenSearch service-linked role (account-wide, shared by every domain)"
+        type: boolean
+        default: false
+      nat_eips:
+        description: "Stable NAT egress EIPs, one per environment (~$0.12/day each)"
+        type: boolean
+        default: false
+      global_accelerator:
+        description: "Global Accelerator per environment, holds the static IPs (~$18/mo each)"
+        type: boolean
+        default: false
+
+      allow_destroy:
+        description: 'Type "destroy" to permit a plan that deletes resources'
+        type: string
+        default: ""
+
+# Account-wide, so one at a time -- no environment in the key. Two concurrent
+# applies would fight over the same state file and the same IAM role.
+concurrency:
+  group: openmetadata-bootstrap
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # required for AWS OIDC
+  contents: read
+
+env:
+  TF_DIR: bootstrap
+  # >= 1.10 required for S3 native state locking (use_lockfile)
+  TF_VERSION: "1.15.8"
+  # The same generic backend block the environments use; values come from
+  # -backend-config at init time.
+  BACKEND_FILE: backend.tf
+  # Its own key, alongside the environments rather than inside one -- bootstrap
+  # outlives them all.
+  STATE_KEY: ${{ vars.TF_STATE_PREFIX || 'openmetadata' }}/bootstrap/terraform.tfstate
+  # Must match var.role_name in bootstrap/variables.tf. Used only by the
+  # unmigrated-state guard below.
+  ROLE_NAME: openmetadata-infra-deploy
+
+jobs:
+  plan:
+    name: Plan (bootstrap)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out infra project
+        uses: actions/checkout@v4
+
+      # No tfvars-file: every value arrives as -var, because the service
+      # selection comes from the inputs above rather than a committed file.
+      - name: Prepare Terraform
+        uses: ./.github/actions/prepare
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key: ${{ env.STATE_KEY }}
+          state-region: ${{ vars.TF_STATE_REGION }}
+          terraform-dir: ${{ env.TF_DIR }}
+          backend-file: ${{ env.BACKEND_FILE }}
+          terraform-version: ${{ env.TF_VERSION }}
+
+      - name: Terraform fmt (advisory)
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform fmt -check -recursive || echo "::warning::Terraform files are not canonically formatted"
+
+      - name: Terraform validate
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform validate
+
+      # The chicken-and-egg check.
+      #
+      # aws_iam_role.deploy is unconditional in bootstrap/main.tf -- there is no
+      # create_* toggle for it, because it is the role this very workflow
+      # assumes. With a migrated state that is fine. With an EMPTY state,
+      # Terraform plans to create a role that already exists and apply fails
+      # deep in the run with EntityAlreadyExists, which reads like a naming
+      # collision rather than a missing state file.
+      #
+      # Catching it here also stops the more damaging version: an empty state
+      # plus a ticked global_accelerator would provision a SECOND accelerator
+      # with different static addresses, silently, at ~$18/month.
+      - name: Guard against unmigrated local state
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          set -uo pipefail
+          n=$(terraform state list 2>/dev/null | grep -c . || true)
+          echo "resources in remote state: $n"
+          if [ "$n" -ne 0 ]; then
+            echo "State is populated; nothing to check."
+            exit 0
+          fi
+
+          if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+            echo "::error::Remote state at ${STATE_KEY} is EMPTY, but IAM role ${ROLE_NAME} already exists in this account. bootstrap/ has been applied before with LOCAL state and it has not been migrated. Applying now would try to recreate resources that exist (and could provision a second Global Accelerator with new addresses). Migrate the local state first -- the exact commands are in the header of this workflow file and in bootstrap/README.md."
+            exit 1
+          fi
+          echo "Empty state and no existing deploy role: this is a genuine first run."
+
+      - name: Terraform plan
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          # Via env rather than inline ${{ }} so nothing from a variable or
+          # secret is pasted into the script itself.
+          TF_REGION: ${{ vars.AWS_REGION }}
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          GH_REPOSITORY: ${{ github.repository }}
+          IN_OIDC: ${{ github.event.inputs.oidc_provider }}
+          IN_BUCKET: ${{ github.event.inputs.state_bucket }}
+          IN_SLR: ${{ github.event.inputs.opensearch_service_linked_role }}
+          IN_NAT: ${{ github.event.inputs.nat_eips }}
+          IN_GA: ${{ github.event.inputs.global_accelerator }}
+        run: |
+          set -euo pipefail
+
+          # github_org has no default in variables.tf and github_repo defaults to
+          # a different repo name, so both are derived from the repository this
+          # workflow is running in rather than being configured twice.
+          org="${GH_REPOSITORY%%/*}"
+          repo="${GH_REPOSITORY##*/}"
+
+          echo "Services selected for this plan:"
+          printf '  %-38s %s\n' \
+            "oidc_provider"                  "$IN_OIDC" \
+            "state_bucket"                   "$IN_BUCKET" \
+            "opensearch_service_linked_role" "$IN_SLR" \
+            "nat_eips"                       "$IN_NAT" \
+            "global_accelerator"             "$IN_GA"
+          echo
+          echo "Anything false above is planned as ABSENT, not as unchanged."
+
+          # state_bucket is passed regardless of whether we are creating the
+          # bucket: it also drives aws_iam_role_policy.state, the inline policy
+          # that lets the deploy role read and write remote state. Omit it and
+          # that policy plans as a delete, which would break every deployment.
+          terraform plan -input=false -out=tfplan \
+            -var="region=${TF_REGION}" \
+            -var="state_bucket=${TF_STATE_BUCKET}" \
+            -var="github_org=${org}" \
+            -var="github_repo=${repo}" \
+            -var="create_oidc_provider=${IN_OIDC}" \
+            -var="create_state_bucket=${IN_BUCKET}" \
+            -var="create_opensearch_service_linked_role=${IN_SLR}" \
+            -var="create_nat_eips=${IN_NAT}" \
+            -var="create_global_accelerator=${IN_GA}"
+
+      # Refuse to hand an apply a plan that deletes things, unless the operator
+      # typed the confirmation. The selection model makes an accidental delete
+      # easy -- forget to tick nat_eips and its EIPs are planned away -- and
+      # some of these deletions are not recoverable: releasing an accelerator or
+      # an EIP means AWS will not give the same addresses back, and every
+      # external DNS record and firewall allowlist pointing at them goes stale.
+      - name: Guard against destructive plans
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          ALLOW_DESTROY: ${{ github.event.inputs.allow_destroy }}
+        run: |
+          set -uo pipefail
+          terraform show -json tfplan > plan.json
+
+          dels=$(python3 - <<'PY'
+          import json
+          d = json.load(open("plan.json"))
+          for r in d.get("resource_changes", []):
+              acts = r.get("change", {}).get("actions", [])
+              if "delete" in acts:
+                  print(f"  {r['address']}  ({'+'.join(acts)})")
+          PY
+          )
+
+          if [ -z "$dels" ]; then
+            echo "No deletions in this plan."
+            exit 0
+          fi
+
+          echo "This plan DELETES:"
+          printf '%s\n' "$dels"
+          echo
+
+          if [ "${ALLOW_DESTROY:-}" = "destroy" ]; then
+            echo "::warning::Destructive plan permitted by the allow_destroy confirmation."
+            exit 0
+          fi
+
+          echo "::error::This plan deletes the resources listed above and allow_destroy was not set to \"destroy\". Almost always the cause is a service left unticked that should have stayed on -- the selection is the full desired state, not a delta. Re-run with every service you want to KEEP ticked. If the deletion is genuinely intended, re-run with allow_destroy=destroy, and note that releasing an Elastic IP or a Global Accelerator loses those addresses permanently."
+          exit 1
+
+      - name: Save plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-bootstrap
+          path: ${{ env.TF_DIR }}/tfplan
+          retention-days: 5
+
+  apply:
+    name: Apply (bootstrap)
+    if: ${{ github.event.inputs.action == 'apply' }}
+    needs: plan
+    runs-on: ubuntu-latest
+    # Account-wide changes, so its own gate rather than dev's or production's.
+    # Referencing an environment that does not exist yet creates it with no
+    # protection rules -- add reviewers under Settings -> Environments.
+    environment: bootstrap
+    steps:
+      - name: Check out infra project
+        uses: actions/checkout@v4
+
+      - name: Prepare Terraform
+        uses: ./.github/actions/prepare
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          state-bucket: ${{ vars.TF_STATE_BUCKET }}
+          state-key: ${{ env.STATE_KEY }}
+          state-region: ${{ vars.TF_STATE_REGION }}
+          terraform-dir: ${{ env.TF_DIR }}
+          backend-file: ${{ env.BACKEND_FILE }}
+          terraform-version: ${{ env.TF_VERSION }}
+
+      # The saved plan, not a fresh one. Applying a re-planned run would skip
+      # both guards above.
+      - name: Fetch plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-bootstrap
+          path: ${{ env.TF_DIR }}
+
+      - name: Terraform apply
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -input=false tfplan
+
+      # What the rest of the repo needs from here. Printed on every apply
+      # because these values are what get pasted into an environment's tfvars
+      # and into DNS tickets, and hunting them out of Terraform state afterwards
+      # is the annoying part.
+      - name: Report bootstrap outputs
+        if: success()
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          set -uo pipefail
+          get() { terraform output -json "$1" 2>/dev/null || echo 'null'; }
+
+          {
+            echo "## Bootstrap applied"
+            echo
+            echo "| Output | Value |"
+            echo "|---|---|"
+            printf '| Deploy role ARN | `%s` |\n' "$(terraform output -raw role_arn 2>/dev/null || echo '-')"
+            printf '| Accelerator names | `%s` |\n'     "$(get accelerator_names)"
+            printf '| Accelerator static IPs | `%s` |\n' "$(get accelerator_static_ips)"
+            printf '| NAT egress IPs | `%s` |\n'        "$(get nat_egress_ips)"
+            echo
+            echo "Next steps, where relevant:"
+            echo "- Set \`app_accelerator_name\` in that environment's tfvars to the accelerator name above."
+            echo "- Publish the static IPs for the externally-managed DNS record."
+            echo "- Allowlist the NAT egress IPs wherever the pods must reach out (Snowflake network policies, partner firewalls)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Outputs also printed here for the log:"
+          terraform output || true

@@ -13,8 +13,10 @@ deploy fails without it, see below), and can create the **remote state bucket**
 (off by default). There is no lock table: the deploy workflow uses S3 native
 locking.
 
-Run it once, with credentials that can create IAM resources. It uses **local
-state** — that's fine for a bootstrap; commit nothing sensitive.
+Run it once, with credentials that can create IAM resources. Run locally it uses
+**local state** — fine for a bootstrap; commit nothing sensitive. The
+`openmetadata-bootstrap` workflow keeps state in S3 instead, so read
+[Running it from Actions](#running-it-from-actions) before mixing the two.
 
 ```bash
 cd openmetadata-infra/bootstrap
@@ -135,3 +137,71 @@ app_accelerator_name = "openmetadata-dev"
 > currently deployed — that is the cost of holding the addresses. Setting this
 > back to false, or destroying this bootstrap, releases them permanently; AWS
 > does not hand the same pair back.
+
+## Running it from Actions
+
+`openmetadata-bootstrap` (Actions → *openmetadata-bootstrap*) runs this
+directory with a checkbox per service, so adding one resource later does not
+mean finding the machine that first applied it.
+
+| Input | Provisions |
+|---|---|
+| `oidc_provider` | The GitHub OIDC identity provider |
+| `state_bucket` | The Terraform state bucket |
+| `opensearch_service_linked_role` | `AWSServiceRoleForAmazonOpenSearchService` |
+| `nat_eips` | Stable NAT egress EIPs, one per environment |
+| `global_accelerator` | One accelerator per environment, holding the static IPs |
+
+`plan` is ungated. `apply` runs in the **bootstrap** GitHub Environment — it is
+created automatically with no protection rules, so add reviewers under
+Settings → Environments if account-wide changes should need approval.
+
+### The selection is the whole desired state
+
+Anything left unticked is passed as `create_* = false`, so a resource already in
+state that is not ticked **plans as a delete**. Tick everything you want to
+keep, not just the thing you are adding.
+
+That is Terraform working correctly rather than a quirk — using `-target` to
+paper over it would hide genuine drift — but the failure mode is expensive
+enough that the plan job refuses to produce an appliable plan containing
+deletions unless you set `allow_destroy` to the literal string `destroy`. It
+catches replacements too, because a `delete+create` on an Elastic IP or an
+accelerator loses those addresses just as permanently as a delete, and every
+external DNS record and firewall allowlist pointing at them goes stale.
+
+### One-time state migration
+
+The workflow cannot use local state: a runner starts with an empty state file
+and would try to **create resources that already exist**. Worse, an empty state
+with `global_accelerator` ticked would quietly provision a *second* accelerator
+with different addresses at ~$18/month.
+
+So bootstrap state moves to the same bucket as the environments, under
+`<TF_STATE_PREFIX>/bootstrap/terraform.tfstate`. If you have already applied
+this directory by hand, migrate that state **once**, from the machine holding
+it:
+
+```bash
+cd openmetadata-infra/bootstrap
+cp ../backend.tf .                 # the same generic S3 backend block
+terraform init -migrate-state \
+  -backend-config="bucket=<TF_STATE_BUCKET>" \
+  -backend-config="key=<TF_STATE_PREFIX>/bootstrap/terraform.tfstate" \
+  -backend-config="region=<TF_STATE_REGION>" \
+  -backend-config="encrypt=true"
+rm backend.tf                      # not committed; the workflow injects it
+```
+
+You do not have to guess whether this is needed. The plan job fails with an
+explicit message if the remote state is empty while the deploy role already
+exists in the account — the only thing that combination can mean.
+
+### Why the deploy role has no checkbox
+
+`aws_iam_role.deploy` and its policy attachments are unconditional: the role is
+what the workflow authenticates *as*, so it cannot be toggled off from a run
+that depends on it. Creating it for the first time therefore stays a local
+operation with elevated credentials. Everything else in the table above is
+within the deploy role's own permissions (PowerUser + IAMFullAccess), which is
+why those got checkboxes and this did not.

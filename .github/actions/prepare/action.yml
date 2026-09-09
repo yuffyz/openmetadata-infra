@@ -26,8 +26,13 @@ inputs:
     description: Path (in this repo) to backend.tf to inject
     required: true
   tfvars-file:
-    description: Path (in this repo) to the .auto.tfvars to inject for this environment
-    required: true
+    description: >-
+      Path (in this repo) to the .auto.tfvars to inject for this environment.
+      Optional: leave empty for a root module whose variables all arrive as
+      -var on the command line (bootstrap/ does this, because the values come
+      from workflow_dispatch inputs rather than a committed file).
+    required: false
+    default: ""
   terraform-version:
     description: Terraform version to install (>= 1.10 for S3 native locking)
     required: false
@@ -97,10 +102,19 @@ runs:
         set -euo pipefail
         test -d "${{ inputs.terraform-dir }}" || { echo "::error::terraform dir not found: ${{ inputs.terraform-dir }}"; exit 1; }
         test -f "${{ inputs.backend-file }}" || { echo "::error::backend file not found: ${{ inputs.backend-file }}"; exit 1; }
-        test -f "${{ inputs.tfvars-file }}"  || { echo "::error::tfvars file not found: ${{ inputs.tfvars-file }}"; exit 1; }
         cp "${{ inputs.backend-file }}" "${{ inputs.terraform-dir }}/backend.tf"
-        cp "${{ inputs.tfvars-file }}" "${{ inputs.terraform-dir }}/deploy.auto.tfvars"
-        echo "Injected ${{ inputs.backend-file }} and ${{ inputs.tfvars-file }} into ${{ inputs.terraform-dir }}"
+        echo "Injected ${{ inputs.backend-file }} into ${{ inputs.terraform-dir }}"
+
+        # A root module with no committed tfvars is valid -- bootstrap/ takes
+        # every value as -var from workflow inputs. Only the backend is
+        # mandatory here.
+        if [ -n "${{ inputs.tfvars-file }}" ]; then
+          test -f "${{ inputs.tfvars-file }}" || { echo "::error::tfvars file not found: ${{ inputs.tfvars-file }}"; exit 1; }
+          cp "${{ inputs.tfvars-file }}" "${{ inputs.terraform-dir }}/deploy.auto.tfvars"
+          echo "Injected ${{ inputs.tfvars-file }} into ${{ inputs.terraform-dir }}"
+        else
+          echo "No tfvars-file given; variables must arrive as -var."
+        fi
 
     # Prints the OIDC claims that AWS is about to be asked to match, so a failure
     # in the next step is self-explaining. "Not authorized to perform

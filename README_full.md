@@ -61,6 +61,7 @@ openmetadata-infra/                     # repo root
 │  ├─ actions/prepare/action.yml     # composite: inject cfg, OIDC, pre-flight, init
 │  └─ workflows/
 │     ├─ deploy.yml                  # manual: environment × (plan / apply / destroy)
+│     ├─ bootstrap.yml               # manual: tick which account-wide services to provision
 │     ├─ openmetadata-ops.yml        # manual: diagnose / restart / search-index repair
 │     └─ validate.yml                # PR fmt + validate (no cloud creds)
 ├─ terraform/                        # the Terraform root module that gets deployed
