@@ -659,16 +659,15 @@ say so.
 `app_accelerator_name` puts two static anycast IPv4 addresses in front of the
 ALB.
 
-> **Currently OFF in dev** (`app_accelerator_name` commented out), deliberately.
-> The code is complete and stays in place; the ALB is being proven on its own
-> first. Stacking a new load balancer and a new network hop in one change makes
-> the two indistinguishable when something times out — which is precisely the
-> failure mode that cost a day here. Turn it on afterwards and re-test.
+> **On in dev since 2026-09-10**, after the ALB had been verified on its own.
+> That order was deliberate: stacking a new load balancer and a new network hop
+> in one change makes them indistinguishable when something times out, which is
+> precisely the failure that cost a day here.
 >
-> To enable: run `openmetadata-bootstrap` with `global_accelerator` ticked, set
-> `app_accelerator_name` from `terraform output accelerator_names`, and apply.
-> The Route 53 alias repoints itself from the ALB to the accelerator — see the
-> target locals in `alb_tls.tf`. The certificate and hostname do not change.
+> The step-by-step sequence — bootstrap state migration, the checkbox run, the
+> four expected plan changes, and the three verification checks — is in
+> [README.md](README.md#enabling-global-accelerator). This section covers the
+> mechanics rather than the procedure.
 
 The accelerator is split across two states, deliberately:
 
@@ -693,7 +692,14 @@ Apply `bootstrap/` with `create_global_accelerator = true` first. Setting
 Accelerator Accelerator found" — the same failure mode as an unbootstrapped NAT
 EIP.
 
-What it was for: `openmetadata-dev.corp.example.com` lived in an internal zone this
+What it was for — and note this justification has since **expired**. Route 53
+now publishes the user-facing record from a zone this account owns and repoints
+it on every apply, so "the record can only be written once" is no longer true.
+What remains is a fixed pair of addresses for a forward-proxy steering bypass,
+which is the thing to test while it is on; if that bypass is not granted, the
+accelerator is buying nothing and should come back off.
+
+Originally: `openmetadata-dev.corp.example.com` lived in an internal zone this
 account does not own, so repointing it is a ticket rather than a command, and
 the ALB's hostname carries a per-load-balancer hash that AWS reassigns whenever
 the load balancer is recreated. Pointed at the accelerator, that record is

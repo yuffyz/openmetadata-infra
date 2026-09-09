@@ -84,47 +84,59 @@ app_lb_allowed_cidrs = [
 # > through the module's helm_values, not app_extra_helm_values (which reaches
 # > Helm as --set and retypes strings).
 
-# --- Global Accelerator: available, currently OFF ---------------------------
-# Two static anycast IPs in front of the ALB, held in bootstrap/ so they outlive
-# this environment's teardown loop. The code is complete and stays in place --
-# the terraform/ listener and endpoint group, the bootstrap/ accelerator, and
-# the checkbox in the bootstrap workflow.
+# --- Global Accelerator: ENABLED --------------------------------------------
+# Two static anycast IPs in front of the ALB. The accelerator itself is owned by
+# bootstrap/ so the addresses outlive this environment's teardown loop; only the
+# listener and endpoint group are created here.
 #
-# Off deliberately while the ALB itself is being proven. Adding an accelerator
-# at the same time as the load balancer swap would put two new hops in the path
-# at once, and the failure everyone remembers here -- a completed TLS handshake
-# with nothing behind it -- looked identical whichever hop was at fault. Get a
-# clean result against the ALB first, then turn this on and re-test.
+# Enabled 2026-09-10, after the ALB was verified on its own. That order was
+# deliberate: stacking a new load balancer and a new network hop in one change
+# makes them indistinguishable when something times out, which is exactly the
+# failure that cost a day here -- a completed TLS handshake with nothing behind
+# it looks the same whichever hop is at fault.
 #
-# To enable it later:
+# The name must match an accelerator bootstrap/ has already created, or the plan
+# fails with "no matching Global Accelerator Accelerator found" -- the same
+# failure mode as an unbootstrapped NAT EIP. Get it from
+# `terraform output accelerator_names` in bootstrap/. The runbook for the whole
+# sequence is in README.md, "Enabling Global Accelerator".
+app_accelerator_name = "openmetadata-dev"
+
+# > ⚠️ Verify client IP preservation after the first apply, and do not assume
+# > it. With it off, the ALB sees the accelerator's addresses instead of the
+# > client's, app_lb_allowed_cidrs matches nothing, and it stops limiting access
+# > at all -- on a UI that still has a default admin account, and with no error
+# > anywhere to say so.
+# >
+# >   openmetadata-ops -> show-exposure     # reads Preserve back per endpoint
 #
-#   1. Run the openmetadata-bootstrap workflow with global_accelerator ticked
-#      (and every other service you want to KEEP ticked -- the selection is the
-#      whole desired state, not a delta).
-#   2. Uncomment the line below. The name is "<prefix>-<environment>", from
-#      `terraform output accelerator_names` in bootstrap/.
-#   3. Apply. The Route 53 alias below repoints itself from the ALB to the
-#      accelerator automatically -- see the target locals in alb_tls.tf. Nothing
-#      about the certificate or the hostname changes.
+# What this does and does not buy, now that DNS is in a zone we own:
 #
-# Then verify client IP preservation actually took effect, because with it off
-# the ALB sees the accelerator's addresses instead of the client's and
-# app_lb_allowed_cidrs silently stops limiting anything:
+#   The original justification is GONE. Static IPs were worth $18/month because
+#   the openmetadata-dev.corp.example.com record could only be written once; Route 53
+#   repoints itself, so that problem no longer exists.
 #
-#   openmetadata-ops -> show-exposure   (reads it back per endpoint)
+#   What remains is a fixed pair of addresses to hand the network team for a
+#   Netskope steering bypass, which cannot be written against a rotating set of
+#   *.elb.amazonaws.com addresses. That is the thing to actually test while this
+#   is on -- if the bypass is not granted, or is granted on FQDN instead, turn
+#   this back off and keep the $18.
 #
-# Adds ~$18/month plus a per-GB data transfer premium, billed by bootstrap/
-# whether or not this environment is deployed. It is NOT a fix for the September
-# 2026 outage -- that was Netskope terminating TLS on the client side and never
-# reaching AWS, which an accelerator has no say over.
+#   It is NOT a fix for the September 2026 outage. That was Netskope terminating
+#   TLS on the client side and never reaching AWS; an accelerator changes where
+#   traffic ENTERS the AWS network and has no say over what a proxy on the
+#   endpoint does with port 443.
 #
-# app_accelerator_name = "openmetadata-dev"
+#   It is NOT multi-region failover: one endpoint group, one region, one ALB.
+#
+# Cost: ~$18/month plus a per-GB data transfer premium, billed by bootstrap/
+# whether or not this environment is currently deployed.
 
 # --- HTTPS and DNS: a public Route 53 zone this account owns -----------------
 # The UI is https://dev.example-openmetadata.com. Terraform owns the whole chain:
 # ACM issues and DNS-validates the certificate, and an A-alias record points at
-# the current front door -- the ALB today, the accelerator if the section above
-# is switched on -- repointed on every apply.
+# the current front door -- the accelerator, since the section above is on --
+# repointed on every apply.
 #
 # This replaced openmetadata-dev.corp.example.com, which lived in an internal zone this
 # account does not own. Terraform could publish nothing there, so every load
@@ -136,11 +148,6 @@ app_lb_allowed_cidrs = [
 # its own, and the alias record follows the load balancer with no ticket. The
 # hosted zone costs about $0.50/month.
 #
-# Note what this does to the accelerator's rationale. Static IPs were originally
-# worth $18/month because the corp.example.com record could only be written once. That
-# argument is gone -- Route 53 repoints itself. What remains is a fixed pair of
-# addresses to hand the network team for a proxy steering bypass, which is worth
-# testing on its own merits rather than assumed.
 #
 # > ⚠️ openmetadata-dev.corp.example.com NO LONGER WORKS. The ALB serves only the
 # > certificate for the name below, so that hostname now fails the TLS handshake

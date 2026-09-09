@@ -179,7 +179,7 @@ kubectl port-forward -n openmetadata svc/openmetadata 8585:8585   # http://local
 
 ### 3. HTTPS (optional)
 
-Set both in `config/dev.auto.tfvars` and TLS terminates on the NLB with an ACM
+Set both in `config/dev.auto.tfvars` and TLS terminates on the ALB with an ACM
 certificate, plus a Route 53 alias record:
 
 ```hcl
@@ -191,7 +191,7 @@ Requires an existing **public** Route 53 hosted zone for a domain you control.
 The URL becomes `https://openmetadata.example.com` — 443, no port. 8585 keeps
 working. Users behind a corporate proxy need the 443 URL: those proxies do not
 forward non-standard ports. Details and caveats in
-[README_full.md](README_full.md#dev--https-on-the-nlb).
+[README_full.md](README_full.md#dev--https-on-the-alb).
 
 For a domain served from an internal zone this account does not own, import a
 certificate from your own PKI and add a stable target for that zone to point at:
@@ -214,6 +214,125 @@ openmetadata.corp.example.com.  CNAME  openmetadata.example.com.
 ```
 
 `terraform output app_dns_alias_fqdn` prints the name to point at.
+
+## Enabling Global Accelerator
+
+Two static anycast IPs in front of the ALB. **On in dev since 2026-09-10**, and
+enabled only after the ALB had been verified on its own — stacking a new load
+balancer and a new network hop in one change makes them indistinguishable when
+something times out, which is the failure that cost a day here.
+
+The accelerator lives in `bootstrap/` (so its addresses survive an environment
+teardown) while the listener and endpoint group live in `terraform/`. That split
+sets the order below: bootstrap first, always.
+
+### 1. Migrate bootstrap state to S3 — once, ever
+
+The `openmetadata-bootstrap` workflow cannot use local state. Skip this and the
+plan job stops you with an explicit error, so it is safe to try and find out.
+From the machine holding the local state:
+
+```bash
+cd bootstrap
+cp ../backend.tf .
+terraform init -migrate-state \
+  -backend-config="bucket=<TF_STATE_BUCKET>" \
+  -backend-config="key=<TF_STATE_PREFIX>/bootstrap/terraform.tfstate" \
+  -backend-config="region=<TF_STATE_REGION>" \
+  -backend-config="encrypt=true"
+rm backend.tf
+```
+
+### 2. Create the accelerator
+
+Actions → **openmetadata-bootstrap** → `action=plan`, tick `global_accelerator`
+**and everything already provisioned**.
+
+> The selection is the whole desired state, not a delta. Anything unticked is
+> passed as `create_* = false` and plans as a *delete*. For this account that
+> normally means also ticking `oidc_provider` and
+> `opensearch_service_linked_role`; leave `state_bucket` off (the bucket was
+> created by hand and is not in state) and `nat_eips` off unless
+> `stable_nat_eip_name` is in use. **Read the plan — it is the authority, not
+> this list.** A wrong selection costs a re-run, not an outage: the plan job
+> refuses to produce an appliable plan containing deletions.
+
+Then re-run with `action=apply`. The run summary prints the accelerator name and
+its two static IPs.
+
+### 3. Point the environment at it
+
+```hcl
+# config/dev.auto.tfvars
+app_accelerator_name = "openmetadata-dev"    # from `terraform output accelerator_names`
+```
+
+Already set for dev. A name with no matching accelerator fails the plan with
+*"no matching Global Accelerator Accelerator found"* rather than creating one.
+
+### 4. Apply the environment
+
+Actions → **openmetadata-infra** → `environment=dev`, `action=plan`, then
+`apply`. Expect exactly four things in the plan:
+
+| Change | |
+|---|---|
+| `aws_globalaccelerator_listener` | TCP on 443 and 8585, matching the ALB's listeners |
+| `aws_globalaccelerator_endpoint_group` | One endpoint: the ALB, by ARN, with client IP preservation on |
+| Ingress annotation | GA's managed prefix list added to the ALB's security group |
+| `aws_route53_record.app` | Alias flips from the ALB to the accelerator, `evaluate_target_health` → false |
+
+The certificate and the hostname do not change. `dev.example-openmetadata.com` stays
+the URL throughout; only what it resolves to moves.
+
+### 5. Verify — three checks, none optional
+
+```bash
+# the addresses DNS should now hand out
+terraform output app_static_ips
+
+# and does it? before this change these were the ALB's addresses
+dig +short dev.example-openmetadata.com
+
+# end to end, from an allowlisted network
+curl -sv --max-time 20 https://dev.example-openmetadata.com 2>&1 | tail -20
+```
+
+Then **client IP preservation**, which is the one that matters:
+
+```
+Actions -> openmetadata-ops -> environment=dev, action=show-exposure
+```
+
+Its Global Accelerator group prints `Preserve` per endpoint. If that is `false`,
+the ALB sees the accelerator's addresses instead of the client's,
+`app_lb_allowed_cidrs` matches nothing, and the allowlist stops limiting access
+at all — on a UI that still ships a default admin account, with no error
+anywhere to reveal it. Treat `false` as an incident, not a tuning issue.
+
+### 6. Test the thing it is actually for
+
+The original reason for static IPs is gone: they existed so the
+`openmetadata-dev.corp.example.com` record could be written once, and Route 53 now
+repoints itself. What remains is a **fixed pair of addresses for a Netskope
+steering bypass**, which cannot be written against a rotating set of
+`*.elb.amazonaws.com` addresses.
+
+So while this is on, ask the network team for that bypass against
+`terraform output app_static_ips`. If they decline, or grant it on FQDN instead,
+the accelerator is buying nothing here — comment `app_accelerator_name` out,
+untick `global_accelerator` in the next bootstrap run, and keep the ~$18/month.
+
+It is not a fix for the September 2026 outage (Netskope terminated TLS on the
+client side and never reached AWS), and it is not multi-region failover — one
+endpoint group, one region, one ALB.
+
+### Turning it off
+
+Comment out `app_accelerator_name` and apply: the listener and endpoint group go,
+and the Route 53 alias returns to the ALB by itself. The accelerator survives in
+`bootstrap/`, still billed, until you untick `global_accelerator` there — and
+releasing it means AWS will not hand the same addresses back.
 
 ## Airflow and connecting data sources
 
