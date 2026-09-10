@@ -95,12 +95,29 @@ app_lb_allowed_cidrs = [
 # failure that cost a day here -- a completed TLS handshake with nothing behind
 # it looks the same whichever hop is at fault.
 #
-# The name must match an accelerator bootstrap/ has already created, or the plan
+# The ARN must match an accelerator bootstrap/ has already created, or the plan
 # fails with "no matching Global Accelerator Accelerator found" -- the same
-# failure mode as an unbootstrapped NAT EIP. Get it from
-# `terraform output accelerator_names` in bootstrap/. The runbook for the whole
-# sequence is in README.md, "Enabling Global Accelerator".
-app_accelerator_name = "openmetadata-dev"
+# failure mode as an unbootstrapped NAT EIP. The runbook for the whole sequence
+# is in README.md, "Enabling Global Accelerator".
+#
+# The ARN and not the name. Looking the accelerator up by name leaves the data
+# source's `arn` attribute null -- it doubles as an optional input, and the
+# provider does not populate it on that path -- and the listener then fails with
+# "accelerator_arn is required, but no definition was found". See the comment in
+# global_accelerator.tf.
+#
+# Fill this in from bootstrap/ (it is not derivable from the name or the
+# accelerator's DNS name):
+#
+#   terraform output accelerator_arns
+#
+# or, without a bootstrap checkout:
+#
+#   aws globalaccelerator list-accelerators --region us-west-2 \
+#     --query "Accelerators[?Name=='openmetadata-dev'].AcceleratorArn" \
+#     --output text
+#
+# app_accelerator_arn = "arn:aws:globalaccelerator::123456789012:accelerator/<uuid>"
 
 # > ⚠️ Verify client IP preservation after the first apply, and do not assume
 # > it. With it off, the ALB sees the accelerator's addresses instead of the

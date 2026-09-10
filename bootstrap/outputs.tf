@@ -24,6 +24,17 @@ output "accelerator_static_ips" {
 }
 
 output "accelerator_names" {
-  description = "Accelerator name per environment. Set the matching one as app_accelerator_name in that environment's tfvars."
+  description = "Accelerator name per environment, for recognising it in the console. The environment stack consumes accelerator_arns below, not this."
   value       = { for env, a in aws_globalaccelerator_accelerator.app : env => a.name }
+}
+
+# The value each environment's app_accelerator_arn takes.
+#
+# The ARN and not the name: the environment stack looks the accelerator up by
+# ARN, because the provider leaves `arn` null when the same data source is
+# looked up by name and the listener then fails with "accelerator_arn is
+# required, but no definition was found".
+output "accelerator_arns" {
+  description = "Accelerator ARN per environment. Set the matching one as app_accelerator_arn in that environment's tfvars. Empty unless create_global_accelerator is true."
+  value       = { for env, a in aws_globalaccelerator_accelerator.app : env => a.arn }
 }

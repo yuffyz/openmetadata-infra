@@ -59,12 +59,12 @@ output "app_lb_scheme" {
 # apply reattaches them -- so the external DNS record is written once and never
 # re-ticketed. Same arrangement, and same reason, as the NAT EIP.
 output "app_static_ips" {
-  description = "The accelerator's two static anycast IPv4 addresses. Publish an A record with both. Empty when app_accelerator_name is empty. Owned by bootstrap/, so they survive this environment being destroyed and rebuilt."
+  description = "The accelerator's two static anycast IPv4 addresses. Publish an A record with both. Empty when app_accelerator_arn is empty. Owned by bootstrap/, so they survive this environment being destroyed and rebuilt."
   value       = try(one(data.aws_globalaccelerator_accelerator.app[*].ip_sets[0].ip_addresses), [])
 }
 
 output "app_accelerator_dns_name" {
-  description = "The accelerator's own hostname, an alternative CNAME target to app_static_ips for a zone that would rather not pin addresses. Empty when app_accelerator_name is empty."
+  description = "The accelerator's own hostname, an alternative CNAME target to app_static_ips for a zone that would rather not pin addresses. Empty when app_accelerator_arn is empty."
   value       = try(one(data.aws_globalaccelerator_accelerator.app[*].dns_name), "")
 }
 

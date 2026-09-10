@@ -73,6 +73,11 @@ on:
         type: boolean
         default: false
 
+      accelerator_environments:
+        description: "Which environments get an accelerator (comma separated). Empty = all of environment_names"
+        type: string
+        default: "dev"
+
       allow_destroy:
         description: 'Type "destroy" to permit a plan that deletes resources'
         type: string
@@ -174,6 +179,7 @@ jobs:
           IN_SLR: ${{ github.event.inputs.opensearch_service_linked_role }}
           IN_NAT: ${{ github.event.inputs.nat_eips }}
           IN_GA: ${{ github.event.inputs.global_accelerator }}
+          IN_GA_ENVS: ${{ github.event.inputs.accelerator_environments }}
         run: |
           set -euo pipefail
 
@@ -189,9 +195,18 @@ jobs:
             "state_bucket"                   "$IN_BUCKET" \
             "opensearch_service_linked_role" "$IN_SLR" \
             "nat_eips"                       "$IN_NAT" \
-            "global_accelerator"             "$IN_GA"
+            "global_accelerator"             "$IN_GA" \
+            "accelerator_environments"       "${IN_GA_ENVS:-<all environments>}"
           echo
           echo "Anything false above is planned as ABSENT, not as unchanged."
+
+          # A Terraform list literal, from the comma separated input. Empty
+          # yields [], which the module reads as "every entry in
+          # environment_names" -- the original behaviour.
+          ga_envs=$(printf '%s' "${IN_GA_ENVS:-}" | tr -d '[:space:]' \
+            | awk -F, '{for(i=1;i<=NF;i++) if ($i != "") printf "%s\"%s\"", (n++?",":""), $i}')
+          ga_envs="[${ga_envs}]"
+          echo "accelerator environments -> ${ga_envs}"
 
           # state_bucket is passed regardless of whether we are creating the
           # bucket: it also drives aws_iam_role_policy.state, the inline policy
@@ -206,7 +221,8 @@ jobs:
             -var="create_state_bucket=${IN_BUCKET}" \
             -var="create_opensearch_service_linked_role=${IN_SLR}" \
             -var="create_nat_eips=${IN_NAT}" \
-            -var="create_global_accelerator=${IN_GA}"
+            -var="create_global_accelerator=${IN_GA}" \
+            -var="global_accelerator_environments=${ga_envs}"
 
       # Refuse to hand an apply a plan that deletes things, unless the operator
       # typed the confirmation. The selection model makes an accidental delete
@@ -311,11 +327,12 @@ jobs:
             echo "|---|---|"
             printf '| Deploy role ARN | `%s` |\n' "$(terraform output -raw role_arn 2>/dev/null || echo '-')"
             printf '| Accelerator names | `%s` |\n'     "$(get accelerator_names)"
+            printf '| Accelerator ARNs | `%s` |\n'      "$(get accelerator_arns)"
             printf '| Accelerator static IPs | `%s` |\n' "$(get accelerator_static_ips)"
             printf '| NAT egress IPs | `%s` |\n'        "$(get nat_egress_ips)"
             echo
             echo "Next steps, where relevant:"
-            echo "- Set \`app_accelerator_name\` in that environment's tfvars to the accelerator name above."
+            echo "- Set \`app_accelerator_arn\` in that environment's tfvars to the matching ARN above (the ARN, not the name -- see global_accelerator.tf)."
             echo "- Publish the static IPs for the externally-managed DNS record."
             echo "- Allowlist the NAT egress IPs wherever the pods must reach out (Snowflake network policies, partner firewalls)."
           } >> "$GITHUB_STEP_SUMMARY"

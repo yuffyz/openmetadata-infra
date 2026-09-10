@@ -1,7 +1,7 @@
 # Global Accelerator in front of the OpenMetadata ALB.
 #
 # Two static anycast IPv4 addresses, advertised from AWS edge locations, that
-# forward TCP to the ALB. Enabled by setting app_accelerator_name to the name of
+# forward TCP to the ALB. Enabled by setting app_accelerator_arn to the ARN of
 # an accelerator that bootstrap/ owns.
 #
 # --- What lives where, and why ----------------------------------------------
@@ -47,41 +47,53 @@
 # even while this environment is torn down) plus a per-GB data transfer premium.
 
 locals {
-  app_ga_enabled = var.app_expose_via_alb && var.app_accelerator_name != ""
+  app_ga_enabled = var.app_expose_via_alb && var.app_accelerator_arn != ""
 }
 
 # The bootstrap-owned accelerator this environment attaches to.
 #
-# Fails the plan with "no matching Global Accelerator Accelerator found" if
-# app_accelerator_name is set but bootstrap/ has not been applied with
-# create_global_accelerator = true -- the same failure mode, deliberately, as an
+# Looked up by ARN, not by name, and the ARN is what feeds the listener below.
+# That is not a style preference -- looking it up by name does not work:
+#
+#   Error: Missing required argument
+#     with aws_globalaccelerator_listener.app[0],
+#     accelerator_arn = var.app_accelerator_arn
+#   The argument "accelerator_arn" is required, but no definition was found.
+#
+# On this data source `arn` is an optional INPUT as well as an attribute, and on
+# the name-lookup path the provider never populates it from the result -- so it
+# reads back null, and a null passed to a required argument is reported as the
+# argument being absent. Everything else populates fine, which is what makes it
+# confusing: the same failed plan computed dns_name and ip_sets correctly.
+#
+# Fails the plan with "no matching Global Accelerator Accelerator found" if the
+# ARN does not exist -- the same failure mode, deliberately, as an
 # unbootstrapped NAT EIP.
 data "aws_globalaccelerator_accelerator" "app" {
   count    = local.app_ga_enabled ? 1 : 0
   provider = aws.global_accelerator
 
-  name = var.app_accelerator_name
-}
-
-# AWS's published address ranges for Global Accelerator, referenced by the
-# Ingress so they land in the ALB's managed security group. See the annotation
-# in alb_ingress.tf for why it is there.
-#
-# Looked up by name rather than hardcoded: the ranges change. If this ever
-# fails with "no managed prefix list found", the name has been changed by AWS
-# -- find the current one with:
-#
-#   aws ec2 describe-managed-prefix-lists --region us-east-1 \
-#     --filters Name=owner-id,Values=AWS \
-#     --query "PrefixLists[?contains(PrefixListName,'globalaccelerator')]"
-data "aws_ec2_managed_prefix_list" "global_accelerator" {
-  count = local.app_ga_enabled ? 1 : 0
-  name  = "com.amazonaws.global.globalaccelerator"
+  arn = var.app_accelerator_arn
 }
 
 # Both of these carry the aliased provider for the same reason the data source
 # above does: Global Accelerator's control plane is reachable only through the
 # us-west-2 endpoint, whatever region the endpoints live in.
+#
+# --- Removed: the ALB security group prefix list ----------------------------
+#
+# An earlier revision added AWS's "com.amazonaws.global.globalaccelerator"
+# managed prefix list to the ALB's security group. There is no such prefix list.
+# AWS publishes managed prefix lists for CloudFront, DynamoDB, EC2 Instance
+# Connect, Ground Station, Route 53 health checks, S3, S3 Express, Secrets
+# Manager and VPC Lattice -- and nothing for Global Accelerator. The plan failed
+# with "no matching EC2 Managed Prefix List found".
+#
+# Nothing is needed in its place. With client_ip_preservation_enabled below, the
+# ALB sees the CLIENT's address, so app_lb_allowed_cidrs is what admits traffic,
+# exactly as it did before the accelerator existed. And Global Accelerator does
+# not health-probe an ALB endpoint itself -- it inherits the load balancer's own
+# target health -- so there is no accelerator-sourced traffic to permit either.
 resource "aws_globalaccelerator_listener" "app" {
   count    = local.app_ga_enabled ? 1 : 0
   provider = aws.global_accelerator

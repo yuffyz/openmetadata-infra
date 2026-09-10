@@ -757,7 +757,7 @@ jobs:
           R="${{ vars.AWS_REGION }}"
 
           echo "::group::Declared in $TFVARS_FILE"
-          grep -nE '^[[:space:]]*(app_expose_via_alb|app_accelerator_name|app_lb_scheme|app_lb_allowed_cidrs|app_tls_domain_name|app_tls_route53_zone_name|app_tls_certificate_arn)' \
+          grep -nE '^[[:space:]]*(app_expose_via_alb|app_accelerator_arn|app_lb_scheme|app_lb_allowed_cidrs|app_tls_domain_name|app_tls_route53_zone_name|app_tls_certificate_arn)' \
             "$TFVARS_FILE" || echo "(no exposure variables set -- UI is ClusterIP + port-forward only)"
           echo "::endgroup::"
 
@@ -868,21 +868,24 @@ jobs:
           # and reads as "no accelerator".
           echo "::group::Global Accelerator"
           # The accelerator is owned by bootstrap/, not by this environment, so
-          # its name comes from the tfvars rather than from the cluster name.
-          GA_NAME=$(grep -E '^[[:space:]]*app_accelerator_name' "$TFVARS_FILE" | head -1 | cut -d'"' -f2)
-          if [ -z "$GA_NAME" ]; then
-            echo "(app_accelerator_name is unset -- no accelerator in front of this environment)"
-            ACCS=""
+          # it is identified from the tfvars rather than from the cluster name.
+          # By ARN, matching what the environment stack itself consumes -- a
+          # name lookup leaves the data source's `arn` null and breaks the
+          # listener, so the tfvars carries the ARN.
+          ACCS=$(grep -E '^[[:space:]]*app_accelerator_arn' "$TFVARS_FILE" | head -1 | cut -d'"' -f2)
+          if [ -z "$ACCS" ]; then
+            echo "(app_accelerator_arn is unset -- no accelerator in front of this environment)"
           else
-            echo "accelerator name from $TFVARS_FILE: $GA_NAME"
-            ACCS=$(aws globalaccelerator list-accelerators --region us-west-2 \
-                     --query "Accelerators[?Name=='${GA_NAME}'].AcceleratorArn" \
-                     --output text 2>/dev/null)
-          fi
-          if [ -n "$GA_NAME" ] && { [ -z "$ACCS" ] || [ "$ACCS" = "None" ]; }; then
-            echo "NOT FOUND: no accelerator named $GA_NAME."
-            echo "bootstrap/ has probably not been applied with create_global_accelerator = true,"
-            echo "in which case the environment plan fails the same way."
+            echo "accelerator ARN from $TFVARS_FILE: $ACCS"
+            if ! aws globalaccelerator describe-accelerator --region us-west-2 \
+                   --accelerator-arn "$ACCS" >/dev/null 2>&1; then
+              echo "NOT FOUND: that ARN does not resolve."
+              echo "bootstrap/ has probably not been applied with create_global_accelerator = true,"
+              echo "or the ARN is stale -- the environment plan fails the same way. Current ARNs:"
+              aws globalaccelerator list-accelerators --region us-west-2 \
+                --query 'Accelerators[].{Name:Name,Arn:AcceleratorArn}' --output table 2>/dev/null || true
+              ACCS=""
+            fi
           fi
           for a in $ACCS; do
             aws globalaccelerator describe-accelerator --region us-west-2 --accelerator-arn "$a" \

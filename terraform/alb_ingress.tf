@@ -132,25 +132,6 @@ resource "kubernetes_ingress_v1" "app_public" {
       local.app_tls_enabled ? {
         "alb.ingress.kubernetes.io/certificate-arn" = local.app_cert_arn
         "alb.ingress.kubernetes.io/ssl-policy"      = "ELBSecurityPolicy-TLS13-1-2-2021-06"
-      } : {},
-
-      # Global Accelerator's published address ranges, added to the same
-      # managed security group as inbound-cidrs.
-      #
-      # Whether this is strictly required depends on the client IP
-      # preservation mode of the endpoint group (global_accelerator.tf sets it
-      # true, so client addresses arrive intact and inbound-cidrs is what
-      # admits them). It is here because it is additive and safe -- an
-      # accelerator can only target endpoints in its own account, so
-      # permitting these ranges does not widen access to anyone else -- and
-      # because getting it wrong presents as the same silent SYN black-hole we
-      # already spent a day on.
-      #
-      # > Verify with a real connection through the accelerator after the
-      # > first apply. If it works, consider dropping this to keep the group
-      # > tight.
-      local.app_ga_enabled ? {
-        "alb.ingress.kubernetes.io/security-group-prefix-lists" = one(data.aws_ec2_managed_prefix_list.global_accelerator[*].id)
       } : {}
     )
   }

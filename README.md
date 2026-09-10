@@ -246,7 +246,14 @@ rm backend.tf
 ### 2. Create the accelerator
 
 Actions → **openmetadata-bootstrap** → `action=plan`, tick `global_accelerator`
-**and everything already provisioned**.
+**and everything already provisioned**, and set `accelerator_environments` to
+just the environments that need one (`dev`).
+
+> `accelerator_environments` exists because the first run of this created one
+> accelerator per entry in `environment_names` — including production, which
+> configures no UI exposure, so its two addresses were never published and
+> nothing could resolve to them. That was ~$18/month for an unreferenced
+> resource. Leaving the input empty restores that behaviour, so keep it set.
 
 > The selection is the whole desired state, not a delta. Anything unticked is
 > passed as `create_* = false` and plans as a *delete*. For this account that
@@ -260,26 +267,44 @@ Actions → **openmetadata-bootstrap** → `action=plan`, tick `global_accelerat
 Then re-run with `action=apply`. The run summary prints the accelerator name and
 its two static IPs.
 
-### 3. Point the environment at it
+### 3. Point the environment at it — with the ARN
 
 ```hcl
 # config/dev.auto.tfvars
-app_accelerator_name = "openmetadata-dev"    # from `terraform output accelerator_names`
+app_accelerator_arn = "arn:aws:globalaccelerator::123456789012:accelerator/<uuid>"
 ```
 
-Already set for dev. A name with no matching accelerator fails the plan with
-*"no matching Global Accelerator Accelerator found"* rather than creating one.
+Get it from the bootstrap run:
+
+```bash
+cd bootstrap && terraform output accelerator_arns
+
+# or, without a bootstrap checkout
+aws globalaccelerator list-accelerators --region us-west-2 \
+  --query "Accelerators[?Name=='openmetadata-dev'].AcceleratorArn" --output text
+```
+
+**The ARN, not the name.** Looking the accelerator up by name leaves the data
+source's `arn` attribute null — it doubles as an optional input and the provider
+does not populate it on that path — and the listener then fails the plan with
+*"The argument `accelerator_arn` is required, but no definition was found"*,
+which is a confusing thing to read next to an expression that plainly defines
+it. The same failed plan computes `dns_name` and `ip_sets` correctly, so the
+data source itself is fine; only that one attribute is empty.
+
+An ARN that resolves to nothing fails the plan with *"no matching Global
+Accelerator Accelerator found"* rather than creating one. Note the **double
+colon** — Global Accelerator is a global service, so the region field is empty.
 
 ### 4. Apply the environment
 
 Actions → **openmetadata-infra** → `environment=dev`, `action=plan`, then
-`apply`. Expect exactly four things in the plan:
+`apply`. Expect exactly three things in the plan:
 
 | Change | |
 |---|---|
 | `aws_globalaccelerator_listener` | TCP on 443 and 8585, matching the ALB's listeners |
 | `aws_globalaccelerator_endpoint_group` | One endpoint: the ALB, by ARN, with client IP preservation on |
-| Ingress annotation | GA's managed prefix list added to the ALB's security group |
 | `aws_route53_record.app` | Alias flips from the ALB to the accelerator, `evaluate_target_health` → false |
 
 The certificate and the hostname do not change. `dev.example-openmetadata.com` stays
@@ -320,7 +345,7 @@ steering bypass**, which cannot be written against a rotating set of
 
 So while this is on, ask the network team for that bypass against
 `terraform output app_static_ips`. If they decline, or grant it on FQDN instead,
-the accelerator is buying nothing here — comment `app_accelerator_name` out,
+the accelerator is buying nothing here — comment `app_accelerator_arn` out,
 untick `global_accelerator` in the next bootstrap run, and keep the ~$18/month.
 
 It is not a fix for the September 2026 outage (Netskope terminated TLS on the
@@ -329,7 +354,7 @@ endpoint group, one region, one ALB.
 
 ### Turning it off
 
-Comment out `app_accelerator_name` and apply: the listener and endpoint group go,
+Comment out `app_accelerator_arn` and apply: the listener and endpoint group go,
 and the Route 53 alias returns to the ALB by itself. The accelerator survives in
 `bootstrap/`, still billed, until you untick `global_accelerator` there — and
 releasing it means AWS will not hand the same addresses back.

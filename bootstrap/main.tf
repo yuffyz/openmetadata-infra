@@ -287,7 +287,7 @@ resource "aws_iam_role_policy" "state" {
 # exactly the intended resting state.
 #
 # The environment stack finds this by name -- "<prefix>-<environment>" -- via
-# app_accelerator_name. Setting that name without applying this first fails the
+# app_accelerator_arn. Setting that ARN without applying this first fails the
 # plan with "no matching Global Accelerator Accelerator found", which is the
 # same failure mode as an unbootstrapped NAT EIP.
 #
@@ -295,10 +295,27 @@ resource "aws_iam_role_policy" "state" {
 # currently deployed, plus a per-GB data transfer premium when it is. Off by
 # default for that reason.
 # ---------------------------------------------------------------------------
+# Which environments actually get one.
+#
+# This used to be every entry in environment_names, which is how production
+# ended up with an accelerator it had no use for: production configures no UI
+# exposure at all, so the two static addresses were never published anywhere and
+# nothing could have resolved to them -- ~$18/month for an unreferenced
+# resource. The list is explicit now.
+#
+# Empty falls back to environment_names, preserving the original behaviour for
+# anyone who set create_global_accelerator without this.
+locals {
+  global_accelerator_environments = (length(var.global_accelerator_environments) > 0
+    ? var.global_accelerator_environments
+    : var.environment_names
+  )
+}
+
 resource "aws_globalaccelerator_accelerator" "app" {
   provider = aws.global_accelerator
 
-  for_each = var.create_global_accelerator ? toset(var.environment_names) : toset([])
+  for_each = var.create_global_accelerator ? toset(local.global_accelerator_environments) : toset([])
 
   name            = "${var.global_accelerator_name_prefix}-${each.key}"
   ip_address_type = "IPV4"

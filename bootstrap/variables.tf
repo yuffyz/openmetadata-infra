@@ -96,15 +96,26 @@ variable "nat_eip_name_prefix" {
 }
 
 variable "create_global_accelerator" {
-  description = "Create one AWS Global Accelerator per environment, giving that environment's UI two static anycast IPs that survive `terraform destroy`. The environment stack attaches its listener and endpoint group to it (see app_accelerator_name there). Costs ~$18/month each, billed even while the environment is torn down."
+  description = "Create one AWS Global Accelerator per environment, giving that environment's UI two static anycast IPs that survive `terraform destroy`. The environment stack attaches its listener and endpoint group to it (see app_accelerator_arn there). Costs ~$18/month each, billed even while the environment is torn down."
   type        = bool
   default     = false
 }
 
 variable "global_accelerator_name_prefix" {
-  description = "Name prefix for the accelerators. The environment stack looks its accelerator up as \"<prefix>-<environment>\", so this must match app_accelerator_name in the environment stack."
+  description = "Name prefix for the accelerators, which are named \"<prefix>-<environment>\". The name is for recognising them in the console; the environment stack attaches by ARN, so changing this does not break an attachment."
   type        = string
   default     = "openmetadata"
+}
+
+variable "global_accelerator_environments" {
+  description = "Which environments get an accelerator, when create_global_accelerator is true. Empty means every entry in environment_names, which is the old behaviour. Narrow it to avoid paying ~$18/month for an accelerator an environment does not use."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = length(setsubtract(toset(var.global_accelerator_environments), toset(var.environment_names))) == 0
+    error_message = "global_accelerator_environments must be a subset of environment_names -- an accelerator is named \"<prefix>-<environment>\", so an environment not listed there has nothing to name one after."
+  }
 }
 
 variable "create_state_bucket" {

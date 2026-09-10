@@ -255,7 +255,7 @@ variable "app_tls_route53_zone_name" {
 # load-balancer-name annotation does not help: it fixes the NAME, while the
 # hash is per load balancer.
 #
-# app_accelerator_name addresses the same problem differently, and more
+# app_accelerator_arn addresses the same problem differently, and more
 # expensively. If both are on, this record points at the accelerator
 # rather than the ALB -- see the target locals in alb_tls.tf.
 #
@@ -270,7 +270,7 @@ variable "app_tls_route53_zone_name" {
 # unaffected: the client still sends the external name in SNI and the ALB still
 # serves the certificate for that name, so the extra hop is invisible to it.
 variable "app_dns_alias_name" {
-  description = "FQDN inside app_tls_route53_zone_name that Terraform keeps pointed at the current front door -- the accelerator when app_accelerator_name is set, otherwise the ALB -- giving external DNS a target that survives load balancer replacement. Empty disables it."
+  description = "FQDN inside app_tls_route53_zone_name that Terraform keeps pointed at the current front door -- the accelerator when app_accelerator_arn is set, otherwise the ALB -- giving external DNS a target that survives load balancer replacement. Empty disables it."
   type        = string
   default     = ""
 
@@ -314,7 +314,7 @@ variable "app_dns_alias_name" {
 # Setting this skips certificate issuance, DNS validation and the Route 53 alias
 # record entirely. Creating the DNS record is then yours: a CNAME from your FQDN
 # to the load balancer's *.elb.amazonaws.com name, or -- with
-# app_accelerator_name set -- an A record to the accelerator's two
+# app_accelerator_arn set -- an A record to the accelerator's two
 # static addresses, which is the pair `terraform output app_static_ips`
 # reports. Prefer a CNAME for the bare-ALB case: an ALB's addresses are not
 # stable at all, so an A record to one of them breaks without warning.
@@ -340,7 +340,7 @@ variable "app_tls_certificate_arn" {
 # The private subnets already carry kubernetes.io/role/internal-elb, so the
 # controller can place an internal load balancer without further tagging.
 #
-# internal is incompatible with app_accelerator_name, which names an
+# internal is incompatible with app_accelerator_arn, which names an
 # internet-facing service that cannot front a private load balancer -- see the
 # validation on that variable.
 #
@@ -371,20 +371,30 @@ variable "app_lb_scheme" {
 # the addresses have to outlive `terraform destroy` in an environment built for
 # cheap teardown; created here, a rebuild would hand out a new pair and the
 # external DNS record would be stale again. This variable names the
-# bootstrap-owned accelerator to attach to, exactly as stable_nat_eip_name names
+# bootstrap-owned accelerator to attach to, much as stable_nat_eip_name names
 # the bootstrap-owned NAT address.
 #
 # > ⚠️ Roughly $18/month for the accelerator plus a per-GB data transfer
 # > premium. The accelerator is billed by bootstrap/ whether or not this
 # > environment is currently deployed.
-variable "app_accelerator_name" {
-  description = "Name of a bootstrap-owned AWS Global Accelerator to put in front of the ALB, giving two static anycast IPs that survive this environment being destroyed. Apply bootstrap/ with create_global_accelerator = true first; the name is \"<global_accelerator_name_prefix>-<environment>\". Empty disables it. Requires app_expose_via_alb and an internet-facing scheme."
+variable "app_accelerator_arn" {
+  description = "ARN of a bootstrap-owned AWS Global Accelerator to put in front of the ALB, giving two static anycast IPs that survive this environment being destroyed. Apply bootstrap/ with create_global_accelerator = true first, then take the ARN from `terraform output accelerator_arns` there. Empty disables it. Requires app_expose_via_alb and an internet-facing scheme."
   type        = string
   default     = ""
 
+  # The ARN, not the name, because the name does not work: on
+  # data.aws_globalaccelerator_accelerator the `arn` attribute is also an
+  # optional input, and the provider leaves it null on the name-lookup path --
+  # which surfaces as "accelerator_arn is required, but no definition was found"
+  # on the listener. See the comment in global_accelerator.tf.
   validation {
-    condition     = var.app_accelerator_name == "" || var.app_expose_via_alb
-    error_message = "app_accelerator_name requires app_expose_via_alb = true -- there is no load balancer for the accelerator to forward to otherwise."
+    condition     = var.app_accelerator_arn == "" || can(regex("^arn:aws[a-z-]*:globalaccelerator::[0-9]{12}:accelerator/", var.app_accelerator_arn))
+    error_message = "app_accelerator_arn must be a Global Accelerator ARN, e.g. arn:aws:globalaccelerator::123456789012:accelerator/1234abcd-... Note the DOUBLE colon: Global Accelerator is a global service, so the region field is empty."
+  }
+
+  validation {
+    condition     = var.app_accelerator_arn == "" || var.app_expose_via_alb
+    error_message = "app_accelerator_arn requires app_expose_via_alb = true -- there is no load balancer for the accelerator to forward to otherwise."
   }
 
   # Global Accelerator is an internet-facing service: its endpoints must be
@@ -392,8 +402,8 @@ variable "app_accelerator_name" {
   # because the alternative is an AccessDeniedException several minutes into an
   # apply, naming the endpoint group rather than the scheme that caused it.
   validation {
-    condition     = var.app_accelerator_name == "" || var.app_lb_scheme == "internet-facing"
-    error_message = "app_accelerator_name requires app_lb_scheme = \"internet-facing\" -- an accelerator cannot forward to an internal load balancer."
+    condition     = var.app_accelerator_arn == "" || var.app_lb_scheme == "internet-facing"
+    error_message = "app_accelerator_arn requires app_lb_scheme = \"internet-facing\" -- an accelerator cannot forward to an internal load balancer."
   }
 }
 

@@ -612,7 +612,7 @@ version.
 | Variable | Default | Purpose |
 |---|---|---|
 | `app_expose_via_alb` | `false` | Install the LB Controller and create the Ingress that becomes the ALB |
-| `app_accelerator_name` | `""` | Name of a bootstrap-owned accelerator to front the ALB (~$18/mo + DT premium). Off in dev |
+| `app_accelerator_arn` | `""` | ARN of a bootstrap-owned accelerator to front the ALB (~$18/mo + DT premium) |
 | `app_lb_allowed_cidrs` | `[]` | CIDRs allowed to reach the NLB. **Required** when the toggle is on |
 | `app_tls_domain_name` | `""` | FQDN to serve over HTTPS. Empty leaves the NLB on plain HTTP |
 | `app_tls_route53_zone_name` | `""` | Public Route 53 zone owning that FQDN. Required with the above **unless** `app_tls_certificate_arn` is set |
@@ -656,7 +656,7 @@ say so.
 
 ### Global Accelerator
 
-`app_accelerator_name` puts two static anycast IPv4 addresses in front of the
+`app_accelerator_arn` puts two static anycast IPv4 addresses in front of the
 ALB.
 
 > **On in dev since 2026-09-10**, after the ALB had been verified on its own.
@@ -674,10 +674,9 @@ The accelerator is split across two states, deliberately:
 | Where | Resource | Purpose |
 |---|---|---|
 | `bootstrap/` | `aws_globalaccelerator_accelerator` | The two static addresses and a stable hostname |
-| `terraform/` | `data.aws_globalaccelerator_accelerator` | Finds it by name |
+| `terraform/` | `data.aws_globalaccelerator_accelerator` | Finds it by **ARN** — see below |
 | `terraform/` | `aws_globalaccelerator_listener` | TCP, on the same ports the ALB listens on |
 | `terraform/` | `aws_globalaccelerator_endpoint_group` | One region, one endpoint: the ALB, by ARN |
-| `terraform/` | `data.aws_ec2_managed_prefix_list` | GA's published ranges, added to the ALB's security group |
 
 The accelerator is in `bootstrap/` because the addresses have to outlive
 `terraform destroy` — the same reason the NAT EIPs are there. The listener and
@@ -688,9 +687,39 @@ environment down removes those two and leaves the accelerator holding its
 addresses with nothing behind it, which is the intended resting state.
 
 Apply `bootstrap/` with `create_global_accelerator = true` first. Setting
-`app_accelerator_name` without it fails the plan with "no matching Global
+`app_accelerator_arn` without it fails the plan with "no matching Global
 Accelerator Accelerator found" — the same failure mode as an unbootstrapped NAT
 EIP.
+
+**Two bugs were fixed here on 2026-09-10, both worth knowing:**
+
+*The accelerator is identified by ARN, not name.* On
+`data.aws_globalaccelerator_accelerator` the `arn` attribute doubles as an
+optional input, and on the name-lookup path the provider never populates it from
+the result. It reads back null, and a null in a required argument is reported as
+the argument being missing:
+
+```
+Error: Missing required argument
+  with aws_globalaccelerator_listener.app[0],
+  accelerator_arn = data.aws_globalaccelerator_accelerator.app[0].arn
+The argument "accelerator_arn" is required, but no definition was found.
+```
+
+Confusingly, the same plan computed `dns_name` and `ip_sets` correctly — the
+data source works, only that one attribute is empty. Hence `app_accelerator_arn`
+and the `accelerator_arns` output in `bootstrap/`.
+
+*There is no Global Accelerator managed prefix list.* An earlier revision added
+`com.amazonaws.global.globalaccelerator` to the ALB's security group; the plan
+failed with "no matching EC2 Managed Prefix List found". AWS publishes managed
+prefix lists for CloudFront, DynamoDB, EC2 Instance Connect, Ground Station,
+Route 53 health checks, S3, S3 Express, Secrets Manager and VPC Lattice —
+nothing for Global Accelerator. Nothing is needed in its place: with client IP
+preservation on, the ALB sees the client's address and `app_lb_allowed_cidrs`
+admits it exactly as before, and GA does not health-probe an ALB endpoint (it
+inherits the load balancer's target health), so there is no
+accelerator-sourced traffic to permit either.
 
 What it was for — and note this justification has since **expired**. Route 53
 now publishes the user-facing record from a zone this account owns and repoints

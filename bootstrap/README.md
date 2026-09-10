@@ -104,9 +104,15 @@ aws iam create-service-linked-role \
 ## Global Accelerator (optional)
 
 `create_global_accelerator = true` allocates one AWS Global Accelerator per
-entry in `environment_names`, named `<global_accelerator_name_prefix>-<env>`.
-Each holds two static anycast IPv4 addresses that sit in front of that
-environment's ALB.
+entry in **`global_accelerator_environments`**, named
+`<global_accelerator_name_prefix>-<env>`. Each holds two static anycast IPv4
+addresses that sit in front of that environment's ALB.
+
+`global_accelerator_environments` defaults to empty, which means *every* entry
+in `environment_names` — and that is how production ended up with an
+accelerator it had no use for. Production configures no UI exposure at all, so
+its two addresses were never published anywhere and nothing could resolve to
+them: ~$18/month for an unreferenced resource. Set the list explicitly.
 
 It is here, rather than in the environment stack, for the same reason as the NAT
 EIPs: the addresses have to outlive `terraform destroy`. The environment's UI is
@@ -117,20 +123,35 @@ survive the dev teardown loop and the external DNS record is written once.
 
 Only the accelerator lives here. Its listener and endpoint group belong to the
 environment stack (`terraform/global_accelerator.tf`), which finds this by name
-through `app_accelerator_name`. Destroying an environment removes those two and
+through `app_accelerator_arn`. Destroying an environment removes those two and
 leaves the accelerator holding its addresses with nothing behind it — the
 intended resting state.
 
 ```bash
-terraform apply -var create_global_accelerator=true
-terraform output accelerator_names        # -> set as app_accelerator_name
+terraform apply -var create_global_accelerator=true \
+                -var 'global_accelerator_environments=["dev"]'
+terraform output accelerator_arns         # -> set as app_accelerator_arn
+terraform output accelerator_names        # console-friendly labels
 terraform output accelerator_static_ips   # -> the pair to publish in DNS
 ```
+
+From the workflow, the equivalent is the `accelerator_environments` input
+(comma separated, `dev` by default).
+
+### Removing one
+
+Drop the environment from `accelerator_environments` and re-run. The plan will
+show `aws_globalaccelerator_accelerator.app["<env>"]` being destroyed, so the
+destroy guard blocks it until you also set `allow_destroy` to `destroy` — which
+is the intended friction: **releasing an accelerator releases its addresses
+permanently**, and AWS will not hand the same pair back. Check nothing has
+published them first. Deletion takes a few minutes: Global Accelerator must be
+disabled before it can be removed, and the provider does that for you.
 
 Then in the environment's tfvars:
 
 ```hcl
-app_accelerator_name = "openmetadata-dev"
+app_accelerator_arn = "arn:aws:globalaccelerator::<account>:accelerator/<uuid>"
 ```
 
 > ⚠️ ~$18/month per accelerator, billed whether or not that environment is
@@ -150,7 +171,7 @@ mean finding the machine that first applied it.
 | `state_bucket` | The Terraform state bucket |
 | `opensearch_service_linked_role` | `AWSServiceRoleForAmazonOpenSearchService` |
 | `nat_eips` | Stable NAT egress EIPs, one per environment |
-| `global_accelerator` | One accelerator per environment, holding the static IPs |
+| `global_accelerator` | An accelerator per environment in `accelerator_environments`, holding the static IPs |
 
 `plan` is ungated. `apply` runs in the **bootstrap** GitHub Environment — it is
 created automatically with no protection rules, so add reviewers under
