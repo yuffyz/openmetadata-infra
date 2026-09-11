@@ -1,0 +1,57 @@
+// Rewrites the vendor name out of the browser tab title.
+//
+// OpenMetadata has no setting for this. Settings -> Preferences -> Appearance
+// customises the logo, monogram, favicon and theme colours, and stops there:
+// the document title is built client-side by the SPA as "<route> | OpenMetadata"
+// and rewritten on every navigation. So a static edit to index.html's <title>
+// would survive exactly until the first route change.
+//
+// Hence a MutationObserver. It is injected into the served HTML by the nginx
+// sub_filter in ui_branding.tf, which means nothing about the OpenMetadata
+// image, chart or database is modified and an upgrade cannot undo it.
+(function () {
+  var FROM = "OpenMetadata";
+  var TO = "${display_name}";
+
+  // Guard against a replacement that contains the search term: the rewrite
+  // below would then never reach a fixed point and the observer would spin.
+  if (!TO || TO.indexOf(FROM) !== -1) {
+    return;
+  }
+
+  function rewrite() {
+    var current = document.title;
+    if (current && current.indexOf(FROM) !== -1) {
+      // Assigning document.title re-triggers the observer, but the new value no
+      // longer contains FROM, so the next pass is a no-op. That is what
+      // terminates the loop.
+      document.title = current.split(FROM).join(TO);
+    }
+  }
+
+  var watched = null;
+
+  function watch() {
+    var el = document.querySelector("title");
+    if (el && el !== watched) {
+      watched = el;
+      new MutationObserver(rewrite).observe(el, {
+        childList: true,
+        characterData: true,
+        subtree: true,
+      });
+    }
+    rewrite();
+  }
+
+  watch();
+
+  // Some navigations replace the <title> ELEMENT rather than editing its text,
+  // which silently detaches the observer above -- hence a second observer on
+  // <head> that re-attaches it.
+  new MutationObserver(watch).observe(document.head || document.documentElement, {
+    childList: true,
+  });
+
+  document.addEventListener("DOMContentLoaded", watch);
+})();

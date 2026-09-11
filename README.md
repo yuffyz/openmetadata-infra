@@ -66,6 +66,7 @@ openmetadata-infra/                     # repo root
 │  ├─ core_addons.tf                # vpc-cni / kube-proxy / coredns EKS addons
 │  ├─ lb_controller.tf              # AWS Load Balancer Controller + IRSA (toggled)
 │  ├─ alb_ingress.tf                # Ingress -> internet-facing ALB for the UI (toggled)
+│  ├─ ui_branding.tf                # rewrites the browser tab title (toggled)
 │  ├─ alb_tls.tf                    # ACM cert + Route 53 alias for HTTPS (toggled)
 │  └─ global_accelerator.tf         # GA listener + endpoint group (accelerator lives in bootstrap/)
 ├─ backend.tf                        # S3 backend block (values via -backend-config)
@@ -214,6 +215,52 @@ openmetadata.corp.example.com.  CNAME  openmetadata.example.com.
 ```
 
 `terraform output app_dns_alias_fqdn` prints the name to point at.
+
+## Renaming the UI in the browser tab
+
+```hcl
+# config/dev.auto.tfvars
+app_display_name = "Example Catalog"
+```
+
+Page titles become `databaseServices | Example Catalog` instead of
+`databaseServices | OpenMetadata`. Clearing the value and applying removes it.
+
+**There is no OpenMetadata setting for this.** Settings → Preferences →
+Appearance customises the logo, monogram, favicon and theme colours and stops
+there. The document title is assembled client-side by the SPA and rewritten on
+every navigation, so editing `index.html` would survive exactly until the first
+route change, and there is no value in the chart, the API or the database that
+reaches it.
+
+So `ui_branding.tf` deploys a small nginx proxy that adds one `<script>` tag to
+the served HTML and passes everything else through untouched. The script is a
+`MutationObserver` on `<title>` — it re-applies on every navigation, and on the
+navigations that replace the `<title>` element rather than editing it.
+
+| | |
+|---|---|
+| Touches the OpenMetadata image | No |
+| Touches chart values or the database | No |
+| Survives an OpenMetadata upgrade | Yes — nothing it changes is owned by the app |
+| Rollback | Clear `app_display_name`, apply |
+
+The chart's own `openmetadata` Service is left exactly as it is — it is the
+cluster-internal address baked into every deployed pipeline's
+`metadataApiEndpoint`. The proxy is a separate Service, `openmetadata-branded`,
+also on 8585, and the Ingress points at whichever of the two is in play. Airflow
+never traverses it.
+
+> ⚠️ **It adds a hop to the request path.** The ALB now health-checks nginx
+> rather than the app. It runs two replicas, and its readiness probe hits a
+> locally-served file so it does not drop out of rotation while OpenMetadata
+> restarts — but it is still one more thing between a browser and the UI, and
+> this stack has spent real time debugging that path. For a cosmetic change,
+> decide deliberately.
+
+This changes the **browser tab only**. The logo, login page and in-app text
+still say OpenMetadata; for those use Appearance, which is supported and stores
+its settings in the database.
 
 ## Enabling Global Accelerator
 

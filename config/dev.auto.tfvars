@@ -84,6 +84,29 @@ app_lb_allowed_cidrs = [
 # > through the module's helm_values, not app_extra_helm_values (which reaches
 # > Helm as --set and retypes strings).
 
+# --- UI branding -------------------------------------------------------------
+# Page titles read "<route> | Example Catalog" instead of
+# "<route> | OpenMetadata" -- so the tab for the database services page shows
+# "databaseServices | Example Catalog".
+#
+# OpenMetadata has no setting for this. Appearance (Settings -> Preferences)
+# covers the logo, monogram, favicon and theme colours and stops there; the
+# title is assembled by the SPA on every navigation, so there is no server-side
+# string to change. Setting this deploys a small nginx proxy that injects a
+# script to rewrite it, and repoints the Ingress at that proxy.
+#
+# > ⚠️ That proxy is then in the path of every UI request, and the ALB
+# > health-checks it rather than the app. It is two replicas with a readiness
+# > probe that does not depend on OpenMetadata being up, but it is still another
+# > hop to debug when the UI is unreachable -- which this stack has spent real
+# > time on. Clear this value and apply to remove it; the Ingress goes straight
+# > back to the chart's Service.
+#
+# It changes the browser tab only. The logo, the login page and the text inside
+# the app still say OpenMetadata -- for those, use Appearance, which is
+# supported and stores its settings in the database.
+app_display_name = "Example Catalog"
+
 # --- Global Accelerator: ENABLED --------------------------------------------
 # Two static anycast IPs in front of the ALB. The accelerator itself is owned by
 # bootstrap/ so the addresses outlive this environment's teardown loop; only the

@@ -407,6 +407,32 @@ variable "app_accelerator_arn" {
   }
 }
 
+# --- UI branding -------------------------------------------------------------
+#
+# OpenMetadata exposes no setting for the browser tab title -- Appearance covers
+# the logo, monogram, favicon and theme colours only, and the title is built by
+# the SPA on every navigation. Setting this deploys a small nginx proxy in front
+# of the UI that injects a script to rewrite it. See ui_branding.tf, including
+# the note about the extra hop that adds to the request path.
+variable "app_display_name" {
+  description = "Name shown in the browser tab in place of \"OpenMetadata\", e.g. \"Example Catalog\". Page titles become \"<route> | <this>\". Empty leaves the UI unbranded and removes the proxy. Requires app_expose_via_alb."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.app_display_name == "" || var.app_expose_via_alb
+    error_message = "app_display_name requires app_expose_via_alb = true -- the branding proxy is only reachable through the Ingress that fronts the UI."
+  }
+
+  # Mirrors the guard inside the injected script, which returns early rather
+  # than rewriting a title into one that still contains the search term and
+  # re-triggering itself. Failing here is better than silently doing nothing.
+  validation {
+    condition     = !strcontains(var.app_display_name, "OpenMetadata")
+    error_message = "app_display_name must not itself contain \"OpenMetadata\" -- the rewrite replaces that string, so a replacement containing it would never settle and the script disables itself."
+  }
+}
+
 variable "lb_controller_chart_version" {
   description = "aws-load-balancer-controller Helm chart version. null tracks the latest release; pin it after the first successful apply (terraform state show 'helm_release.aws_load_balancer_controller[0]' | grep version)."
   type        = string

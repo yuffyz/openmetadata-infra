@@ -149,10 +149,14 @@ resource "kubernetes_ingress_v1" "app_public" {
           path_type = "Prefix"
 
           # The chart's own Service -- ClusterIP, named after the Helm release,
-          # still on 8585. Nothing about it changes; this only reads it.
+          # still on 8585 -- unless app_display_name puts the branding proxy in
+          # front, in which case this points at that instead. Either way the
+          # chart's Service is untouched and stays the cluster-internal address
+          # in every pipeline's metadataApiEndpoint, and the port is 8585, so
+          # switching branding on or off changes only the name here.
           backend {
             service {
-              name = "openmetadata"
+              name = local.app_ingress_service
               port {
                 number = 8585
               }
