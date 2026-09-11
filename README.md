@@ -262,7 +262,8 @@ just the environments that need one (`dev`).
 > created by hand and is not in state) and `nat_eips` off unless
 > `stable_nat_eip_name` is in use. **Read the plan — it is the authority, not
 > this list.** A wrong selection costs a re-run, not an outage: the plan job
-> refuses to produce an appliable plan containing deletions.
+> refuses to produce an appliable plan containing deletions unless
+> `allow_destroy` names each address being deleted.
 
 Then re-run with `action=apply`. The run summary prints the accelerator name and
 its two static IPs.

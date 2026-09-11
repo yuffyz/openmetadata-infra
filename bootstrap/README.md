@@ -140,12 +140,24 @@ From the workflow, the equivalent is the `accelerator_environments` input
 
 ### Removing one
 
-Drop the environment from `accelerator_environments` and re-run. The plan will
-show `aws_globalaccelerator_accelerator.app["<env>"]` being destroyed, so the
-destroy guard blocks it until you also set `allow_destroy` to `destroy` — which
-is the intended friction: **releasing an accelerator releases its addresses
-permanently**, and AWS will not hand the same pair back. Check nothing has
-published them first. Deletion takes a few minutes: Global Accelerator must be
+Drop the environment from `accelerator_environments` and name the address in
+`allow_destroy`. To remove production's:
+
+| Input | Value |
+|---|---|
+| `action` | `plan`, then `apply` |
+| `global_accelerator` | ✅ |
+| `accelerator_environments` | `dev` |
+| `allow_destroy` | `aws_globalaccelerator_accelerator.app["production"]` |
+
+Tick the other services that are already in state as well — leaving one off
+plans it away, and the guard will then refuse the run because the plan deletes
+something `allow_destroy` did not name. That refusal is the feature.
+
+**Releasing an accelerator releases its addresses permanently**; AWS will not
+hand the same pair back. Check nothing has published them first — for production
+nothing has, since it configures no UI exposure at all, which is why its
+accelerator was waste. Deletion takes a few minutes: Global Accelerator must be
 disabled before it can be removed, and the provider does that for you.
 
 Then in the environment's tfvars:

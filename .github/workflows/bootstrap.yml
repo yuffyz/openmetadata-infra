@@ -15,8 +15,19 @@ name: openmetadata-bootstrap
 # Terraform works and hiding it with -target would hide real drift -- but it
 # means you tick everything you want to KEEP, not just the thing you are adding.
 # The guard in the plan job refuses to hand an apply a plan containing deletes
-# unless you type the confirmation, so a mistake here costs a re-run, not an
-# outage.
+# unless you NAME the addresses it may delete in allow_destroy, so a mistake
+# here costs a re-run, not an outage.
+#
+# Removing one service deliberately -- production's accelerator, say -- is
+# therefore two inputs, not a blanket override:
+#
+#   accelerator_environments = dev
+#   allow_destroy            = aws_globalaccelerator_accelerator.app["production"]
+#
+# If the plan then also deletes something you did not name, it still fails.
+# That is the case worth having: forgetting to tick oidc_provider while removing
+# an accelerator would otherwise take the deploy role's identity provider with
+# it, under an approval you thought applied only to the accelerator.
 #
 # STATE MOVED FROM LOCAL TO S3. bootstrap/ was applied by hand with local state
 # ("it's a bootstrap"), which a workflow cannot use -- a runner starts with an
@@ -79,7 +90,7 @@ on:
         default: "dev"
 
       allow_destroy:
-        description: 'Type "destroy" to permit a plan that deletes resources'
+        description: 'Resource addresses this plan may delete, comma separated (or "destroy" for any)'
         type: string
         default: ""
 
@@ -230,6 +241,29 @@ jobs:
       # some of these deletions are not recoverable: releasing an accelerator or
       # an EIP means AWS will not give the same addresses back, and every
       # external DNS record and firewall allowlist pointing at them goes stale.
+      # Refuse to hand an apply a plan that deletes things, unless the operator
+      # named what it may delete.
+      #
+      # The selection model makes an accidental delete easy -- forget to tick
+      # nat_eips and its EIPs are planned away -- and some of these deletions
+      # are not recoverable: releasing an Elastic IP or a Global Accelerator
+      # means AWS will not hand the same addresses back, and every firewall
+      # allowlist, network policy and DNS record naming them goes stale.
+      #
+      # allow_destroy takes one of three things:
+      #
+      #   (empty)                no deletion is permitted; the plan is refused
+      #   <addresses>            a comma separated list of Terraform resource
+      #                          addresses. The plan may delete EXACTLY those
+      #                          and nothing else -- an unexpected extra
+      #                          deletion still fails. This is the form to use.
+      #   destroy                blanket: any deletion is permitted. A blunt
+      #                          instrument, kept for a genuine teardown.
+      #
+      # The targeted form is the point. "I am removing production's
+      # accelerator" is a different statement from "delete whatever this plan
+      # decided to delete", and only the first one survives a mistake in the
+      # service checkboxes above.
       - name: Guard against destructive plans
         working-directory: ${{ env.TF_DIR }}
         env:
@@ -238,32 +272,61 @@ jobs:
           set -uo pipefail
           terraform show -json tfplan > plan.json
 
-          dels=$(python3 - <<'PY'
-          import json
-          d = json.load(open("plan.json"))
-          for r in d.get("resource_changes", []):
-              acts = r.get("change", {}).get("actions", [])
-              if "delete" in acts:
-                  print(f"  {r['address']}  ({'+'.join(acts)})")
+          python3 - <<'PY'
+          import json, os, sys
+
+          allow = (os.environ.get("ALLOW_DESTROY") or "").strip()
+          plan = json.load(open("plan.json"))
+
+          dels = [
+              (r["address"], "+".join(r.get("change", {}).get("actions", [])))
+              for r in plan.get("resource_changes", [])
+              if "delete" in r.get("change", {}).get("actions", [])
+          ]
+
+          if not dels:
+              print("No deletions in this plan.")
+              sys.exit(0)
+
+          print("This plan DELETES:")
+          for addr, acts in dels:
+              print(f"  {addr}  ({acts})")
+          print()
+
+          if allow == "destroy":
+              print("::warning::Every deletion above permitted by the blanket allow_destroy=destroy.")
+              sys.exit(0)
+
+          if allow:
+              named = {a.strip() for a in allow.split(",") if a.strip()}
+              planned = {addr for addr, _ in dels}
+              unexpected = sorted(planned - named)
+              missing = sorted(named - planned)
+
+              if unexpected:
+                  print("::error::allow_destroy named specific addresses, but this plan ALSO deletes: "
+                        + "; ".join(unexpected)
+                        + ". That is the guard doing its job -- the extra deletions are almost always a"
+                        " service left unticked that should have stayed on, because the selection is the"
+                        " full desired state and not a delta. Fix the checkboxes and re-plan; only widen"
+                        " allow_destroy once the list matches what you actually intend.")
+                  sys.exit(1)
+
+              if missing:
+                  print("::warning::allow_destroy also named addresses this plan does not delete (already"
+                        " gone, or misspelled): " + "; ".join(missing))
+
+              print("::warning::Deletion permitted: every address this plan deletes was named in allow_destroy.")
+              sys.exit(0)
+
+          print('::error::This plan deletes the resources listed above and allow_destroy is empty. If the'
+                ' deletions are unintended -- which is usually a service left unticked that should have'
+                ' stayed on, since the selection is the full desired state and not a delta -- fix the'
+                ' checkboxes and re-plan. If they ARE intended, set allow_destroy to the exact addresses,'
+                ' comma separated, e.g.  aws_globalaccelerator_accelerator.app["production"]  . Releasing'
+                ' an Elastic IP or an accelerator loses those addresses permanently.')
+          sys.exit(1)
           PY
-          )
-
-          if [ -z "$dels" ]; then
-            echo "No deletions in this plan."
-            exit 0
-          fi
-
-          echo "This plan DELETES:"
-          printf '%s\n' "$dels"
-          echo
-
-          if [ "${ALLOW_DESTROY:-}" = "destroy" ]; then
-            echo "::warning::Destructive plan permitted by the allow_destroy confirmation."
-            exit 0
-          fi
-
-          echo "::error::This plan deletes the resources listed above and allow_destroy was not set to \"destroy\". Almost always the cause is a service left unticked that should have stayed on -- the selection is the full desired state, not a delta. Re-run with every service you want to KEEP ticked. If the deletion is genuinely intended, re-run with allow_destroy=destroy, and note that releasing an Elastic IP or a Global Accelerator loses those addresses permanently."
-          exit 1
 
       - name: Save plan
         uses: actions/upload-artifact@v4
