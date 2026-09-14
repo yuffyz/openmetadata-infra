@@ -219,24 +219,30 @@ openmetadata.corp.example.com.  CNAME  openmetadata.example.com.
 / TTL, ready to paste into a ticket. Every apply also renders it into the run
 summary.
 
-**What dev uses is simpler than either of the above: no Route 53 at all.**
-`openmetadata-dev.corp.example.com` is served with an imported `*.corp.example.com` certificate
-and CNAMEs straight to the Global Accelerator:
+**Dev uses the first form.** As of 2026-09-14 it serves
+`dev.example-openmetadata.com` out of `example-openmetadata.com`, a public hosted zone
+this account owns, so Terraform issues the certificate and owns the record:
+
+```hcl
+app_tls_domain_name       = "dev.example-openmetadata.com"
+app_tls_route53_zone_name = "example-openmetadata.com"
+```
 
 ```
-openmetadata-dev.corp.example.com.   CNAME   <accelerator>.awsglobalaccelerator.com.   ← written once, by them
+dev.example-openmetadata.com.   ALIAS   <current ALB>   ← rewritten by every apply
 ```
 
-The accelerator's hostname and addresses are fixed for its lifetime, and it
-lives in `bootstrap/` — outside this environment's teardown loop — so it already
-provides what the Route 53 alias was there to provide. `app_tls_route53_zone_name`
-and `app_dns_alias_name` are both empty as a result; setting either brings the
-hosted zone and the second hop back, which is what you want if the accelerator
-is ever retired.
+This replaced `openmetadata-dev.corp.example.com`, which lived in an internal zone this
+account does not own: every record there was a ticket to another team, and it
+needed a `*.corp.example.com` certificate imported from our own PKI that does not
+auto-renew. `app_tls_certificate_arn` and `app_dns_alias_name` are both empty as
+a result — neither has anything to do in a zone we control, and setting the
+certificate ARN would switch the Route 53 record off. The commented-out ARN in
+`config/dev.auto.tfvars` is the way back if that domain ever returns.
 
-> ⚠️ This makes the accelerator load-bearing for DNS. `app_accelerator_arn` must
-> stay set — turning it off to save the ~$18/month breaks the published record
-> and needs a new ticket to the external team.
+> ⚠️ The hosted zone must exist and be delegated from the registrar. It is
+> looked up with a data source, never created here, and ACM DNS-validates by
+> resolving a record from the public internet.
 
 > ⚠️ Never hand the external team the `*.elb.amazonaws.com` hostname directly.
 > It resolves and it works, so the mistake stays invisible until the load

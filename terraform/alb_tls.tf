@@ -150,18 +150,20 @@ resource "aws_route53_record" "app" {
 #   <external name>.       CNAME  <app_dns_alias_name>.
 #   <app_dns_alias_name>.  ALIAS  <accelerator, or current ALB>.
 #
-# UNUSED IN DEV as of 2026-09-14, and so is every other resource in this file.
-# openmetadata-dev.corp.example.com now points straight at the Global Accelerator, whose
-# hostname and addresses are fixed for the accelerator's life and which lives in
-# bootstrap/, outside this environment's teardown loop. That already gives the
-# external zone a target that does not move, so the Route 53 hop this resource
-# provides would be stabilising something already stable -- at the cost of a
-# hosted zone and an extra resolution step.
+# UNUSED IN DEV as of 2026-09-14 -- but note that the rest of this file is now
+# in use there. Dev serves dev.example-openmetadata.com out of a hosted zone this
+# account owns, so Terraform issues the certificate and owns the record for the
+# served name directly (aws_route53_record.app above). There is no longer an
+# externally-managed name in the chain, and this resource exists only to give
+# one a stable target, so it has nothing to serve.
 #
-# Kept for the case where there is no accelerator to point at: clearing
-# app_accelerator_arn leaves the ALB hostname as the only target, and that one
-# does move. Setting app_tls_route53_zone_name and app_dns_alias_name brings
-# this back.
+# Kept for the case where a domain outside this account comes back: set
+# app_tls_certificate_arn for that name, then app_tls_route53_zone_name and
+# app_dns_alias_name to publish it something to CNAME at.
+#
+# Do NOT set app_dns_alias_name to the same name as app_tls_domain_name while
+# the certificate is managed here. Both records are A aliases in the same zone,
+# and Route 53 rejects the duplicate at apply time.
 #
 # The second hop is rewritten by every apply; the first is written once. That
 # is the whole point -- with no accelerator the front door is owned by the AWS
