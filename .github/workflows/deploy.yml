@@ -162,6 +162,24 @@ jobs:
           static_ips=$(terraform output -json app_static_ips 2>/dev/null \
                          | python3 -c 'import json,sys; print(", ".join(json.load(sys.stdin)))' 2>/dev/null || true)
           publish=$(terraform output -raw app_dns_publish_instruction 2>/dev/null || true)
+          # Rendered as a table so it can be pasted straight into a ticket for
+          # whoever runs the external zone, without anyone having to translate
+          # Terraform output into "name / type / value".
+          dns_table=$(terraform output -json app_dns_record 2>/dev/null | python3 -c '
+          import json, sys
+          try: r = json.load(sys.stdin)
+          except Exception: sys.exit(0)
+          if not r: sys.exit(0)
+          print("| Field | Value |"); print("|---|---|")
+          for k in ("name", "type", "value", "ttl"):
+              print(f"| {k.upper()} | `{r[k]}` |")
+          if not r.get("stable_target", False):
+              print()
+              print("> :warning: " + r.get("note", ""))
+          else:
+              print()
+              print("> " + r.get("note", ""))
+          ' 2>/dev/null || true)
 
           if [ -z "$url" ] && [ "$exposed" = "true" ] && [ -n "$cluster" ]; then
             echo "Waiting for the load balancer controller to provision the ALB..."
@@ -195,7 +213,15 @@ jobs:
               echo "**Static IPs (Global Accelerator):** \`$static_ips\`"
               echo
             fi
-            if [ -n "$publish" ]; then
+            if [ -n "$dns_table" ]; then
+              echo "### DNS record for the externally-managed zone"
+              echo
+              echo "Hand this to the team that runs that zone. It is a one-off:"
+              echo "the target below is managed here and does not change."
+              echo
+              printf '%s\n' "$dns_table"
+              echo
+            elif [ -n "$publish" ]; then
               echo "**DNS to publish:** $publish"
               echo
             fi

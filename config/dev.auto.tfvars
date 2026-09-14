@@ -172,49 +172,71 @@ app_display_name = "Example Catalog"
 # Cost: ~$18/month plus a per-GB data transfer premium, billed by bootstrap/
 # whether or not this environment is currently deployed.
 
-# --- HTTPS and DNS: a public Route 53 zone this account owns -----------------
-# The UI is https://dev.example-openmetadata.com. Terraform owns the whole chain:
-# ACM issues and DNS-validates the certificate, and an A-alias record points at
-# the current front door -- the accelerator, since the section above is on --
-# repointed on every apply.
+# --- HTTPS and DNS: externally-managed domain, straight to the accelerator ----
+# The UI is https://openmetadata-dev.corp.example.com, a name in an internal zone this
+# account does not own. Terraform publishes NO record for it -- that is a
+# request to the team who runs that zone -- and terminates TLS with a
+# certificate imported from our own PKI.
 #
-# This replaced openmetadata-dev.corp.example.com, which lived in an internal zone this
-# account does not own. Terraform could publish nothing there, so every load
-# balancer replacement meant a ticket rather than a command, and the name was
-# served by a *.corp.example.com certificate imported from our own PKI -- which does NOT
-# auto-renew, and which nothing in this stack warned about before expiry.
+# The external record points directly at the Global Accelerator:
 #
-# Moving the name into a zone we control fixes both: ACM issues and renews on
-# its own, and the alias record follows the load balancer with no ticket. The
-# hosted zone costs about $0.50/month.
+#   openmetadata-dev.corp.example.com.  CNAME  <accelerator>.awsglobalaccelerator.com.
 #
+# No Route 53 anywhere in the chain. app_tls_route53_zone_name and
+# app_dns_alias_name are both empty, so this stack creates no hosted zone
+# lookup, no alias record and no ACM validation record.
 #
-# > ⚠️ openmetadata-dev.corp.example.com NO LONGER WORKS. The ALB serves only the
-# > certificate for the name below, so that hostname now fails the TLS handshake
-# > rather than returning a readable error. Withdraw the internal record, and
-# > repoint anyone holding the bookmark.
+# --- Why the Route 53 hop is gone -------------------------------------------
 #
-# The zone must already exist as a PUBLIC hosted zone in this account --
-# Terraform looks it up with a data source and does not create it. ACM proves
-# ownership by publishing a validation record into it, so a private zone, or one
-# held in another account, can never validate.
-app_tls_domain_name       = "dev.example-openmetadata.com"
-app_tls_route53_zone_name = "example-openmetadata.com"
+# It existed to give the external zone something that does not move. The ALB's
+# hostname carries a per-load-balancer hash that AWS reassigns whenever it is
+# recreated, so pointing corp.example.com straight at it meant a ticket after every
+# rebuild; app_dns_alias_name was a Terraform-owned name in a zone we control,
+# repointed on each apply, so the external record was written once.
+#
+# The accelerator does that job already and does it better. Its addresses and
+# hostname are fixed for the life of the accelerator, and the accelerator is
+# owned by bootstrap/ -- outside this environment's teardown loop -- so they
+# survive a full `terraform destroy` and rebuild of dev. Keeping both would mean
+# paying ~$0.50/month for a hosted zone to stabilise something already stable,
+# and adding a resolution hop for nothing.
+#
+# > ⚠️ This makes Global Accelerator load-bearing for DNS, not just for
+# > latency. app_accelerator_arn MUST stay set. Turning the accelerator off --
+# > to save the ~$18/month if the Netskope steering bypass never materialises --
+# > now breaks the published record and needs a new ticket to that team. That
+# > cost decision and a DNS change are the same decision from here on.
+# >
+# > Releasing the accelerator in bootstrap/ does the same thing, permanently:
+# > AWS will not hand the same addresses back.
+app_tls_domain_name = "openmetadata-dev.corp.example.com"
 
-# Both left unset, deliberately.
+# Imported from our own PKI, because ACM cannot issue for this name: it
+# validates by resolving a record from the public internet, and an internal-only
+# name resolves nowhere public. Setting this switches OFF issuance, DNS
+# validation and any record for app_tls_domain_name -- correct here, since that
+# name is not ours to publish.
 #
-# app_tls_certificate_arn imports a certificate for a name that is NOT in Route
-# 53. Setting it switches OFF issuance, validation and the record above, handing
-# DNS back to whoever owns that zone -- the arrangement this environment just
-# moved away from. The import command is on the variable in variables.tf if a
-# future name genuinely cannot move.
+# A *.corp.example.com wildcard, so it matches. Clients send openmetadata-dev.corp.example.com
+# in SNI regardless of what the CNAME resolves to, so neither the accelerator
+# nor the load balancer behind it is visible to the handshake.
 #
-# app_dns_alias_name publishes a second, stable name for an external zone to
-# CNAME at. Redundant here: app_tls_domain_name is already in a zone we own, so
-# Terraform publishes the user-facing record directly.
+# > ⚠️ Imported certificates do NOT auto-renew and nothing here warns before
+# > expiry. Re-import with `--certificate-arn <this ARN>` so the ARN stays
+# > stable and the listener keeps working with no Terraform change.
+app_tls_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/a443aeb2-67db-4105-8c05-b9ca0020e654"
+
+# Route 53 is deliberately not used.
 #
-# app_tls_certificate_arn = ""
-# app_dns_alias_name      = ""
+# Setting either of these brings the hosted zone back: app_tls_route53_zone_name
+# is looked up with a data source (it is never created here), and
+# app_dns_alias_name publishes a stable name inside it for an external zone to
+# CNAME at instead of the accelerator. That is the arrangement this replaced --
+# re-enable both if the accelerator is ever retired and the external record
+# still needs a target that does not move.
+#
+# app_tls_route53_zone_name = "example-openmetadata.com"
+# app_dns_alias_name        = "dev.example-openmetadata.com"
 
 # --- Scheme: internet-facing, deliberately ----------------------------------
 # Left at the default (internet-facing) after trying `internal` and reverting.

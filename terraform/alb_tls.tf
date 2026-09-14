@@ -150,11 +150,18 @@ resource "aws_route53_record" "app" {
 #   <external name>.       CNAME  <app_dns_alias_name>.
 #   <app_dns_alias_name>.  ALIAS  <accelerator, or current ALB>.
 #
-# UNUSED IN DEV since 2026-09-09. The UI moved to dev.example-openmetadata.com, in
-# a public Route 53 zone this account owns, so aws_route53_record.app above IS
-# the user-facing record and there is no external zone left needing a stable
-# target. Kept for a domain that genuinely cannot move -- the previous
-# arrangement, openmetadata-dev.corp.example.com in an internal zone, was exactly that.
+# UNUSED IN DEV as of 2026-09-14, and so is every other resource in this file.
+# openmetadata-dev.corp.example.com now points straight at the Global Accelerator, whose
+# hostname and addresses are fixed for the accelerator's life and which lives in
+# bootstrap/, outside this environment's teardown loop. That already gives the
+# external zone a target that does not move, so the Route 53 hop this resource
+# provides would be stabilising something already stable -- at the cost of a
+# hosted zone and an extra resolution step.
+#
+# Kept for the case where there is no accelerator to point at: clearing
+# app_accelerator_arn leaves the ALB hostname as the only target, and that one
+# does move. Setting app_tls_route53_zone_name and app_dns_alias_name brings
+# this back.
 #
 # The second hop is rewritten by every apply; the first is written once. That
 # is the whole point -- with no accelerator the front door is owned by the AWS

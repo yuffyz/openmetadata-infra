@@ -214,7 +214,34 @@ apply instead, so the record in your internal zone is written once:
 openmetadata.corp.example.com.  CNAME  openmetadata.example.com.
 ```
 
-`terraform output app_dns_alias_fqdn` prints the name to point at.
+`terraform output app_dns_alias_fqdn` prints the name to point at, and
+`terraform output app_dns_record` prints the whole record as name / type / value
+/ TTL, ready to paste into a ticket. Every apply also renders it into the run
+summary.
+
+**What dev uses is simpler than either of the above: no Route 53 at all.**
+`openmetadata-dev.corp.example.com` is served with an imported `*.corp.example.com` certificate
+and CNAMEs straight to the Global Accelerator:
+
+```
+openmetadata-dev.corp.example.com.   CNAME   <accelerator>.awsglobalaccelerator.com.   ← written once, by them
+```
+
+The accelerator's hostname and addresses are fixed for its lifetime, and it
+lives in `bootstrap/` — outside this environment's teardown loop — so it already
+provides what the Route 53 alias was there to provide. `app_tls_route53_zone_name`
+and `app_dns_alias_name` are both empty as a result; setting either brings the
+hosted zone and the second hop back, which is what you want if the accelerator
+is ever retired.
+
+> ⚠️ This makes the accelerator load-bearing for DNS. `app_accelerator_arn` must
+> stay set — turning it off to save the ~$18/month breaks the published record
+> and needs a new ticket to the external team.
+
+> ⚠️ Never hand the external team the `*.elb.amazonaws.com` hostname directly.
+> It resolves and it works, so the mistake stays invisible until the load
+> balancer is recreated — at which point the UI is down and the fix is a ticket,
+> not a command. That is the entire reason for the second hop.
 
 ## Renaming the UI in the browser tab
 

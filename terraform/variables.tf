@@ -237,11 +237,19 @@ variable "app_tls_route53_zone_name" {
   #          var.app_tls_domain_name (validation)
   #
   # Equality is allowed so the name can sit at the zone apex.
+  #
+  # Scoped to the issuance path only (app_tls_certificate_arn empty). With an
+  # IMPORTED certificate the served name deliberately lives in a zone this
+  # account does not own -- openmetadata-dev.corp.example.com -- and this Route 53 zone
+  # is used for nothing but app_dns_alias_name, which carries its own
+  # membership check. Without that exemption, the supported arrangement fails
+  # its own validation.
   validation {
     condition = (var.app_tls_domain_name == "" || var.app_tls_route53_zone_name == ""
+      || var.app_tls_certificate_arn != ""
       || var.app_tls_domain_name == var.app_tls_route53_zone_name
     || endswith(var.app_tls_domain_name, ".${var.app_tls_route53_zone_name}"))
-    error_message = "app_tls_domain_name must be inside app_tls_route53_zone_name, or equal to it: e.g. dev.example.com (or example.com) in zone example.com."
+    error_message = "app_tls_domain_name must be inside app_tls_route53_zone_name, or equal to it, when Terraform issues the certificate: e.g. dev.example.com (or example.com) in zone example.com. A name outside the zone is only valid with app_tls_certificate_arn set."
   }
 }
 

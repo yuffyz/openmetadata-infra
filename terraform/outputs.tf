@@ -81,10 +81,60 @@ output "app_dns_publish_instruction" {
     : local.app_cert_managed
     ? "Nothing to do -- Terraform owns ${var.app_tls_domain_name} in Route 53."
     : local.app_dns_alias_managed
-    ? "CNAME ${var.app_tls_domain_name} -> ${var.app_dns_alias_name} (written once; Terraform repoints the second hop)"
+    ? "CNAME ${var.app_tls_domain_name} -> ${var.app_dns_alias_name}  (TTL 300). Written once: Terraform repoints the second hop on every apply. Full record in `terraform output app_dns_record`."
     : local.app_ga_enabled
-    ? "A record ${var.app_tls_domain_name} -> the two addresses in app_static_ips (owned by bootstrap/, so this is written once)"
+    ? "CNAME ${var.app_tls_domain_name} -> ${one(data.aws_globalaccelerator_accelerator.app[*].dns_name)}  (TTL 300). Written once: the accelerator is owned by bootstrap/ and outlives this environment. An A record to app_static_ips works too. Full record in `terraform output app_dns_record`."
     : "CNAME ${var.app_tls_domain_name} -> the hostname from: kubectl get ingress -n ${local.namespace} openmetadata-public -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' (changes whenever the ALB is replaced)"
+  )
+}
+
+# The record to hand to whoever runs the external zone, as fields rather than
+# prose -- because what gets pasted into a ticket should not need interpreting,
+# and because a DNS team that does not know this system will otherwise ask three
+# follow-up questions.
+#
+# `stable_target = true` is the claim that matters to them: this value will not
+# change again, so they are being asked for a one-off, not a standing
+# commitment. It is false only in the degenerate case where app_dns_alias_name
+# was left unset and the record would have to point straight at a load balancer
+# hostname that moves -- which is worth refusing to hand over at all.
+output "app_dns_record" {
+  description = "The exact DNS record the externally-managed zone must publish for app_tls_domain_name: name, type, value, TTL. Empty when nothing needs handing over -- either the UI is not exposed, or Terraform owns the record itself."
+  value = (!var.app_expose_via_alb || local.app_cert_managed
+    ? {}
+    : local.app_dns_alias_managed
+    ? {
+      name          = var.app_tls_domain_name
+      type          = "CNAME"
+      value         = var.app_dns_alias_name
+      ttl           = 300
+      stable_target = true
+      note          = "Terraform repoints ${var.app_dns_alias_name} at the current front door on every apply, so this record is written once and never revisited."
+    }
+
+    # The accelerator's own hostname, in preference to its two addresses: one
+    # value to transcribe instead of two, and it keeps working if AWS ever
+    # changes how an accelerator's addresses are presented. The addresses are in
+    # app_static_ips for a zone that would rather pin an A record, and for the
+    # network team's proxy bypass, which needs literal addresses either way.
+    : local.app_ga_enabled
+    ? {
+      name          = var.app_tls_domain_name
+      type          = "CNAME"
+      value         = one(data.aws_globalaccelerator_accelerator.app[*].dns_name)
+      ttl           = 300
+      stable_target = true
+      note          = "Fixed for the life of the accelerator, which is owned by bootstrap/ and therefore survives this environment being destroyed and rebuilt -- so this record is written once. Alternative if an A record is preferred: ${join(", ", try(one(data.aws_globalaccelerator_accelerator.app[*].ip_sets[0].ip_addresses), []))}. Both break only if the accelerator itself is released."
+    }
+
+    : {
+      name          = var.app_tls_domain_name
+      type          = "CNAME"
+      value         = one(data.aws_lb.app[*].dns_name)
+      ttl           = 300
+      stable_target = false
+      note          = "UNSTABLE -- do not hand this over. It points straight at the load balancer, whose hostname carries a per-load-balancer hash that AWS reassigns whenever it is recreated, so the record goes dead on the next rebuild. Give the external zone something that does not move first: set app_accelerator_arn (the accelerator's hostname, no Route 53 needed) or app_dns_alias_name (a Terraform-managed Route 53 name)."
+    }
   )
 }
 
