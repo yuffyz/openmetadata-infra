@@ -12,7 +12,6 @@ variable "github_org" {
 variable "github_repo" {
   description = "Repository name (the repo hosting the workflows — NOT the project subfolder)."
   type        = string
-  default     = "your-repo"
 }
 
 variable "github_org_id" {
