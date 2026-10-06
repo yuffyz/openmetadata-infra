@@ -40,9 +40,10 @@ on:
           - restart-server           # rollout restart of the OpenMetadata deployment
           - diagnose-and-restart     # diagnose, restart, then diagnose again
           - test-search-write        # probe WRITE auth: creates and deletes a throwaway index
-          - reset-opensearch-password  # MUTATES: set the domain master password to the secret's value
-          - rotate-opensearch-password # MUTATES: new password on BOTH domain and secret, then restart
+          - reset-opensearch-password  # MUTATES: verified bounce of the domain password back to the secret's; restarts a stale server
+          - rotate-opensearch-password # MUTATES: new password on BOTH domain and secret, then restart (prefer reset)
           - reduce-replicas          # MUTATES (dev only): number_of_replicas = 0 on non-system indices
+          - set-shard-template       # MUTATES: index template, 1 primary shard for OpenMetadata indices
           - show-exposure            # read-only: how the UI is published (LB, listeners, cert, DNS, SG)
         default: diagnose
 
@@ -460,77 +461,34 @@ jobs:
           echo "  active_shards far above ~25 per GiB of node heap    -> shard pressure; reduce-replicas helps in dev"
 
       # Re-points the domain's FGAC master user at the password already held in
-      # the opensearch-credentials secret.
+      # the opensearch-credentials secret -- which is Terraform's value -- and
+      # restarts the server if it holds an older one.
       #
       # Why this drifts: modules/opensearch/main.tf generates the password with
       # random_password and writes it to BOTH the domain and the Kubernetes
       # secret. AWS never returns master_user_password, so Terraform cannot
       # detect that the domain's copy no longer matches -- a plan is clean while
-      # every search request is rejected with 401. The server and the secret
-      # agree with each other; only the domain disagrees.
+      # every search request is rejected with 401.
       #
-      # Sends the password via --cli-input-json rather than the shorthand
-      # --advanced-security-options syntax, which splits on commas and equals
-      # signs and would corrupt some passwords.
+      # Sending the secret's value straight to the domain used to be what this
+      # did, and AWS frequently accepted it and applied nothing. It now runs
+      # scripts/opensearch-credentials.sh heal, which "bounces" the password:
+      # a throwaway value first, then the secret's value, asserting that
+      # UpdateVersion moves both times, and re-probes afterwards. It only acts
+      # if it finds a 401 or a stale pod. deploy.yml runs the same script after
+      # every apply, so this action is for drift between applies.
       - name: Reset the OpenSearch master password to match the secret
         if: ${{ github.event.inputs.action == 'reset-opensearch-password' }}
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           if [ -z "${OS_DOMAIN:-}" ]; then
             echo "::error::This environment has no AWS OpenSearch domain (in-cluster via the deps chart)"
             exit 1
           fi
-
-          PW=$(kubectl get secret -n "$NAMESPACE" opensearch-credentials \
-                 -o jsonpath='{.data.password}' | base64 -d)
-          [ -n "$PW" ] || { echo "::error::opensearch-credentials secret is empty"; exit 1; }
-          # Keep it out of the log even if a command below echoes it.
-          echo "::add-mask::$PW"
-
-          # Username from the pod, with the literal quotes stripped (the chart
-          # double-quotes these values -- see the Probe step).
-          OS_USER=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- \
-                      sh -c 'printf %s "${ELASTICSEARCH_USER:-admin}"' 2>/dev/null \
-                    | tr -d '\r"' )
-          OS_USER=${OS_USER:-admin}
-          echo "Resetting master user '$OS_USER' on domain '$OS_DOMAIN'"
-
-          umask 077
-          CFG=$(mktemp)
-          trap 'rm -f "$CFG"' EXIT
-          OS_DOMAIN="$OS_DOMAIN" OS_USER="$OS_USER" PW="$PW" python3 - > "$CFG" <<'PY'
-          import json, os
-          print(json.dumps({
-              "DomainName": os.environ["OS_DOMAIN"],
-              "AdvancedSecurityOptions": {
-                  "Enabled": True,
-                  "InternalUserDatabaseEnabled": True,
-                  "MasterUserOptions": {
-                      "MasterUserName": os.environ["OS_USER"],
-                      "MasterUserPassword": os.environ["PW"],
-                  },
-              },
-          }))
-          PY
-
-          aws opensearch update-domain-config --region "${{ vars.AWS_REGION }}" \
-            --cli-input-json "file://$CFG" \
-            --query 'DomainConfig.AdvancedSecurityOptions.Status' --output json
-
-          echo "Waiting for the domain to finish processing..."
-          for _ in $(seq 1 40); do
-            p=$(aws opensearch describe-domain --domain-name "$OS_DOMAIN" \
-                  --region "${{ vars.AWS_REGION }}" \
-                  --query 'DomainStatus.Processing' --output text)
-            echo "  Processing=$p"
-            [ "$p" = "False" ] && break
-            sleep 15
-          done
-
-          echo
-          echo "Next: re-run this workflow with action=test-search-write."
-          echo "Expect HTTP 200s. Then re-run Search Indexing from the UI"
-          echo "(Settings -> Applications -> Search Indexing, Recreate Index = true)."
+          scripts/opensearch-credentials.sh heal
 
       # Sets a BRAND NEW password on both sides, rather than trying to make one
       # side match the other.
@@ -546,9 +504,13 @@ jobs:
       # limited to _ - . so it survives being embedded in openmetadata.yaml).
       #
       # NOTE: this diverges from Terraform state, which still holds the old
-      # random_password. The next `apply` will push the state value back to both
-      # the domain and the secret, which reconverges them -- but if that apply is
-      # what broke them originally, watch it.
+      # random_password. The next `apply` reverts the SECRET to the state value
+      # (Terraform can read a Kubernetes secret) but NOT the domain (it cannot
+      # read the master password, so it sees no diff) -- which on its own would
+      # leave search broken again. deploy.yml's "Verify search credentials" step
+      # catches exactly that and bounces the domain back to the state value.
+      # Prefer reset-opensearch-password, which ends on Terraform's value and
+      # so creates no divergence at all.
       - name: Rotate the OpenSearch password on both sides
         if: ${{ github.event.inputs.action == 'rotate-opensearch-password' }}
         run: |
@@ -630,7 +592,8 @@ jobs:
 
           echo
           echo "Rotated. Re-run with action=test-search-write; expect HTTP 200."
-          echo "Terraform state still holds the OLD password -- see the note in this step."
+          echo "Terraform state still holds the OLD password: the next apply reverts the"
+          echo "secret, and its post-apply check re-aligns the domain. See the note in this step."
 
       # Sets number_of_replicas = 0 on every non-system index.
       #
@@ -736,6 +699,249 @@ jobs:
           echo "If it is still yellow, the missing data node is the remaining cause;"
           echo "check us-east-1b in the diagnose action's AWS domain health output."
 
+      # Installs a composable index template that gives OpenMetadata's indices
+      # 1 primary shard (and 0 replicas in dev, 1 elsewhere), instead of the 5
+      # primaries Amazon OpenSearch Service gives an index by default. ~757
+      # shards become ~150 with replicas, ~75 without.
+      #
+      # A template applies only when an index is CREATED -- shard count is
+      # immutable afterwards. Nothing changes for existing indices until
+      # OpenMetadata rebuilds them: Settings -> Applications -> Search Indexing
+      # -> Recreate Index = true -> Run. Re-run this action afterwards; it is
+      # idempotent, and its index table should then show pri=1.
+      #
+      # If pri is still 5 after a rebuild, OpenMetadata is setting the shard
+      # count explicitly in its create-index request, which beats any template.
+      # The fallback is the _shrink API per index; see README_full.md.
+      #
+      # Composable templates do NOT merge: only the highest-priority match
+      # applies to an index. A template of ours that overlapped one OpenMetadata
+      # or OpenSearch already owns (data streams such as di-data-assets-* depend
+      # on theirs) would silently replace it. So this refuses, before writing
+      # anything, if any existing template could match the same names.
+      #
+      # Two pods rather than one: the curl image has no jq or python, so the
+      # pods only fetch and print, and every decision is made here on the
+      # runner. Phase 1 is read-only; phase 2 writes only if phase 1 passed.
+      - name: Set shard template
+        if: ${{ github.event.inputs.action == 'set-shard-template' }}
+        env:
+          TEMPLATE_NAME: openmetadata-shards
+          # OpenMetadata's entity and report indices, with or without its
+          # clusterAlias prefix. Dot-prefixed system indices never match.
+          TEMPLATE_PATTERNS: "*_search_index *_report_data_index"
+        run: |
+          set -uo pipefail
+          ENV_NAME="${{ github.event.inputs.environment }}"
+          # Dev runs without replicas (see reduce-replicas); anywhere else
+          # search has to survive a node loss.
+          if [ "$ENV_NAME" = "dev" ]; then REPLICAS=0; else REPLICAS=1; fi
+          export TEMPLATE_NAME TEMPLATE_PATTERNS REPLICAS
+
+          dump=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c '
+            echo "H=${ELASTICSEARCH_HOST:-}"
+            echo "P=${ELASTICSEARCH_PORT:-443}"
+            echo "S=${ELASTICSEARCH_SCHEME:-https}"
+            echo "U=${ELASTICSEARCH_USER:-admin}"' 2>/dev/null)
+          # The chart double-quotes these; see the Probe step's byte dump.
+          strip() { printf %s "$1" | tr -d '\r' | sed -e 's/^"\(.*\)"$/\1/'; }
+          OS_HOST=$(strip "$(printf %s "$dump" | sed -n 's/^H=//p')")
+          OS_PORT=$(strip "$(printf %s "$dump" | sed -n 's/^P=//p')")
+          OS_SCHEME=$(strip "$(printf %s "$dump" | sed -n 's/^S=//p')")
+          OS_USER=$(strip "$(printf %s "$dump" | sed -n 's/^U=//p')")
+          [ -n "$OS_HOST" ] || { echo "::error::ELASTICSEARCH_HOST empty in the server pod"; exit 1; }
+          echo "target: $OS_SCHEME://$OS_HOST:$OS_PORT as $OS_USER"
+          echo "template: $TEMPLATE_NAME  patterns: $TEMPLATE_PATTERNS  shards: 1  replicas: $REPLICAS"
+          export OS_HOST OS_PORT OS_SCHEME OS_USER
+
+          # Runs SCRIPT in a throwaway curl pod: same nodes, so the same node
+          # security group faces the VPC-only domain, with the password from
+          # the secret by secretKeyRef so it never lands in a pod spec or log.
+          # Extra env vars named in $3 are passed through.
+          os_pod() {
+            local name="$1" script="$2" extra="${3:-}"
+            local overrides
+            overrides=$(SCRIPT="$script" POD_NAME="$name" EXTRA="$extra" python3 - <<'PY'
+          import json, os
+          env = lambda k: {"name": k, "value": os.environ[k]}
+          names = ["OS_HOST", "OS_PORT", "OS_SCHEME", "OS_USER"] + os.environ["EXTRA"].split()
+          print(json.dumps({
+              "apiVersion": "v1",
+              "spec": {
+                  "restartPolicy": "Never",
+                  "containers": [{
+                      "name": os.environ["POD_NAME"],
+                      "image": "curlimages/curl:8.11.1",
+                      "command": ["sh", "-c", os.environ["SCRIPT"]],
+                      "env": [env(k) for k in names] + [
+                          {"name": "OS_PASS", "valueFrom": {"secretKeyRef": {
+                              "name": "opensearch-credentials", "key": "password"}}}],
+                  }],
+              },
+          }))
+          PY
+            )
+            kubectl run "$name" -n "$NAMESPACE" \
+              --image=curlimages/curl:8.11.1 --restart=Never --rm -i --quiet \
+              --pod-running-timeout=3m --overrides="$overrides"
+          }
+
+          # --- phase 1: read-only --------------------------------------------
+          read -r -d '' READ_SCRIPT <<'READ' || true
+          set -u
+          B="$OS_SCHEME://$OS_HOST:$OS_PORT"
+          A="-u $OS_USER:$OS_PASS"
+          for part in "HEALTH _cluster/health" \
+                      "TEMPLATES _index_template" \
+                      "INDICES _cat/indices?format=json&h=index,pri,rep,docs.count&expand_wildcards=open" \
+                      "STREAMS _data_stream"; do
+            set -- $part
+            echo "@@$1@@"
+            curl -s --max-time 120 $A "$B/$2"
+            echo
+            echo "@@END@@"
+          done
+          READ
+
+          os_pod "om-os-shards-read-${GITHUB_RUN_ID}" "$READ_SCRIPT" > phase1.txt
+          rc=$?
+          [ $rc -eq 0 ] || { cat phase1.txt; echo "::error::read phase failed (exit $rc)"; exit 1; }
+
+          python3 - <<'PY' || exit 1
+          import fnmatch, json, os, re, sys
+
+          raw = open("phase1.txt").read()
+          parts = dict(re.findall(r"@@(\w+)@@\n(.*?)\n@@END@@", raw, re.S))
+          def load(k):
+              try:
+                  return json.loads(parts[k])
+              except Exception:
+                  print(raw[-3000:])
+                  print(f"::error::could not read {k} from OpenSearch -- see the output above")
+                  sys.exit(1)
+
+          health, templates, indices, streams = (load(k) for k in ("HEALTH", "TEMPLATES", "INDICES", "STREAMS"))
+          if "error" in templates or isinstance(indices, dict):
+              print(json.dumps(templates)[:1500], json.dumps(indices)[:1500])
+              print("::error::OpenSearch refused a read -- run test-search-write to classify it")
+              sys.exit(1)
+
+          name = os.environ["TEMPLATE_NAME"]
+          ours = os.environ["TEMPLATE_PATTERNS"].split()
+          replicas = int(os.environ["REPLICAS"])
+          print(f"cluster status: {health.get('status')}  active shards: {health.get('active_shards')}  "
+                f"unassigned: {health.get('unassigned_shards')}")
+
+          # Names that exist now: open indices plus data streams.
+          live = [i["index"] for i in indices] + [s["name"] for s in streams.get("data_streams", [])]
+          def matches(n, pats):
+              return any(fnmatch.fnmatchcase(n, p) for p in pats)
+
+          # Overlap with any template we do not own. Pattern against pattern is
+          # checked both ways (a literal reading of one against the other
+          # catches "*" and prefix catch-alls); real names catch the rest.
+          conflicts = []
+          for t in templates.get("index_templates", []):
+              if t["name"] == name:
+                  continue
+              theirs = t["index_template"].get("index_patterns", [])
+              why = [f"{tp} ~ {op}" for tp in theirs for op in ours
+                     if fnmatch.fnmatchcase(tp, op) or fnmatch.fnmatchcase(op, tp)]
+              why += [f"both match {n}" for n in live if matches(n, theirs) and matches(n, ours)]
+              if why:
+                  conflicts.append((t["name"], theirs, why[:5]))
+          if conflicts:
+              print("\nRefusing: these existing templates could match the same names, and only")
+              print("one composable template applies per index -- ours would replace theirs.\n")
+              for n, pats, why in conflicts:
+                  print(f"  {n}  patterns={pats}")
+                  for w in why:
+                      print(f"      {w}")
+              print("\n::error::template patterns overlap an existing template; nothing was written. "
+                    "Narrow TEMPLATE_PATTERNS in this step to exclude those names.")
+              sys.exit(1)
+          print("no overlapping templates")
+
+          # What the template will cover, and what the rebuild should save.
+          user = [i for i in indices if not i["index"].startswith(".")]
+          covered = [i for i in user if matches(i["index"], ours)]
+          missed = [i for i in user if not matches(i["index"], ours)]
+          now = sum(int(i["pri"]) * (1 + int(i["rep"])) for i in covered)
+          after = len(covered) * (1 + replicas)
+          print(f"\n{len(covered)} OpenMetadata indices covered: {now} shards now, {after} after a rebuild")
+          print(f"{'index':<55} {'pri':>4} {'rep':>4} {'docs':>10}")
+          for i in sorted(covered, key=lambda i: i["index"]):
+              print(f"{i['index']:<55} {i['pri']:>4} {i['rep']:>4} {i['docs.count'] or 0:>10}")
+          if missed:
+              print("\nNOT covered by the patterns (left as they are):")
+              for i in missed:
+                  print(f"  {i['index']}  pri={i['pri']} rep={i['rep']}")
+
+          body = {"index_patterns": ours, "priority": 10,
+                  "template": {"settings": {"number_of_shards": 1, "number_of_replicas": replicas}},
+                  "_meta": {"managed_by": "openmetadata-ops set-shard-template"}}
+          open("template.json", "w").write(json.dumps(body))
+          PY
+
+          # --- phase 2: write, then prove what a new index would get ----------
+          export TEMPLATE_BODY="$(cat template.json)"
+          read -r -d '' WRITE_SCRIPT <<'WRITE' || true
+          set -u
+          B="$OS_SCHEME://$OS_HOST:$OS_PORT"
+          A="-u $OS_USER:$OS_PASS"
+          echo "@@PUT@@"
+          curl -s --max-time 120 -X PUT $A -H 'Content-Type: application/json' \
+            --data-binary "$TEMPLATE_BODY" "$B/_index_template/$TEMPLATE_NAME"
+          echo
+          echo "@@END@@"
+          # Simulated names that match each pattern, so this checks the
+          # template as OpenSearch resolves it without creating anything.
+          for n in zz_shardcheck_search_index zz_shardcheck_report_data_index; do
+            echo "@@SIM@@"
+            curl -s --max-time 120 -X POST $A "$B/_index_template/_simulate_index/$n"
+            echo
+            echo "@@END@@"
+          done
+          WRITE
+
+          os_pod "om-os-shards-write-${GITHUB_RUN_ID}" "$WRITE_SCRIPT" "TEMPLATE_BODY TEMPLATE_NAME" > phase2.txt
+          rc=$?
+          [ $rc -eq 0 ] || { cat phase2.txt; echo "::error::write phase failed (exit $rc)"; exit 1; }
+
+          python3 - <<'PY' || exit 1
+          import json, os, re, sys
+          raw = open("phase2.txt").read()
+          blocks = re.findall(r"@@(\w+)@@\n(.*?)\n@@END@@", raw, re.S)
+          put = json.loads(dict(blocks)["PUT"])
+          if not put.get("acknowledged"):
+              print(json.dumps(put, indent=2)[:3000])
+              print("::error::OpenSearch did not accept the template")
+              sys.exit(1)
+          print(f"template {os.environ['TEMPLATE_NAME']} accepted")
+          want = ("1", os.environ["REPLICAS"])
+          ok = True
+          for kind, body in blocks:
+              if kind != "SIM":
+                  continue
+              sim = json.loads(body)
+              idx = sim.get("template", {}).get("settings", {}).get("index", {})
+              got = (str(idx.get("number_of_shards")), str(idx.get("number_of_replicas")))
+              applied = [o.get("name") for o in sim.get("overlapping", [])]
+              print(f"  a new matching index would get shards={got[0]} replicas={got[1]}"
+                    + (f"  (overlapping, not applied: {applied})" if applied else ""))
+              ok &= got == want
+          if not ok:
+              print("::error::the simulated settings do not match the template -- another template wins")
+              sys.exit(1)
+          PY
+
+          echo
+          echo "Done. Existing indices are unchanged until OpenMetadata rebuilds them:"
+          echo "  Settings -> Applications -> Search Indexing -> Configure -> Recreate Index = true -> Run"
+          echo "Wait for the cluster to be green first. Then re-run this action: the index"
+          echo "table should show pri=1. If it still shows 5, OpenMetadata sets the shard"
+          echo "count itself and the template cannot override it -- see README_full.md."
+
       # Everything about how the UI is published, in one read-only run: the
       # Service the controller reconciles, the load balancer it produced, the
       # listeners and certificate, target health, the security group rules
@@ -757,7 +963,7 @@ jobs:
           R="${{ vars.AWS_REGION }}"
 
           echo "::group::Declared in $TFVARS_FILE"
-          grep -nE '^[[:space:]]*(app_expose_via_alb|app_accelerator_arn|app_lb_scheme|app_lb_allowed_cidrs|app_tls_domain_name|app_tls_route53_zone_name|app_tls_certificate_arn)' \
+          grep -nE '^[[:space:]]*(app_expose_via_alb|app_accelerator_arn|app_lb_scheme|app_lb_allowed_cidrs|app_tls_domain_name|app_tls_route53_zone_name|app_tls_certificate_arn|app_waf_enabled|app_waf_rate_limit|app_waf_rate_limit_action)' \
             "$TFVARS_FILE" || echo "(no exposure variables set -- UI is ClusterIP + port-forward only)"
           echo "::endgroup::"
 

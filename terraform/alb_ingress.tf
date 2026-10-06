@@ -1,8 +1,10 @@
 # Public entry point for the OpenMetadata UI.
 #
 # An Ingress that the AWS Load Balancer Controller turns into an
-# internet-facing ALB. With TLS configured it listens HTTPS on 443 and 8585;
-# without it, HTTP on 8585 alone. Targets are always the pod's 8585.
+# internet-facing ALB. With TLS configured it listens HTTPS on 443 and 8585,
+# plus HTTP on 80 solely to redirect to 443; without TLS, HTTP on 8585 alone.
+# Targets are always the pod's 8585. With app_waf_enabled, the web ACL in
+# waf.tf sits in front of every listener.
 #
 # 443 is not cosmetic. Clients on a corporate network reach this through a
 # forward proxy (Netskope here, which terminates TLS and re-signs with its own
@@ -43,19 +45,28 @@
 #   a handful of egress addresses -- that would pin the whole company onto one
 #   pod. See the target-group-attributes annotation below.
 #
-#   Layer 7 is now available. WAF and listener-level OIDC
-#   (alb.ingress.kubernetes.io/auth-type) are annotations away, which they
-#   were not on an NLB. Neither is enabled here -- see the note at the bottom.
+#   Layer 7 is now available. WAF (waf.tf, app_waf_enabled) is attached by
+#   annotation, which an NLB could not do. Listener-level OIDC
+#   (alb.ingress.kubernetes.io/auth-type) is equally available and
+#   deliberately not enabled -- see the note at the bottom.
 
 locals {
   # Ports the ALB publishes, and the ports Global Accelerator forwards. Named
   # because listen-ports is JSON keyed by protocol and the name keeps the two
   # lists from drifting apart.
+  #
+  # With TLS, port 80 is plain HTTP and exists only to redirect: the
+  # ssl-redirect annotation below turns every HTTP listener into a 301 to
+  # https on 443, so someone typing the bare hostname lands on the UI instead
+  # of "connection refused". It never forwards to the pod. The allowlist
+  # (inbound-cidrs) covers it like every other listener, and the accelerator
+  # forwards it too, since its ports derive from this list.
   app_public_ports = local.app_tls_enabled ? [
-    { name = "https", port = 443 },
-    { name = "http", port = 8585 },
+    { name = "http-redirect", port = 80, protocol = "HTTP" },
+    { name = "https", port = 443, protocol = "HTTPS" },
+    { name = "http", port = 8585, protocol = "HTTPS" },
     ] : [
-    { name = "http", port = 8585 },
+    { name = "http", port = 8585, protocol = "HTTP" },
   ]
 
   # listen-ports takes a JSON array of single-key objects, protocol -> port.
@@ -63,7 +74,7 @@ locals {
   # subtly wrong and the controller's parse error names the annotation, not
   # the offending character.
   app_listen_ports = jsonencode([
-    for p in local.app_public_ports : { (local.app_tls_enabled ? "HTTPS" : "HTTP") = p.port }
+    for p in local.app_public_ports : { (p.protocol) = p.port }
   ])
 }
 
@@ -129,9 +140,20 @@ resource "kubernetes_ingress_v1" "app_public" {
 
       # TLS on the listener. ssl-policy is pinned rather than left at the
       # controller default so a policy change is a visible diff here.
+      #
+      # ssl-redirect makes every HTTP listener (only :80, see app_public_ports)
+      # answer with a 301 to the same host and path on 443. 8585 is HTTPS
+      # under TLS, so it is unaffected.
       local.app_tls_enabled ? {
         "alb.ingress.kubernetes.io/certificate-arn" = local.app_cert_arn
         "alb.ingress.kubernetes.io/ssl-policy"      = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+        "alb.ingress.kubernetes.io/ssl-redirect"    = "443"
+      } : {},
+
+      # WAF in front of every listener. waf.tf owns the web ACL; the controller
+      # associates it with the ALB and disassociates it if this goes away.
+      local.app_waf_enabled ? {
+        "alb.ingress.kubernetes.io/wafv2-acl-arn" = aws_wafv2_web_acl.app[0].arn
       } : {}
     )
   }

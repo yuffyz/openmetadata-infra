@@ -6,8 +6,8 @@ locals {
   # Check before bumping: aws eks describe-cluster-versions
   eks_version                   = "1.36"
   eks_cidr                      = "10.100.0.0/24"
-  eks_node_group_instance_types = ["t3.xlarge"]
-  eks_nodes_disk_size           = 20
+  eks_node_group_instance_types = var.eks_node_instance_types
+  eks_nodes_disk_size           = var.eks_node_disk_size
   eks_nodes_sg_id               = aws_eks_cluster.openmetadata.vpc_config[0].cluster_security_group_id
 }
 
@@ -58,9 +58,9 @@ resource "aws_eks_node_group" "nodes" {
   # 1.33+, so AL2023 is required alongside the version above.
   ami_type = "AL2023_x86_64_STANDARD"
   scaling_config {
-    desired_size = 2
-    max_size     = 3
-    min_size     = 2
+    desired_size = var.eks_node_desired_size
+    max_size     = var.eks_node_max_size
+    min_size     = var.eks_node_min_size
   }
   update_config {
     max_unavailable = 1

@@ -127,6 +127,64 @@ jobs:
         working-directory: ${{ env.TF_DIR }}
         run: terraform apply -input=false tfplan
 
+      # Proves the server can still authenticate to OpenSearch, and fixes it
+      # if not. Terraform cannot see the domain's master password (AWS never
+      # returns it), so a clean apply says nothing about whether search works;
+      # this is the only check that does. See scripts/opensearch-credentials.sh
+      # for what "heal" does -- it only ever acts on a 401 or a stale pod.
+      #
+      # Fails the job if search is still broken afterwards: the apply itself
+      # succeeded, but a deploy that leaves Explore empty is not a success.
+      # Skipped for environments without an AWS OpenSearch domain.
+      - name: Verify search credentials (heal if drifted)
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          OS_DOMAIN=$(grep -E '^[[:space:]]*domain_name[[:space:]]*=' "$GITHUB_WORKSPACE/$TFVARS_FILE" \
+                        | head -1 | cut -d'"' -f2 || true)
+          if [ -z "$OS_DOMAIN" ]; then
+            echo "No AWS OpenSearch domain in $TFVARS_FILE -- nothing to verify."
+            exit 0
+          fi
+          export OS_DOMAIN
+          aws eks update-kubeconfig --region "$AWS_REGION" \
+            --name "$(terraform output -raw eks_cluster_name)" >/dev/null
+          "$GITHUB_WORKSPACE/scripts/opensearch-credentials.sh" heal
+
+      # When opensearch_iam_auth is on, the server signs search requests with
+      # its IAM role instead of sending the password (terraform/opensearch_iam.tf).
+      # Terraform creates the role and switches the server over, but cannot
+      # reach inside the VPC-only domain to authorise it, so this maps the role
+      # in OpenSearch's security index and then proves the server is really on
+      # the signed path. Runs after the step above on purpose: mapping is done
+      # as the master user, so the password has to work first.
+      #
+      # On the apply that first enables it, the restarted server meets an
+      # unmapped role and can fail its startup checks; once the mapping is new,
+      # the server is restarted so it does not sit out a crash-loop backoff.
+      - name: Verify search over IAM
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          ROLE_ARN=$(terraform output -raw opensearch_iam_role_arn 2>/dev/null || true)
+          if [ -z "$ROLE_ARN" ]; then
+            echo "opensearch_iam_auth is off -- the server uses the master password."
+            exit 0
+          fi
+          export ROLE_ARN
+          out=$("$GITHUB_WORKSPACE/scripts/opensearch-iam.sh" map); echo "$out"
+          if printf '%s' "$out" | grep -q '^mapped'; then
+            kubectl rollout restart deploy/openmetadata -n openmetadata
+          fi
+          kubectl rollout status deploy/openmetadata -n openmetadata --timeout=10m
+          "$GITHUB_WORKSPACE/scripts/opensearch-iam.sh" check
+
       - name: Output kubeconfig command
         working-directory: ${{ env.TF_DIR }}
         run: terraform output -raw update_kubeconfig

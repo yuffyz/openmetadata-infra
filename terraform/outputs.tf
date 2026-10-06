@@ -169,3 +169,10 @@ output "eks_cluster_name" {
   description = "EKS cluster name. Used to find the controller-created load balancer by its elbv2.k8s.aws/cluster tag."
   value       = local.eks_cluster_name
 }
+
+# Read by deploy.yml's post-apply step: non-empty means "map this role in
+# OpenSearch and verify the server is signing with it".
+output "opensearch_iam_role_arn" {
+  description = "IAM role the OpenMetadata server uses for SigV4 to OpenSearch when opensearch_iam_auth is on; empty otherwise."
+  value       = local.opensearch_iam_enabled ? aws_iam_role.openmetadata_search[0].arn : ""
+}

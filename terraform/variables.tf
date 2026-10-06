@@ -119,6 +119,51 @@ variable "eks_cluster_name" {
   default     = "open-metadata"
 }
 
+# --- EKS node group sizing ----------------------------------------------------
+# Per environment. The defaults are the values that used to be hard-coded in
+# eks.tf, so an environment that sets none of these plans with no change.
+#
+# > ⚠️ instance_types and disk_size are immutable on an EKS managed node group:
+# > changing either REPLACES the node group. Its name is fixed ("eks-nodes"), so
+# > Terraform cannot create the new one first -- the old nodes are deleted, and
+# > every pod is down until the new nodes join (typically 5-10 minutes). The
+# > three counts below change in place.
+
+variable "eks_node_instance_types" {
+  description = "Instance types for the EKS managed node group. Changing this replaces the node group (see the note above)."
+  type        = list(string)
+  default     = ["t3.xlarge"]
+}
+
+variable "eks_node_disk_size" {
+  description = "Root volume size in GiB for each node. Holds the container image cache, including the large OpenMetadata ingestion images. Changing this replaces the node group."
+  type        = number
+  default     = 20
+}
+
+variable "eks_node_min_size" {
+  description = "Minimum node count."
+  type        = number
+  default     = 2
+}
+
+variable "eks_node_desired_size" {
+  description = "Desired node count. Nothing in this stack autoscales, so this is the count that runs."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.eks_node_desired_size >= var.eks_node_min_size && var.eks_node_desired_size <= var.eks_node_max_size
+    error_message = "eks_node_desired_size must be between eks_node_min_size and eks_node_max_size."
+  }
+}
+
+variable "eks_node_max_size" {
+  description = "Maximum node count."
+  type        = number
+  default     = 3
+}
+
 variable "opensearch" {
   description = "OpenSearch configuration"
   type        = any
@@ -439,6 +484,58 @@ variable "app_display_name" {
     condition     = !strcontains(var.app_display_name, "OpenMetadata")
     error_message = "app_display_name must not itself contain \"OpenMetadata\" -- the rewrite replaces that string, so a replacement containing it would never settle and the script disables itself."
   }
+}
+
+variable "opensearch_iam_auth" {
+  description = "OpenMetadata authenticates to OpenSearch with its pod's IAM role (SigV4, via IRSA) instead of the master password, so password drift can no longer break search. See opensearch_iam.tf."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.opensearch_iam_auth || try(var.opensearch.provisioner, "helm") == "aws"
+    error_message = "opensearch_iam_auth needs an AWS-managed OpenSearch domain (opensearch.provisioner = \"aws\")."
+  }
+}
+
+# --- WAF (waf.tf) --------------------------------------------------------------
+
+variable "app_waf_enabled" {
+  description = "Put an AWS WAF web ACL (IP reputation, known bad inputs, core rule set, per-IP rate limit) in front of the ALB. Requires app_expose_via_alb. See waf.tf for which rules block and which only count."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.app_waf_enabled || var.app_expose_via_alb
+    error_message = "app_waf_enabled requires app_expose_via_alb = true -- the web ACL attaches to the ALB, so there must be one."
+  }
+}
+
+variable "app_waf_rate_limit" {
+  description = "Requests per source IP per 5 minutes before the rate-limit rule matches. Per IP, so everyone behind one corporate proxy address shares it."
+  type        = number
+  default     = 20000
+
+  validation {
+    condition     = var.app_waf_rate_limit >= 10 && var.app_waf_rate_limit <= 2000000000
+    error_message = "app_waf_rate_limit must be between 10 and 2,000,000,000 (the AWS WAF range)."
+  }
+}
+
+variable "app_waf_rate_limit_action" {
+  description = "\"count\" records requests over app_waf_rate_limit without blocking them; \"block\" rejects them with 403. Start with count and switch once the metric shows real peaks."
+  type        = string
+  default     = "count"
+
+  validation {
+    condition     = contains(["count", "block"], var.app_waf_rate_limit_action)
+    error_message = "app_waf_rate_limit_action must be \"count\" or \"block\"."
+  }
+}
+
+variable "app_waf_log_retention_days" {
+  description = "Retention for the WAF request log group (aws-waf-logs-<cluster>-omd). Must be a value CloudWatch Logs accepts."
+  type        = number
+  default     = 30
 }
 
 variable "lb_controller_chart_version" {

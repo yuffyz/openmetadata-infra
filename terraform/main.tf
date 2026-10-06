@@ -6,9 +6,10 @@ module "app" {
 
   airflow  = var.airflow
   env_from = local.env_from
-  extra_envs = {
-    "ELASTICSEARCH_BATCH_SIZE" = 250
-  }
+  # Plus the SigV4 switch when opensearch_iam_auth is on (opensearch_iam.tf).
+  extra_envs = merge({
+    "ELASTICSEARCH_BATCH_SIZE" = "250"
+  }, local.opensearch_iam_envs)
   app_namespace    = local.namespace
   app_version      = var.app_version
   db               = var.db
@@ -102,7 +103,9 @@ locals {
   # lets both exist for the minute it takes.
   app_alb_name = substr("${var.eks_cluster_name}-omd-alb", 0, 32)
 
-  app_helm_values = var.app_extra_helm_values
+  # Operator overrides, plus the IRSA ServiceAccount annotation when
+  # opensearch_iam_auth is on (opensearch_iam.tf).
+  app_helm_values = merge(var.app_extra_helm_values, local.opensearch_iam_helm_values)
 }
 
 # Extra environment variables from Kubernets secret

@@ -43,12 +43,13 @@ association per extra AZ.
 |---|---|---|
 | Config | `config/dev.auto.tfvars` | `config/production.auto.tfvars` |
 | RDS | single-AZ, `deletion_protection=false`, `skip_final_snapshot=true`, no backups | multi-AZ, `deletion_protection=true`, final snapshot, 30-day backups |
-| OpenSearch | 2 nodes / 2 AZs (the module's minimum) | 2 nodes / 2 AZs |
+| OpenSearch | 2 × `t3.medium.search` / 2 AZs (the module's minimum count) | 2 × `r6g.large.search` / 2 AZs, replicas kept |
 | Resource names | `-dev` suffixed (`open-metadata-dev`, `openmetadata-dev`, …) | defaults (`open-metadata`, `openmetadata`, …) |
 | State key | `<prefix>/dev/terraform.tfstate` | `<prefix>/production/terraform.tfstate` |
 | Approval | none (fast create/destroy) | required reviewers |
 | Teardown | `terraform destroy` just works | intentionally hard (protected) |
-| UI access | internet-facing NLB, IP-allowlisted; HTTPS available via `app_tls_domain_name` | **not configured** — `ClusterIP` + port-forward only |
+| UI access | internet-facing ALB, IP-allowlisted; HTTPS at `dev.example-openmetadata.com` | same as dev; HTTPS at `example-openmetadata.com` |
+| EKS nodes | 2 × `t3.xlarge`, 20 GiB disk | 3 × `m7i.large` (one per AZ), 50 GiB disk |
 
 The `-dev` naming lets a dev stack coexist with production **in the same
 account/region** without RDS/OpenSearch/EKS name collisions.
@@ -794,10 +795,11 @@ Cost: roughly $18/month plus a per-GB data transfer premium, on top of the ALB.
 
 ## Production exposure — what's still missing
 
-Production deliberately has **no** UI exposure configured: its tfvars omit
-`app_expose_via_alb`, so nothing but the chart's `ClusterIP` Service exists and
-the only access is `kubectl port-forward`. The variables are per-environment, so
-enabling the ALB + TLS there is a tfvars change and nothing more.
+Production now has the same exposure as dev: an internet-facing ALB limited to
+the same `app_lb_allowed_cidrs`, with HTTPS at `example-openmetadata.com`
+on a certificate Terraform issues and validates in the shared Route 53 zone.
+Everything below applies to both environments — and matters more in
+production, where the data is real.
 
 Dev's move from an NLB to an ALB Ingress closed most of what this section used
 to list as future work. Layer 7 is now available, health checks are HTTP rather
@@ -839,13 +841,23 @@ is still open:
    RBAC. Pick one or the other, never both: two redirect flows with two session
    lifetimes produce login loops that look like an IdP fault. See the note at
    the bottom of `alb_ingress.tf`.
-2. **HTTP→HTTPS redirect.** Port 80 is still not served, so a user who types the
-   bare hostname gets a connection refused. The ALB does this in a listener rule
-   (`ssl-redirect`), which is now a one-annotation change rather than an
-   architecture one.
-3. **WAF and managed rules.** Now attachable, since the load balancer is an ALB.
-   This is also where you stop maintaining `/32`s by hand — the dev allowlist
-   still carries dynamic ISP addresses that will keep drifting.
+2. **HTTP→HTTPS redirect — done.** The ALB now also listens on plain HTTP:80,
+   and `ssl-redirect` answers every request there with a 301 to HTTPS:443, so
+   typing the bare hostname works. Port 80 never reaches the pod, and the
+   allowlist covers it like the other listeners.
+3. **WAF — done, partly in count mode.** `app_waf_enabled` (on in both
+   environments) puts a web ACL in front of the ALB (`waf.tf`):
+   - **Blocks:** AWS IP reputation, known bad inputs (Log4Shell-style payloads),
+     and the core rule set.
+   - **Only counts:** the per-IP rate limit, plus three core rules that misfire
+     on OpenMetadata's own request bodies (8 KB size limit, XSS and LFI in
+     body). Review the matches in the `aws-waf-logs-<cluster>-omd` log group
+     and in the WAF metrics, then promote them to blocking.
+
+   Still open: replacing the hand-maintained `/32`s in the allowlist. The
+   security group still decides who can connect; WAF only inspects what they
+   send. A WAF IP set rule could take over the allowlist, but that is a
+   separate change.
 4. **Internal rather than internet-facing.** Everyone who uses this is on the
    corporate network, so the correct posture is an internal load balancer and no
    public exposure at all. The blocker is routing, not configuration: nothing
@@ -867,8 +879,9 @@ Two further considerations for production specifically:
   lines.
 
 Also worth revisiting for production, unrelated to exposure:
-`enabled_cluster_log_types = []` disables EKS control-plane logging, and the
-node group is the same 2 × `t3.xlarge` as dev.
+`enabled_cluster_log_types = []` disables EKS control-plane logging. (The node
+group is now sized per environment; production runs 3 × `m7i.large` — the
+reasoning is in `config/production.auto.tfvars`.)
 
 ## Search index — when Explore is empty
 
@@ -922,9 +935,10 @@ access-entry fight to run any of this.
 | `diagnose` | no | Pod password vs secret (by hash), stored password *shape*, domain health, node/AZ availability, `MasterUserName`, `UpdateVersion`, recent server-side search errors |
 | `test-search-write` | throwaway index | Can the credentials read **and write**? Cluster health, node list, index list with `docs.count`, FGAC roles in effect |
 | `restart-server` | rollout | For the stale-pod case: secret rolled, running pod still holds the old value |
-| `reset-opensearch-password` | domain | Sets the domain master password to the secret's value. **Often a no-op — see below** |
-| `rotate-opensearch-password` | domain + secret + rollout | Sets a *new* password on both sides and verifies the change actually landed. This is the one that works |
+| `reset-opensearch-password` | domain, rollout if stale | Runs `scripts/opensearch-credentials.sh heal`: bounces the domain password (throwaway, then the secret's value), asserting `UpdateVersion` moves each time, and restarts a stale server. Ends on Terraform's value. **The one to use** |
+| `rotate-opensearch-password` | domain + secret + rollout | Sets a *new* password on both sides. Works, but diverges from Terraform state — prefer `reset` |
 | `reduce-replicas` | index settings, dev only | Drops `number_of_replicas` to 0 on non-system indices |
+| `set-shard-template` | index template | 1 primary shard (0 replicas in dev, 1 elsewhere) for indices created from now on. Refuses if it would overlap an existing template |
 
 Read `test-search-write` by **which kind of failure** you get. The distinction
 that matters is *rejected* versus *overwhelmed*:
@@ -960,11 +974,12 @@ password updates the secret while the running pod keeps the old one in memory.
 Re-ingestion is never part of this. The entities are already in the application
 database; only the index was missing.
 
-### Fixing password drift — and why `reset` is not enough
+### Fixing password drift — and why a plain reset was not enough
 
-`reset-opensearch-password` sends the secret's existing value to the domain.
-**AWS frequently accepts that call and applies nothing**, returning what looks
-exactly like success:
+`reset-opensearch-password` used to send the secret's existing value straight
+to the domain. **AWS frequently accepts that call and applies nothing**,
+returning what looks exactly like success (it now bounces instead, see *Worth
+fixing properly* below):
 
 ```json
 { "State": "Active", "UpdateDate": "2026-08-04T03:56:20", "UpdateVersion": 10 }
@@ -992,9 +1007,11 @@ Two things that look wrong in the output but are not:
 - `MasterUserName: None` from `describe-domain-config` — AWS redacts it. It does
   not mean the master user is unset.
 - Rotation **diverges from Terraform state**, which still holds the old
-  `random_password`. The next `apply` pushes the state value back to both the
-  domain and the secret, which reconverges them — but if a state operation is
-  what broke them originally, watch that apply.
+  `random_password`. The next `apply` reverts the **secret** to the state value
+  (Terraform can read a Kubernetes secret) but **not the domain** (it cannot
+  read the master password, so it sees no diff), which on its own breaks
+  search again. The deploy workflow's post-apply check now catches this and
+  bounces the domain back. `reset` avoids the round trip entirely.
 
 ### When the cluster is overwhelmed instead
 
@@ -1077,14 +1094,61 @@ or fix the shard defaults once the domain is right-sized.
 
 ### Worth fixing properly
 
-- **Password drift recurs** on any apply that rolls it. Either add a checksum
-  annotation to the deployment's pod template so a secret change forces a
-  rollout, or give `random_password` `keepers` so it stops regenerating. The
-  first is better but lives in the upstream module's deployment template, so it
-  needs `app_extra_helm_values` or an upstream change.
-- **Shard defaults.** 5 primaries per index is wrong for a single-node dev
-  domain. Until that is configurable here, `reduce-replicas` plus a larger
-  instance type is the workaround.
+- **Password drift — fixed, in two halves.**
+  - *Stale pod:* `terraform/opensearch_password.tf` puts a SHA-256 of the
+    `opensearch-credentials` secret on the server Deployment's pod template, so
+    a secret change rolls the pods in the same apply. The first apply with it
+    restarts the server once to add the annotation.
+  - *Domain out of sync:* Terraform can never see this, so `deploy.yml` now
+    runs `scripts/opensearch-credentials.sh heal` after every apply. It logs in
+    to OpenSearch with the secret's password from a throwaway pod. On a 401 it
+    bounces the domain password (a throwaway value, then the secret's, checking
+    that `UpdateVersion` moves both times), restarts a stale server, re-checks,
+    and fails the job if search is still broken.
+
+  - *Taking the password out of the app's path (dev, trial):*
+    `opensearch_iam_auth = true` makes the server sign search requests with
+    its pod's IAM role (SigV4 via IRSA) instead of sending the password. This
+    is OpenMetadata 1.12's `elasticsearch.aws` setting
+    (`SEARCH_AWS_IAM_AUTH_ENABLED`). `terraform/opensearch_iam.tf` creates the
+    role, annotates the chart's ServiceAccount and sets the environment
+    variables. After each apply, `deploy.yml` then:
+    - maps the role in OpenSearch (`scripts/opensearch-iam.sh map`, adding it to
+      the `all_access` role mapping);
+    - proves the server is really signing (`check`): the image supports it,
+      the pod has the role, the server log shows the SigV4 transport, and a
+      request signed as the server's ServiceAccount gets `all_access`.
+
+    The password still exists for the `admin` user and the ops tooling. **The
+    test before production:** in dev, change the domain password on purpose
+    (`rotate-opensearch-password`) and confirm Explore keeps working.
+
+  Why a bounce: AWS appears to compare a new master password against the last
+  value it was *sent*, not the one actually in force. So after the password is
+  changed elsewhere (OpenSearch Dashboards, a rotation), sending Terraform's
+  value is "unchanged" and silently ignored. A throwaway value first makes both
+  updates real.
+- **Shard defaults.** Amazon OpenSearch Service gives each index 5 primary
+  shards, which is how ~45 small indices become ~757 shards. The
+  `set-shard-template` action installs an index template with 1 primary per
+  OpenMetadata index (0 replicas in dev, 1 elsewhere), cutting that to ~150, or
+  ~75 without replicas. Shard count is fixed when an index is created, so:
+  1. Run `set-shard-template`. It refuses, writing nothing, if its patterns
+     (`*_search_index`, `*_report_data_index`) could match the same names as an
+     existing template. Composable templates do not merge, so overlapping one
+     OpenMetadata owns (its `di-data-assets-*` data streams) would replace it.
+  2. With the cluster green: **Settings → Applications → Search Indexing →
+     Configure**, *Recreate Index* = true, all entity types, **Run**.
+  3. Run `set-shard-template` again. It is idempotent, and its index table
+     should now show `pri` = 1. Once it does, dev no longer needs
+     `reduce-replicas`, and production can come down from `r6g.large.search`
+     to `m6g.large.search`.
+
+  If `pri` is still 5 after the rebuild, OpenMetadata is setting the shard
+  count in its create-index request, which takes precedence over any template.
+  The fallback is the `_shrink` API per index: block writes, move a copy of
+  every shard onto one node, shrink into a new index with 1 primary, then swap
+  names. It is far more involved, so treat it as a last resort.
 - **The quoting bug** belongs upstream — the module writes those values
   unquoted, so the chart is adding them.
 
@@ -1112,11 +1176,14 @@ or fix the shard defaults once the domain is right-sized.
   `skip_final_snapshot=false`), which block `terraform destroy`. Use the **dev**
   environment for disposable stacks; to tear down production you must first flip
   those flags and apply, then destroy.
-- **Not variable-controlled, but editable here.** The EKS node group
-  (2–3 × `t3.xlarge`, `eks.tf`) and the VPC CIDR (`172.72.0.0/16`, `vpc.tf`) are
-  hard-coded locals rather than variables, so dev and production share them.
-  Because the config is vendored, you can now change them directly instead of
-  patching upstream — but the value is shared across both environments.
+- **Node group sizing is per environment.** `eks_node_instance_types`,
+  `eks_node_disk_size` and the min/desired/max counts are variables whose
+  defaults are dev's original 2–3 × `t3.xlarge` with 20 GiB disks. Changing the
+  instance type or disk size **replaces** the node group — the name is fixed,
+  so old nodes go before new ones join and pods are down for 5–10 minutes.
+- **Not variable-controlled, but editable here.** The VPC CIDR
+  (`172.72.0.0/16`, `vpc.tf`) is a hard-coded local, shared by both
+  environments.
 - **EKS version and AMI move together.** `eks_version` must be under STANDARD
   support (`upgrade_policy { support_type = "STANDARD" }`) or `CreateCluster`
   fails outright; check with `aws eks describe-cluster-versions` before bumping.

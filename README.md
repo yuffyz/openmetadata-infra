@@ -40,12 +40,13 @@ brings in about 5 more for the certificate and DNS record.
 |---|---|---|
 | Config | `config/dev.auto.tfvars` | `config/production.auto.tfvars` |
 | RDS | single-AZ, `deletion_protection=false`, `skip_final_snapshot=true`, no backups | multi-AZ, `deletion_protection=true`, final snapshot, 30-day backups |
-| OpenSearch | 2 nodes / 2 AZs (the module's minimum) | 2 nodes / 2 AZs |
+| OpenSearch | 2 × `t3.medium.search` / 2 AZs (the module's minimum count) | 2 × `r6g.large.search` / 2 AZs, replicas kept |
 | Resource names | `-dev` suffixed (`open-metadata-dev`, `openmetadata-dev`, …) | defaults (`open-metadata`, `openmetadata`, …) |
 | State key | `<prefix>/dev/terraform.tfstate` | `<prefix>/production/terraform.tfstate` |
 | Approval | none (fast create/destroy) | required reviewers |
 | Teardown | `terraform destroy` just works | intentionally hard (protected) |
-| UI access | internet-facing NLB, IP-allowlisted; HTTPS via `app_tls_domain_name` | **not configured** — `ClusterIP` + port-forward only |
+| UI access | internet-facing ALB, IP-allowlisted; HTTPS at `dev.example-openmetadata.com` | same as dev; HTTPS at `example-openmetadata.com` |
+| EKS nodes | 2 × `t3.xlarge`, 20 GiB disk | 3 × `m7i.large` (one per AZ), 50 GiB disk |
 
 The `-dev` naming lets a dev stack coexist with production **in the same
 account/region** without RDS/OpenSearch/EKS name collisions.
@@ -574,10 +575,11 @@ walkthrough in
 
 ## Production exposure — what's still missing
 
-Production deliberately has **no** UI exposure configured: its tfvars omit
-`app_expose_via_alb`, so nothing but the chart's `ClusterIP` Service exists and
-the only access is `kubectl port-forward`. The variables are per-environment, so
-enabling the ALB + TLS there is a tfvars change and nothing more.
+Production now has the same exposure as dev: an internet-facing ALB limited to
+the same `app_lb_allowed_cidrs`, with HTTPS at `example-openmetadata.com`
+on a certificate Terraform issues and validates in the shared Route 53 zone.
+Everything below applies to both environments — and matters more in
+production, where the data is real.
 
 Dev moved from an NLB to an ALB Ingress on 2026-09-04, which closed most of what
 this section used to list as future work — L7 is now available, health checks
@@ -599,12 +601,23 @@ is still open:
    browsers only: it 302-redirects API clients, and it leaves everyone sharing
    the one admin account. Pick one, never both. See the note at the bottom of
    `alb_ingress.tf`.
-2. **HTTP→HTTPS redirect.** Port 80 is still not served. The ALB can do it in a
-   listener rule (`ssl-redirect`), which the NLB could not — it is now a
-   one-annotation change rather than an architecture one.
-3. **WAF and managed rules.** Now attachable, since the load balancer is an ALB.
-   This is also where you stop maintaining `/32`s by hand — the dev allowlist
-   still carries dynamic ISP addresses that will keep drifting.
+2. **HTTP→HTTPS redirect — done.** The ALB now also listens on plain HTTP:80,
+   and `ssl-redirect` answers every request there with a 301 to HTTPS:443, so
+   typing the bare hostname works. Port 80 never reaches the pod, and the
+   allowlist covers it like the other listeners.
+3. **WAF — done, partly in count mode.** `app_waf_enabled` (on in both
+   environments) puts a web ACL in front of the ALB (`waf.tf`):
+   - **Blocks:** AWS IP reputation, known bad inputs (Log4Shell-style payloads),
+     and the core rule set.
+   - **Only counts:** the per-IP rate limit, plus three core rules that misfire
+     on OpenMetadata's own request bodies (8 KB size limit, XSS and LFI in
+     body). Review the matches in the `aws-waf-logs-<cluster>-omd` log group
+     and in the WAF metrics, then promote them to blocking.
+
+   Still open: replacing the hand-maintained `/32`s in the allowlist. The
+   security group still decides who can connect; WAF only inspects what they
+   send. A WAF IP set rule could take over the allowlist, but that is a
+   separate change.
 4. **Multi-replica.** Cookie stickiness is configured, but the sessions are
    still in-memory per pod, so a pod restart logs its users out.
 

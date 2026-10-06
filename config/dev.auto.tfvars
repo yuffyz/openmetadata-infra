@@ -84,6 +84,29 @@ app_lb_allowed_cidrs = [
 # > through the module's helm_values, not app_extra_helm_values (which reaches
 # > Helm as --set and retypes strings).
 
+# --- WAF ---------------------------------------------------------------------
+# AWS WAF in front of the ALB: IP reputation, known bad inputs (e.g. Log4Shell
+# against this Java app) and the AWS core rule set block; three core rules that
+# misfire on OpenMetadata's own request bodies, and the per-IP rate limit, only
+# count for now. waf.tf explains each choice. Requests are logged, with cookies
+# and auth headers redacted, to CloudWatch log group aws-waf-logs-<cluster>-omd.
+#
+# This does not replace app_lb_allowed_cidrs: the allowlist still decides who
+# can connect, and WAF inspects what they send.
+app_waf_enabled = true
+
+# --- OpenSearch over IAM: ON in dev (trial) ----------------------------------
+# The server signs search requests with its pod's IAM role (SigV4 via IRSA)
+# instead of sending the master password, so the domain and the
+# opensearch-credentials secret can drift without breaking search.
+# opensearch_iam.tf has the mechanics; deploy.yml maps the role inside
+# OpenSearch and verifies the signed path after every apply.
+#
+# The proof that matters: once this is applied and green, change the domain's
+# master password (openmetadata-ops -> rotate-opensearch-password) and confirm
+# Explore still works. Turn it on in production only after that.
+opensearch_iam_auth = true
+
 # --- UI branding -------------------------------------------------------------
 # Page titles read "<route> | Example Catalog" instead of
 # "<route> | OpenMetadata" -- so the tab for the database services page shows
