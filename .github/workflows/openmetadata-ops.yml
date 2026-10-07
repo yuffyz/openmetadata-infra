@@ -620,9 +620,15 @@ jobs:
         if: ${{ github.event.inputs.action == 'set-shard-template' }}
         env:
           TEMPLATE_NAME: openmetadata-shards
-          # OpenMetadata's entity and report indices, with or without its
-          # clusterAlias prefix. Dot-prefixed system indices never match.
-          TEMPLATE_PATTERNS: "*_search_index *_report_data_index"
+          # The concrete indices OpenMetadata creates when it (re)indexes:
+          # <entity>_search_index_rebuild_<epoch>, with the plain
+          # <entity>_search_index name only an alias onto it -- and a template
+          # matches index names, never aliases. With or without its
+          # clusterAlias prefix. Not the bare "*_search_index": that also takes
+          # vector_search_index, which OpenMetadata creates from its own
+          # om_vector_search_index (knn) template, so the overlap check refuses
+          # it (dev, 2026-10-07). Dot-prefixed system indices never match.
+          TEMPLATE_PATTERNS: "*_search_index_rebuild_* *_report_data_index_rebuild_*"
         run: |
           set -uo pipefail
           ENV_NAME="${{ github.event.inputs.environment }}"
@@ -817,7 +823,7 @@ jobs:
           echo "@@END@@"
           # Simulated names that match each pattern, so this checks the
           # template as OpenSearch resolves it without creating anything.
-          for n in zz_shardcheck_search_index zz_shardcheck_report_data_index; do
+          for n in zz_shardcheck_search_index_rebuild_1 zz_shardcheck_report_data_index_rebuild_1; do
             echo "@@SIM@@"
             curl -s --max-time 120 -X POST $A "$B/_index_template/_simulate_index/$n"
             echo

@@ -1121,7 +1121,8 @@ or fix the shard defaults once the domain is right-sized.
   OpenMetadata index (0 replicas in dev, 1 elsewhere), cutting that to ~150, or
   ~75 without replicas. Shard count is fixed when an index is created, so:
   1. Run `set-shard-template`. It refuses, writing nothing, if its patterns
-     (`*_search_index`, `*_report_data_index`) could match the same names as an
+     (`*_search_index_rebuild_*`, `*_report_data_index_rebuild_*` -- the
+     concrete index names; `*_search_index` is only the alias) could match the same names as an
      existing template. Composable templates do not merge, so overlapping one
      OpenMetadata owns (its `di-data-assets-*` data streams) would replace it.
   2. With the cluster green: **Settings → Applications → Search Indexing →
