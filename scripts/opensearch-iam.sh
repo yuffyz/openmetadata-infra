@@ -47,6 +47,50 @@ log() { printf '%s\n' "$*"; }
 err() { printf '::error::%s\n' "$*"; }
 case "$MODE" in map|check) ;; *) err "usage: $0 map|check"; exit 1 ;; esac
 
+# The newest Ready server pod that is NOT terminating, or empty.
+#
+# check must not address the server as deploy/$RELEASE. kubectl resolves that
+# to ONE pod of the Deployment's selector, preferring the pod that has been
+# Ready longest -- and it does not look at deletionTimestamp. Right after a
+# rollout the old pod is still in its grace period, still Running and Ready,
+# and older than its replacement, so exec and logs land on the pod that is
+# going away. That is how run 37552351108 (2026-10-07) failed check 3: it read
+# the outgoing pod, three seconds after `rollout status` returned.
+server_pod() {
+  local sel
+  sel=$(kubectl get deploy "$RELEASE" -n "$NAMESPACE" -o json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    m = json.load(sys.stdin)["spec"]["selector"]["matchLabels"]
+except Exception:
+    sys.exit(0)
+print(",".join(f"{k}={v}" for k, v in sorted(m.items())))')
+  [ -n "$sel" ] || return 0
+  kubectl get pods -n "$NAMESPACE" -l "$sel" -o json 2>/dev/null | python3 -c '
+import json, sys
+def ready(p):
+    return any(c["type"] == "Ready" and c["status"] == "True" for c in p["status"].get("conditions", []))
+pods = [p for p in json.load(sys.stdin)["items"]
+        if not p["metadata"].get("deletionTimestamp") and p["status"].get("phase") == "Running" and ready(p)]
+pods.sort(key=lambda p: p["metadata"]["creationTimestamp"])
+print(pods[-1]["metadata"]["name"] if pods else "")'
+}
+
+# map keeps deploy/: it only needs connection details any server pod has, and
+# it must still work when the server is crash-looping (see spec_env below).
+TARGET="deploy/$RELEASE"
+if [ "$MODE" = check ]; then
+  pod=""
+  for _ in $(seq 1 36); do                        # up to ~3 minutes
+    pod=$(server_pod)
+    [ -n "$pod" ] && break
+    sleep 5
+  done
+  [ -n "$pod" ] || { err "no Ready, non-terminating $RELEASE pod in $NAMESPACE"; exit 1; }
+  TARGET="pod/$pod"
+  log "checking server pod $pod"
+fi
+
 # Fallback when the server pod cannot be exec'd into -- crash-looping, or
 # not yet scheduled. The literal env values from the Deployment spec; entries
 # set by valueFrom (secrets) are skipped, and defaults fill the gaps.
@@ -67,7 +111,7 @@ for k, short, default in (("ELASTICSEARCH_HOST", "H", ""), ("ELASTICSEARCH_PORT"
 # map only needs host/port/user, so it falls back to the Deployment spec when
 # the pod cannot be exec'd -- the case where a crash-looping server is waiting
 # for exactly this mapping. check needs the live pod, and fails if it is gone.
-env_dump=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c '
+env_dump=$(kubectl exec -n "$NAMESPACE" "$TARGET" -- sh -c '
   echo "H=${ELASTICSEARCH_HOST:-}"
   echo "P=${ELASTICSEARCH_PORT:-443}"
   echo "U=${ELASTICSEARCH_USER:-admin}"
@@ -191,7 +235,7 @@ fail=0
 
 # 1. The image knows the setting. Looked up rather than assumed, both the key
 #    and the file, so an image without it says so plainly.
-supported=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c \
+supported=$(kubectl exec -n "$NAMESPACE" "$TARGET" -- sh -c \
   'grep -rl SEARCH_AWS_IAM_AUTH_ENABLED /opt/openmetadata/conf 2>/dev/null | head -1' 2>/dev/null | tr -d '\r')
 if [ -n "$supported" ]; then log "1 ok    image supports IAM auth ($supported)"
 else err "1 FAIL  this OpenMetadata image has no SEARCH_AWS_IAM_AUTH_ENABLED setting"; fail=1; fi
@@ -206,14 +250,42 @@ else
   fail=1
 fi
 
-# 3. The server actually took the IAM path (logged once, at client creation).
-logs=$(kubectl logs -n "$NAMESPACE" "deploy/$RELEASE" --tail=-1 2>/dev/null)
+# 3. The server actually took the IAM path (logged once, at client creation,
+#    at INFO by OpenSearchClient.createAwsSdk2Transport in 1.12.x).
+#
+#    That line is written once, at startup, so its absence only proves
+#    something if the log still reaches back to startup. The kubelet rotates
+#    container logs (10 MiB by default) and `kubectl logs` returns only the
+#    current file, so on a server that has been up for a while the line is
+#    simply gone. Compare the first surviving timestamp with the container's
+#    start: if the beginning is missing, say so instead of claiming the server
+#    is on the password.
+logs=$(kubectl logs -n "$NAMESPACE" "$TARGET" --tail=-1 --timestamps 2>/dev/null)
+started=$(kubectl get -n "$NAMESPACE" "$TARGET" \
+  -o jsonpath='{.status.containerStatuses[0].state.running.startedAt}' 2>/dev/null)
+log_start_missing=$(FIRST="$(printf '%s\n' "$logs" | head -1 | cut -d' ' -f1)" STARTED="$started" python3 -c '
+import os
+from datetime import datetime
+def ts(s):
+    s = s.strip().rstrip("Z")
+    if "." in s:
+        head, frac = s.split(".", 1)
+        s = head + "." + frac[:6]
+    return datetime.fromisoformat(s)
+try:
+    gap = (ts(os.environ["FIRST"]) - ts(os.environ["STARTED"])).total_seconds()
+except Exception:
+    gap = 0
+print("yes" if gap > 120 else "no")')
+
 if printf '%s' "$logs" | grep -q 'Failed to create AwsSdk2Transport'; then
   err "3 FAIL  the server failed to create its SigV4 transport -- see 'Failed to create AwsSdk2Transport' in its log"; fail=1
 elif printf '%s' "$logs" | grep -q 'Creating AwsSdk2Transport for AWS OpenSearch IAM auth'; then
   log "3 ok    server log: SigV4 transport created"
+elif [ "$log_start_missing" = yes ]; then
+  printf '::warning::%s\n' "3 SKIP  ${TARGET#pod/} started at $started but its log now begins later (rotated), so the startup line cannot be checked. Restart the server (openmetadata-ops -> restart-server) and re-run to verify."
 else
-  err "3 FAIL  no SigV4 transport line in the server log -- it is still on the password"; fail=1
+  err "3 FAIL  no SigV4 transport line in ${TARGET#pod/}'s log since it started at $started -- it is still on the password"; fail=1
 fi
 
 # 4. A request signed with the server's role is accepted and authorised.
