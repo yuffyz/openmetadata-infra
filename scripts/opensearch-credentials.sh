@@ -87,7 +87,7 @@ server_env() {
     echo "P=${ELASTICSEARCH_PORT:-443}"
     echo "S=${ELASTICSEARCH_SCHEME:-https}"
     echo "U=${ELASTICSEARCH_USER:-admin}"' 2>/dev/null)
-  printf '%s\n' "$out" | grep -q '^H=..' || out=$(spec_env)
+  grep -q '^H=..' <<<"$out" || out=$(spec_env)
   printf '%s\n' "$out" | tr -d '\r' | sed -e 's/=\"\(.*\)\"$/=\1/'
 }
 

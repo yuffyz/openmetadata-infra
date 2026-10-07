@@ -191,7 +191,7 @@ jobs:
           fi
           export ROLE_ARN
           out=$(bash "$GITHUB_WORKSPACE/scripts/opensearch-iam.sh" map); echo "$out"
-          if printf '%s' "$out" | grep -q '^mapped'; then
+          if grep -q '^mapped' <<<"$out"; then
             kubectl rollout restart deploy/openmetadata -n openmetadata
           fi
           kubectl rollout status deploy/openmetadata -n openmetadata --timeout=10m

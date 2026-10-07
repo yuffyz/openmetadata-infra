@@ -119,7 +119,7 @@ env_dump=$(kubectl exec -n "$NAMESPACE" "$TARGET" -- sh -c '
   echo "ROLE=${AWS_ROLE_ARN:-}"
   echo "TOKEN=${AWS_WEB_IDENTITY_TOKEN_FILE:-}"' 2>/dev/null \
   | tr -d '\r' | sed -e 's/=\"\(.*\)\"$/=\1/')
-printf '%s\n' "$env_dump" | grep -q '^H=..' \
+grep -q '^H=..' <<<"$env_dump" \
   || env_dump=$(spec_env | tr -d '\r' | sed -e 's/=\"\(.*\)\"$/=\1/')
 field() { printf '%s\n' "$env_dump" | sed -n "s/^$1=//p"; }
 OS_HOST=$(field H); OS_PORT=$(field P); OS_USER=$(field U)
@@ -263,7 +263,8 @@ fi
 logs=$(kubectl logs -n "$NAMESPACE" "$TARGET" --tail=-1 --timestamps 2>/dev/null)
 started=$(kubectl get -n "$NAMESPACE" "$TARGET" \
   -o jsonpath='{.status.containerStatuses[0].state.running.startedAt}' 2>/dev/null)
-log_start_missing=$(FIRST="$(printf '%s\n' "$logs" | head -1 | cut -d' ' -f1)" STARTED="$started" python3 -c '
+first_line=${logs%%$'\n'*}
+log_start_missing=$(FIRST="${first_line%% *}" STARTED="$started" python3 -c '
 import os
 from datetime import datetime
 def ts(s):
@@ -278,9 +279,14 @@ except Exception:
     gap = 0
 print("yes" if gap > 120 else "no")')
 
-if printf '%s' "$logs" | grep -q 'Failed to create AwsSdk2Transport'; then
+# Here-strings, never `printf "$logs" | grep -q`: grep -q exits at the first
+# match, the still-writing printf gets SIGPIPE, and under `set -o pipefail` the
+# pipeline then reports FAILURE -- so a found line reads as missing. On a large
+# server log that is exactly what happened ("printf: write error: Broken pipe",
+# then "3 FAIL ... still on the password" on a server that was on SigV4).
+if grep -q 'Failed to create AwsSdk2Transport' <<<"$logs"; then
   err "3 FAIL  the server failed to create its SigV4 transport -- see 'Failed to create AwsSdk2Transport' in its log"; fail=1
-elif printf '%s' "$logs" | grep -q 'Creating AwsSdk2Transport for AWS OpenSearch IAM auth'; then
+elif grep -q 'Creating AwsSdk2Transport for AWS OpenSearch IAM auth' <<<"$logs"; then
   log "3 ok    server log: SigV4 transport created"
 elif [ "$log_start_missing" = yes ]; then
   printf '::warning::%s\n' "3 SKIP  ${TARGET#pod/} started at $started but its log now begins later (rotated), so the startup line cannot be checked. Restart the server (openmetadata-ops -> restart-server) and re-run to verify."
