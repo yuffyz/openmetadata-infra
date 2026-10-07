@@ -134,6 +134,11 @@ jobs:
       # this is the only check that does. See scripts/opensearch-credentials.sh
       # for what "heal" does -- it only ever acts on a 401 or a stale pod.
       #
+      # The scripts are run with `bash script.sh`, never directly: the files can
+      # reach the deploying repo without their executable bit (a copy or a web
+      # upload stores them as 100644), and a direct call then dies with
+      # "Permission denied" / exit 126 after the apply has already succeeded.
+      #
       # Fails the job if search is still broken afterwards: the apply itself
       # succeeded, but a deploy that leaves Explore empty is not a success.
       # Skipped for environments without an AWS OpenSearch domain.
@@ -153,7 +158,7 @@ jobs:
           export OS_DOMAIN
           aws eks update-kubeconfig --region "$AWS_REGION" \
             --name "$(terraform output -raw eks_cluster_name)" >/dev/null
-          "$GITHUB_WORKSPACE/scripts/opensearch-credentials.sh" heal
+          bash "$GITHUB_WORKSPACE/scripts/opensearch-credentials.sh" heal
 
       # When opensearch_iam_auth is on, the server signs search requests with
       # its IAM role instead of sending the password (terraform/opensearch_iam.tf).
@@ -185,12 +190,12 @@ jobs:
             exit 0
           fi
           export ROLE_ARN
-          out=$("$GITHUB_WORKSPACE/scripts/opensearch-iam.sh" map); echo "$out"
+          out=$(bash "$GITHUB_WORKSPACE/scripts/opensearch-iam.sh" map); echo "$out"
           if printf '%s' "$out" | grep -q '^mapped'; then
             kubectl rollout restart deploy/openmetadata -n openmetadata
           fi
           kubectl rollout status deploy/openmetadata -n openmetadata --timeout=10m
-          "$GITHUB_WORKSPACE/scripts/opensearch-iam.sh" check
+          bash "$GITHUB_WORKSPACE/scripts/opensearch-iam.sh" check
 
       - name: Output kubeconfig command
         working-directory: ${{ env.TF_DIR }}

@@ -488,7 +488,7 @@ jobs:
             echo "::error::This environment has no AWS OpenSearch domain (in-cluster via the deps chart)"
             exit 1
           fi
-          scripts/opensearch-credentials.sh heal
+          bash scripts/opensearch-credentials.sh heal
 
       # Sets a BRAND NEW password on both sides, rather than trying to make one
       # side match the other.
