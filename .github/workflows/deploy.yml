@@ -124,6 +124,7 @@ jobs:
           path: ${{ env.TF_DIR }}
 
       - name: Terraform apply
+        id: apply
         working-directory: ${{ env.TF_DIR }}
         run: terraform apply -input=false tfplan
 
@@ -165,7 +166,13 @@ jobs:
       # On the apply that first enables it, the restarted server meets an
       # unmapped role and can fail its startup checks; once the mapping is new,
       # the server is restarted so it does not sit out a crash-loop backoff.
+      #
+      # Runs whenever the apply itself succeeded, even if the password check
+      # above failed: a server switched to IAM but not yet mapped can be
+      # crash-looping, which is exactly what makes the check above fail -- and
+      # mapping the role here is the fix, so it must not be skipped.
       - name: Verify search over IAM
+        if: ${{ !cancelled() && steps.apply.outcome == 'success' }}
         working-directory: ${{ env.TF_DIR }}
         env:
           AWS_REGION: ${{ vars.AWS_REGION }}

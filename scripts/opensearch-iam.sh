@@ -47,7 +47,26 @@ log() { printf '%s\n' "$*"; }
 err() { printf '::error::%s\n' "$*"; }
 case "$MODE" in map|check) ;; *) err "usage: $0 map|check"; exit 1 ;; esac
 
+# Fallback when the server pod cannot be exec'd into -- crash-looping, or
+# not yet scheduled. The literal env values from the Deployment spec; entries
+# set by valueFrom (secrets) are skipped, and defaults fill the gaps.
+spec_env() {
+  kubectl get deploy "$RELEASE" -n "$NAMESPACE" -o json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    c = json.load(sys.stdin)["spec"]["template"]["spec"]["containers"][0]
+except Exception:
+    sys.exit(0)
+env = {e["name"]: e["value"] for e in c.get("env", []) if "value" in e}
+for k, short, default in (("ELASTICSEARCH_HOST", "H", ""), ("ELASTICSEARCH_PORT", "P", "443"),
+                          ("ELASTICSEARCH_SCHEME", "S", "https"), ("ELASTICSEARCH_USER", "U", "admin")):
+    print(f"{short}={env.get(k, default)}")'
+}
+
 # Connection details as the server sees them, the chart's quotes stripped.
+# map only needs host/port/user, so it falls back to the Deployment spec when
+# the pod cannot be exec'd -- the case where a crash-looping server is waiting
+# for exactly this mapping. check needs the live pod, and fails if it is gone.
 env_dump=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c '
   echo "H=${ELASTICSEARCH_HOST:-}"
   echo "P=${ELASTICSEARCH_PORT:-443}"
@@ -56,6 +75,8 @@ env_dump=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c '
   echo "ROLE=${AWS_ROLE_ARN:-}"
   echo "TOKEN=${AWS_WEB_IDENTITY_TOKEN_FILE:-}"' 2>/dev/null \
   | tr -d '\r' | sed -e 's/=\"\(.*\)\"$/=\1/')
+printf '%s\n' "$env_dump" | grep -q '^H=..' \
+  || env_dump=$(spec_env | tr -d '\r' | sed -e 's/=\"\(.*\)\"$/=\1/')
 field() { printf '%s\n' "$env_dump" | sed -n "s/^$1=//p"; }
 OS_HOST=$(field H); OS_PORT=$(field P); OS_USER=$(field U)
 [ -n "$OS_HOST" ] || { err "ELASTICSEARCH_HOST is empty in the server pod"; exit 1; }

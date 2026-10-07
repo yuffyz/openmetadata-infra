@@ -69,8 +69,10 @@ locals {
 resource "aws_wafv2_web_acl" "app" {
   count = local.app_waf_enabled ? 1 : 0
 
-  name        = local.app_waf_name
-  description = "OpenMetadata UI (${var.eks_cluster_name})"
+  name = local.app_waf_name
+  # WAF descriptions allow only letters, digits, whitespace and + = : # @ / - , .
+  # -- no parentheses; CreateWebACL rejects anything else with a 400.
+  description = "OpenMetadata UI for cluster ${var.eks_cluster_name}"
   scope       = "REGIONAL"
 
   default_action {

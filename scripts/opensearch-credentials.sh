@@ -61,15 +61,34 @@ secret_password() {
 
 sha() { python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:12])'; }
 
-# Connection details as the server sees them. The chart wraps these values in
-# literal double quotes; strip them (see the Probe step in openmetadata-ops).
+# Fallback when the server pod cannot be exec'd into -- crash-looping, or
+# not yet scheduled. The literal env values from the Deployment spec; entries
+# set by valueFrom (secrets) are skipped, and defaults fill the gaps.
+spec_env() {
+  kubectl get deploy "$RELEASE" -n "$NAMESPACE" -o json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    c = json.load(sys.stdin)["spec"]["template"]["spec"]["containers"][0]
+except Exception:
+    sys.exit(0)
+env = {e["name"]: e["value"] for e in c.get("env", []) if "value" in e}
+for k, short, default in (("ELASTICSEARCH_HOST", "H", ""), ("ELASTICSEARCH_PORT", "P", "443"),
+                          ("ELASTICSEARCH_SCHEME", "S", "https"), ("ELASTICSEARCH_USER", "U", "admin")):
+    print(f"{short}={env.get(k, default)}")'
+}
+
+# Connection details as the server sees them, falling back to the Deployment
+# spec. The chart wraps these values in literal double quotes; strip them (see
+# the Probe step in openmetadata-ops).
 server_env() {
-  kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c '
+  local out
+  out=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c '
     echo "H=${ELASTICSEARCH_HOST:-}"
     echo "P=${ELASTICSEARCH_PORT:-443}"
     echo "S=${ELASTICSEARCH_SCHEME:-https}"
-    echo "U=${ELASTICSEARCH_USER:-admin}"' 2>/dev/null \
-  | tr -d '\r' | sed -e 's/=\"\(.*\)\"$/=\1/'
+    echo "U=${ELASTICSEARCH_USER:-admin}"' 2>/dev/null)
+  printf '%s\n' "$out" | grep -q '^H=..' || out=$(spec_env)
+  printf '%s\n' "$out" | tr -d '\r' | sed -e 's/=\"\(.*\)\"$/=\1/'
 }
 
 # The password the RUNNING server holds, hashed. Compared against the secret's
@@ -165,6 +184,9 @@ PW=$(secret_password)
 
 secret_sha=$(printf %s "$PW" | sha)
 pod_sha=$(server_password_sha)
+# sha of empty input: the server pod could not be exec'd (crash-looping or not
+# running). Treated as stale, so heal restarts it -- which is also the cure.
+[ "$pod_sha" = "$(printf '' | sha)" ] && log "server pod not reachable for exec -- treating it as stale"
 stale=no
 [ "$secret_sha" = "$pod_sha" ] || stale=yes
 code=$(probe)
@@ -217,5 +239,10 @@ if [ "$pod_sha" = "$secret_sha" ] && [ "$code" = 200 ]; then
   exit 0
 fi
 err "still unhealthy after healing (server matches secret: $([ "$pod_sha" = "$secret_sha" ] && echo yes || echo no), HTTP $code)."
-err "If UpdateVersion moved but 401 persists, reset the password from OpenSearch Dashboards: Security -> Internal users."
+if [ "$pod_sha" = "$(printf '' | sha)" ]; then
+  err "The server pod is not running (crash-looping?) -- check: kubectl logs -n $NAMESPACE deploy/$RELEASE --previous"
+  err "With opensearch_iam_auth on, an unmapped IAM role is a likely cause; deploy.yml's next step maps it."
+else
+  err "If UpdateVersion moved but 401 persists, reset the password from OpenSearch Dashboards: Security -> Internal users."
+fi
 exit 1
