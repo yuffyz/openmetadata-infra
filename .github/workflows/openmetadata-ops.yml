@@ -571,9 +571,21 @@ jobs:
           PY
           )
 
+          # Detached, then logs: the attach form drops the first responses (see
+          # the Probe step), which here are the "before" health readings.
           kubectl run "$POD_NAME" -n "$NAMESPACE" \
-            --image=curlimages/curl:8.11.1 --restart=Never --rm -i --quiet \
-            --pod-running-timeout=3m --overrides="$OVERRIDES" || true
+            --image=curlimages/curl:8.11.1 --restart=Never \
+            --overrides="$OVERRIDES" >/dev/null || true
+          phase=""
+          for _ in $(seq 1 90); do          # ~3 minutes (the script sleeps 20s)
+            phase=$(kubectl get pod -n "$NAMESPACE" "$POD_NAME" \
+                      -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            case "$phase" in Succeeded|Failed) break ;; esac
+            sleep 2
+          done
+          kubectl logs -n "$NAMESPACE" "$POD_NAME" 2>/dev/null || true
+          kubectl delete pod -n "$NAMESPACE" "$POD_NAME" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+          [ "$phase" = Succeeded ] || echo "::warning::replica pod ended in phase ${phase:-unknown}"
 
           echo
           echo "Expect status=green and unassign=0 in the 'after' block."
@@ -662,9 +674,27 @@ jobs:
           }))
           PY
             )
+            # Detached, then logs -- never `kubectl run -i --rm`. The attach form
+            # loses output written before the stream is up (see the Probe step),
+            # and a lost or cut section then fails the parse below with nothing
+            # in the log to say why. That is how this action first failed on
+            # dev (2026-10-07: "could not read TEMPLATES").
             kubectl run "$name" -n "$NAMESPACE" \
-              --image=curlimages/curl:8.11.1 --restart=Never --rm -i --quiet \
-              --pod-running-timeout=3m --overrides="$overrides"
+              --image=curlimages/curl:8.11.1 --restart=Never \
+              --overrides="$overrides" >/dev/null || return 1
+            local phase=""
+            for _ in $(seq 1 90); do                 # ~3 minutes
+              phase=$(kubectl get pod -n "$NAMESPACE" "$name" \
+                        -o jsonpath='{.status.phase}' 2>/dev/null || true)
+              case "$phase" in Succeeded|Failed) break ;; esac
+              sleep 2
+            done
+            kubectl logs -n "$NAMESPACE" "$name" 2>/dev/null
+            kubectl delete pod -n "$NAMESPACE" "$name" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+            if [ "$phase" != Succeeded ]; then
+              echo "::error::pod $name ended in phase ${phase:-unknown}" >&2
+              return 1
+            fi
           }
 
           # --- phase 1: read-only --------------------------------------------
@@ -673,9 +703,9 @@ jobs:
           B="$OS_SCHEME://$OS_HOST:$OS_PORT"
           A="-u $OS_USER:$OS_PASS"
           for part in "HEALTH _cluster/health" \
-                      "TEMPLATES _index_template" \
+                      "TEMPLATES _index_template?filter_path=index_templates.name,index_templates.index_template.index_patterns,index_templates.index_template.priority,index_templates.index_template.data_stream" \
                       "INDICES _cat/indices?format=json&h=index,pri,rep,docs.count&expand_wildcards=open" \
-                      "STREAMS _data_stream"; do
+                      "STREAMS _data_stream?filter_path=data_streams.name"; do
             set -- $part
             echo "@@$1@@"
             curl -s --max-time 120 $A "$B/$2"
@@ -696,9 +726,19 @@ jobs:
           def load(k):
               try:
                   return json.loads(parts[k])
-              except Exception:
-                  print(raw[-3000:])
-                  print(f"::error::could not read {k} from OpenSearch -- see the output above")
+              except Exception as e:
+                  # Enough to tell a missing section, a cut one and an error
+                  # body apart -- not the tail of everything, which is how the
+                  # first failure hid its cause.
+                  print(f"sections received: {sorted(parts)}  (raw output {len(raw)} bytes)")
+                  if k in parts:
+                      body = parts[k]
+                      print(f"{k}: {len(body)} bytes, {type(e).__name__}: {e}")
+                      print(f"{k} starts: {body[:400]!r}")
+                      print(f"{k} ends:   {body[-200:]!r}")
+                  else:
+                      print(f"{k}: section missing; raw output starts: {raw[:400]!r}")
+                  print(f"::error::could not read {k} from OpenSearch -- details above")
                   sys.exit(1)
 
           health, templates, indices, streams = (load(k) for k in ("HEALTH", "TEMPLATES", "INDICES", "STREAMS"))
