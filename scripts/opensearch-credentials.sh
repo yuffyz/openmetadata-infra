@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Checks, and optionally heals, OpenSearch password drift for one environment.
+# Checks, and optionally heals, the OpenSearch ADMIN password for one
+# environment: that the domain's master user still accepts the password in
+# the opensearch-credentials secret.
 #
 #   scripts/opensearch-credentials.sh check   # report only
-#   scripts/opensearch-credentials.sh heal    # check, and fix what it finds
+#   scripts/opensearch-credentials.sh heal    # check, and fix the domain if not
 #
 # Run by deploy.yml after every apply, and by openmetadata-ops for
 # reset-opensearch-password. Needs kubectl pointed at the cluster, AWS
@@ -15,29 +17,25 @@
 #   RELEASE     default openmetadata (Deployment name)
 #   RUN_ID      suffix for the probe pod name, default $$
 #
-# There are two ways the password drifts, and they need different fixes:
+# Why this still matters with the server on IAM (opensearch_iam_auth): the
+# OpenMetadata server no longer uses this password, so drift here no longer
+# breaks search. But the password is still how anything administers the
+# domain -- opensearch-iam.sh map (which authorises the server's IAM role),
+# the openmetadata-ops probes, and OpenSearch Dashboards all log in as the
+# master user. A drifted admin password makes all of those fail.
 #
-#   STALE POD  The secret changed but the server pod started before that, and
-#              it embeds the password at container start. Fix: restart it.
-#              (opensearch_password.tf now does this on apply; this is the
-#              safety net.)
+# Drift means the domain's master password differs from the secret. Terraform
+# cannot see this -- AWS never returns the password -- so a plan stays clean
+# while the admin login is rejected with 401.
 #
-#   DOMAIN     The domain's master password differs from the secret. Terraform
-#              cannot see this -- AWS never returns the password -- so a plan
-#              stays clean while every search request gets 401. Fix: set the
-#              domain to the secret's value.
-#
-# Why the domain fix is a "bounce": sending the secret's value straight to the
-# domain is often accepted and silently not applied -- AWS returns success and
+# The fix is a "bounce": sending the secret's value straight to the domain is
+# often accepted and silently not applied -- AWS returns success and
 # AdvancedSecurityOptions.Status.UpdateVersion does not move (README_full.md,
 # "Fixing password drift"). So this first sets a throwaway password, which AWS
 # cannot treat as unchanged, then the secret's value, which now differs from
-# the current one, and checks that UpdateVersion moved both times.
-#
-# The end state is the secret's value, which is Terraform's value. That is the
-# difference from rotate-opensearch-password: rotation picks a NEW password, so
-# the next apply puts the secret back to Terraform's and the domain is left
-# behind again -- which this script then has to bounce.
+# the current one, and checks that UpdateVersion moved both times. The end
+# state is the secret's value, which is Terraform's value, so the next apply
+# has nothing to undo.
 #
 # Exit codes: 0 healthy (or healed), 1 unhealthy and not fixed,
 #             2 could not determine (no answer from OpenSearch).
@@ -59,8 +57,6 @@ secret_password() {
   kubectl get secret -n "$NAMESPACE" "$SECRET" -o jsonpath='{.data.password}' | base64 -d
 }
 
-sha() { python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:12])'; }
-
 # Fallback when the server pod cannot be exec'd into -- crash-looping, or
 # not yet scheduled. The literal env values from the Deployment spec; entries
 # set by valueFrom (secrets) are skipped, and defaults fill the gaps.
@@ -77,9 +73,9 @@ for k, short, default in (("ELASTICSEARCH_HOST", "H", ""), ("ELASTICSEARCH_PORT"
     print(f"{short}={env.get(k, default)}")'
 }
 
-# Connection details as the server sees them, falling back to the Deployment
-# spec. The chart wraps these values in literal double quotes; strip them (see
-# the Probe step in openmetadata-ops).
+# Where the domain is and who the master user is, as the server pod sees them,
+# falling back to the Deployment spec. The chart wraps these values in literal
+# double quotes; strip them (see the Probe step in openmetadata-ops).
 server_env() {
   local out
   out=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c '
@@ -89,14 +85,6 @@ server_env() {
     echo "U=${ELASTICSEARCH_USER:-admin}"' 2>/dev/null)
   grep -q '^H=..' <<<"$out" || out=$(spec_env)
   printf '%s\n' "$out" | tr -d '\r' | sed -e 's/=\"\(.*\)\"$/=\1/'
-}
-
-# The password the RUNNING server holds, hashed. Compared against the secret's
-# hash to spot a stale pod without either value leaving the cluster.
-server_password_sha() {
-  kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- \
-    sh -c 'printf %s "$ELASTICSEARCH_PASSWORD"' 2>/dev/null \
-  | tr -d '\r' | sed -e 's/^"\(.*\)"$/\1/' | sha
 }
 
 # Runs a one-shot pod to completion and prints its output on stdout.
@@ -206,74 +194,43 @@ PY
 }
 
 # --- check ---------------------------------------------------------------------
-kubectl rollout status "deploy/$RELEASE" -n "$NAMESPACE" --timeout=10m >/dev/null 2>&1 \
-  || log "warning: deploy/$RELEASE is not fully rolled out; checking anyway"
-
 PW=$(secret_password)
 [ -n "$PW" ] || { err "$SECRET is empty or missing in $NAMESPACE"; exit 1; }
 [ -n "${GITHUB_ACTIONS:-}" ] && echo "::add-mask::$PW"
 
-secret_sha=$(printf %s "$PW" | sha)
-pod_sha=$(server_password_sha)
-# sha of empty input: the server pod could not be exec'd (crash-looping or not
-# running). Treated as stale, so heal restarts it -- which is also the cure.
-[ "$pod_sha" = "$(printf '' | sha)" ] && log "server pod not reachable for exec -- treating it as stale"
-stale=no
-[ "$secret_sha" = "$pod_sha" ] || stale=yes
 code=$(probe)
+log "OpenSearch admin login with the secret's password: HTTP $code"
 
-log "secret password sha256: $secret_sha"
-log "server password sha256: $pod_sha  (stale pod: $stale)"
-log "OpenSearch with the secret's password: HTTP $code"
-
-if [ "$stale" = no ] && [ "$code" = 200 ]; then
-  log "OK: server, secret and domain agree."
+if [ "$code" = 200 ]; then
+  log "OK: the domain accepts the admin password in $SECRET."
   exit 0
 fi
-if [ "$code" != 200 ] && [ "$code" != 401 ]; then
+if [ "$code" != 401 ]; then
   err "OpenSearch did not give a usable answer (HTTP $code) -- not a credential verdict. Run openmetadata-ops diagnose."
   exit 2
 fi
-
 if [ "$MODE" = check ]; then
-  [ "$stale" = yes ] && err "the server pod holds an old password: restart it (heal does this)"
-  [ "$code" = 401 ] && err "the domain rejects the secret's password: domain drift (heal fixes this)"
+  err "the domain rejects the secret's password: admin password drift (heal fixes this)"
   exit 1
 fi
 
 # --- heal ----------------------------------------------------------------------
-if [ "$code" = 401 ]; then
-  [ -n "${OS_DOMAIN:-}" ] || { err "OS_DOMAIN is not set; cannot fix the domain"; exit 1; }
-  user=$(server_env | sed -n 's/^U=//p'); user=${user:-admin}
-  log "Domain drift: bouncing the master password on $OS_DOMAIN back to the secret's value"
-  TEMP=$(python3 -c "import secrets,string; print('T' + ''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range(22)) + '_x9')")
-  [ -n "${GITHUB_ACTIONS:-}" ] && echo "::add-mask::$TEMP"
-  log "step 1/2: throwaway password"
-  set_domain_password "$TEMP" "$user" || exit 1
-  log "step 2/2: the secret's (Terraform's) password"
-  set_domain_password "$PW" "$user" || exit 1
-fi
-
-if [ "$stale" = yes ]; then
-  log "Stale pod: restarting deploy/$RELEASE so it reloads the secret"
-  kubectl rollout restart "deploy/$RELEASE" -n "$NAMESPACE"
-  kubectl rollout status  "deploy/$RELEASE" -n "$NAMESPACE" --timeout=10m || exit 1
-fi
+[ -n "${OS_DOMAIN:-}" ] || { err "OS_DOMAIN is not set; cannot fix the domain"; exit 1; }
+user=$(server_env | sed -n 's/^U=//p'); user=${user:-admin}
+log "Admin password drift: bouncing the master password on $OS_DOMAIN back to the secret's value"
+TEMP=$(python3 -c "import secrets,string; print('T' + ''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range(22)) + '_x9')")
+[ -n "${GITHUB_ACTIONS:-}" ] && echo "::add-mask::$TEMP"
+log "step 1/2: throwaway password"
+set_domain_password "$TEMP" "$user" || exit 1
+log "step 2/2: the secret's (Terraform's) password"
+set_domain_password "$PW" "$user" || exit 1
 
 # Re-check from scratch rather than trusting the steps above.
-pod_sha=$(server_password_sha)
 code=$(probe)
-log "after: server password sha256 $pod_sha, OpenSearch HTTP $code"
-if [ "$pod_sha" = "$secret_sha" ] && [ "$code" = 200 ]; then
-  log "HEALED: server, secret and domain agree."
-  log "If Explore is empty, re-run Search Indexing (Recreate Index = true)."
+log "after: OpenSearch admin login HTTP $code"
+if [ "$code" = 200 ]; then
+  log "HEALED: the domain accepts the admin password again."
   exit 0
 fi
-err "still unhealthy after healing (server matches secret: $([ "$pod_sha" = "$secret_sha" ] && echo yes || echo no), HTTP $code)."
-if [ "$pod_sha" = "$(printf '' | sha)" ]; then
-  err "The server pod is not running (crash-looping?) -- check: kubectl logs -n $NAMESPACE deploy/$RELEASE --previous"
-  err "With opensearch_iam_auth on, an unmapped IAM role is a likely cause; deploy.yml's next step maps it."
-else
-  err "If UpdateVersion moved but 401 persists, reset the password from OpenSearch Dashboards: Security -> Internal users."
-fi
+err "still rejected after the bounce (HTTP $code). If UpdateVersion moved but 401 persists, reset the password from OpenSearch Dashboards: Security -> Internal users."
 exit 1

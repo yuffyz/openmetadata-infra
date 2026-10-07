@@ -122,6 +122,16 @@ app_tls_route53_zone_name = "example-openmetadata.com"
 #   stable_nat_eip_name -- off in dev too. Turn it on before anything external
 #                          (e.g. Snowflake) allowlists production's egress IP.
 
+# --- OpenSearch over IAM: same as dev ---------------------------------------
+# The server signs search requests with its pod's IAM role instead of sending
+# the master password, so password drift cannot break search. Proven in dev
+# first; see dev.auto.tfvars and terraform/opensearch_iam.tf.
+#
+# > ⚠️ The first apply with this restarts the server onto IAM before its role
+# > is mapped inside OpenSearch, so search returns 403 for a minute or two
+# > until deploy.yml's "Verify search over IAM" step maps it. Schedule it.
+opensearch_iam_auth = true
+
 # --- OpenSearch: right-sized for production ----------------------------------
 # 2 x r6g.large.search (2 vCPU / 16 GiB, ~8 GiB JVM heap each), up from the
 # module default of 2 x t3.small.search (~1 GiB heap each).

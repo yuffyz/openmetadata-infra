@@ -95,16 +95,17 @@ app_lb_allowed_cidrs = [
 # can connect, and WAF inspects what they send.
 app_waf_enabled = true
 
-# --- OpenSearch over IAM: ON in dev (trial) ----------------------------------
+# --- OpenSearch over IAM --------------------------------------------------------
 # The server signs search requests with its pod's IAM role (SigV4 via IRSA)
 # instead of sending the master password, so the domain and the
 # opensearch-credentials secret can drift without breaking search.
 # opensearch_iam.tf has the mechanics; deploy.yml maps the role inside
 # OpenSearch and verifies the signed path after every apply.
 #
-# The proof that matters: once this is applied and green, change the domain's
-# master password (openmetadata-ops -> rotate-opensearch-password) and confirm
-# Explore still works. Turn it on in production only after that.
+# Proven here first (2026-10-06/07): checks 1, 2 and 4 of
+# scripts/opensearch-iam.sh passed on a running server, including a request
+# signed as the server's role getting all_access. Now the default; set
+# explicitly so the choice is visible in this file.
 opensearch_iam_auth = true
 
 # --- UI branding -------------------------------------------------------------

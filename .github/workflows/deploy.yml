@@ -128,21 +128,22 @@ jobs:
         working-directory: ${{ env.TF_DIR }}
         run: terraform apply -input=false tfplan
 
-      # Proves the server can still authenticate to OpenSearch, and fixes it
-      # if not. Terraform cannot see the domain's master password (AWS never
-      # returns it), so a clean apply says nothing about whether search works;
-      # this is the only check that does. See scripts/opensearch-credentials.sh
-      # for what "heal" does -- it only ever acts on a 401 or a stale pod.
+      # Proves the domain still accepts the ADMIN password in the
+      # opensearch-credentials secret, and bounces it back if not. Terraform
+      # cannot see the domain's master password (AWS never returns it), so a
+      # clean apply says nothing about it. The server itself uses IAM, not this
+      # password, but the next step maps the server's role AS the admin user,
+      # and the ops tooling logs in the same way -- so this runs first. See
+      # scripts/opensearch-credentials.sh; it only acts on a 401.
       #
       # The scripts are run with `bash script.sh`, never directly: the files can
       # reach the deploying repo without their executable bit (a copy or a web
       # upload stores them as 100644), and a direct call then dies with
       # "Permission denied" / exit 126 after the apply has already succeeded.
       #
-      # Fails the job if search is still broken afterwards: the apply itself
-      # succeeded, but a deploy that leaves Explore empty is not a success.
+      # Fails the job if the admin login is still rejected afterwards.
       # Skipped for environments without an AWS OpenSearch domain.
-      - name: Verify search credentials (heal if drifted)
+      - name: Verify OpenSearch admin password (heal if drifted)
         working-directory: ${{ env.TF_DIR }}
         env:
           AWS_REGION: ${{ vars.AWS_REGION }}

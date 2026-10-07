@@ -40,8 +40,7 @@ on:
           - restart-server           # rollout restart of the OpenMetadata deployment
           - diagnose-and-restart     # diagnose, restart, then diagnose again
           - test-search-write        # probe WRITE auth: creates and deletes a throwaway index
-          - reset-opensearch-password  # MUTATES: verified bounce of the domain password back to the secret's; restarts a stale server
-          - rotate-opensearch-password # MUTATES: new password on BOTH domain and secret, then restart (prefer reset)
+          - reset-opensearch-password  # MUTATES: verified bounce of the domain's admin password back to the secret's
           - reduce-replicas          # MUTATES (dev only): number_of_replicas = 0 on non-system indices
           - set-shard-template       # MUTATES: index template, 1 primary shard for OpenMetadata indices
           - show-exposure            # read-only: how the UI is published (LB, listeners, cert, DNS, SG)
@@ -144,39 +143,21 @@ jobs:
           kubectl get deploy,pods -n "$NAMESPACE" -o wide
           echo "::endgroup::"
 
-          echo "::group::Search credential drift (server pod vs Kubernetes secret)"
-          # The module regenerates the OpenSearch master password with
-          # random_password, and the OpenMetadata chart embeds it into
-          # openmetadata.yaml at CONTAINER START. A terraform apply that rolls the
-          # password therefore updates the secret while the running pod keeps the
-          # old one in memory -- search writes then fail as Unauthorized with
-          # everything else healthy. Compare hashes so nothing secret is logged.
-          #
-          # Hash only NON-EMPTY values. sha256sum of empty input is a perfectly
-          # valid digest (e3b0c442...), so hashing unconditionally would make a
-          # missing secret and an unset pod variable compare EQUAL and report
-          # "no drift" -- the exact opposite of the truth.
-          sec_b64=$(kubectl get secret -n "$NAMESPACE" opensearch-credentials \
-                      -o jsonpath='{.data.password}' 2>/dev/null || true)
-          pod_raw=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- \
-                      sh -c 'printf %s "${ELASTICSEARCH_PASSWORD:-}"' 2>/dev/null || true)
-
-          sec_hash=""
-          pod_hash=""
-          [ -n "$sec_b64" ] && sec_hash=$(printf %s "$sec_b64" | base64 -d | sha256sum | cut -c1-16)
-          [ -n "$pod_raw" ] && pod_hash=$(printf %s "$pod_raw" | sha256sum | cut -c1-16)
-
-          echo "secret password sha256[0:16] : ${sec_hash:-<empty or unreadable>}"
-          echo "pod ELASTICSEARCH_PASSWORD    : ${pod_hash:-<empty or unreadable>}"
-
-          if [ -z "$sec_hash" ]; then
-            echo "::warning::Could not read the opensearch-credentials secret"
-          elif [ -z "$pod_hash" ]; then
-            echo "::warning::ELASTICSEARCH_PASSWORD is empty/unset in the server pod -- the chart is not wiring the secret through"
-          elif [ "$sec_hash" != "$pod_hash" ]; then
-            echo "::warning::Server pod's OpenSearch password does not match the secret -- run action 'restart-server'"
+          echo "::group::Search authentication (how the server reaches OpenSearch)"
+          # With opensearch_iam_auth on, the server signs requests with its IAM
+          # role and never uses the master password, so comparing its copy of
+          # the password with the secret (what this section used to do) says
+          # nothing about search. Report the mode, and point at the right check.
+          iam=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- \
+                  sh -c 'printf %s "${SEARCH_AWS_IAM_AUTH_ENABLED:-}"' 2>/dev/null | tr -d '\r"' || true)
+          role=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- \
+                  sh -c 'printf %s "${AWS_ROLE_ARN:-}"' 2>/dev/null | tr -d '\r' || true)
+          if [ "$iam" = true ]; then
+            echo "IAM (SigV4) as ${role:-<no AWS_ROLE_ARN: pod predates the ServiceAccount annotation -- restart-server>}"
+            echo "The master password is not in the server's path. Verify end to end with:"
+            echo "  ROLE_ARN=<terraform output opensearch_iam_role_arn> bash scripts/opensearch-iam.sh check"
           else
-            echo "Passwords match; drift is not the cause."
+            echo "::warning::The server is on the master PASSWORD (opensearch_iam_auth off). After any password change, run restart-server."
           fi
           # Names only, never values.
           kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- \
@@ -460,23 +441,28 @@ jobs:
           echo "  two *_rebuild_<epoch> generations for one entity     -> a reindex is mid-flight; the alias names the live one"
           echo "  active_shards far above ~25 per GiB of node heap    -> shard pressure; reduce-replicas helps in dev"
 
-      # Re-points the domain's FGAC master user at the password already held in
-      # the opensearch-credentials secret -- which is Terraform's value -- and
-      # restarts the server if it holds an older one.
+      # Re-points the domain's FGAC master (admin) user at the password held in
+      # the opensearch-credentials secret -- which is Terraform's value.
       #
-      # Why this drifts: modules/opensearch/main.tf generates the password with
+      # The OpenMetadata server no longer uses this password (it signs with its
+      # IAM role, opensearch_iam_auth), so drift here does not break search. It
+      # does break administration: opensearch-iam.sh map, the probes in this
+      # workflow and OpenSearch Dashboards all log in as admin.
+      #
+      # Why it drifts: modules/opensearch/main.tf generates the password with
       # random_password and writes it to BOTH the domain and the Kubernetes
       # secret. AWS never returns master_user_password, so Terraform cannot
-      # detect that the domain's copy no longer matches -- a plan is clean while
-      # every search request is rejected with 401.
+      # detect that the domain's copy no longer matches.
       #
-      # Sending the secret's value straight to the domain used to be what this
-      # did, and AWS frequently accepted it and applied nothing. It now runs
-      # scripts/opensearch-credentials.sh heal, which "bounces" the password:
-      # a throwaway value first, then the secret's value, asserting that
-      # UpdateVersion moves both times, and re-probes afterwards. It only acts
-      # if it finds a 401 or a stale pod. deploy.yml runs the same script after
-      # every apply, so this action is for drift between applies.
+      # Runs scripts/opensearch-credentials.sh heal, which "bounces" the
+      # password (a throwaway value, then the secret's, asserting UpdateVersion
+      # moves both times -- a straight reset is often silently ignored by AWS)
+      # and re-probes. It only acts on a 401. deploy.yml runs the same script
+      # after every apply, so this action is for drift between applies.
+      #
+      # (rotate-opensearch-password, which set a NEW password on both sides,
+      # was removed on 2026-10-07: it diverged from Terraform state, and with
+      # the server on IAM there is no reason to rotate outside Terraform.)
       - name: Reset the OpenSearch master password to match the secret
         if: ${{ github.event.inputs.action == 'reset-opensearch-password' }}
         env:
@@ -489,111 +475,6 @@ jobs:
             exit 1
           fi
           bash scripts/opensearch-credentials.sh heal
-
-      # Sets a BRAND NEW password on both sides, rather than trying to make one
-      # side match the other.
-      #
-      # Why this exists: `reset-opensearch-password` sent the secret's value to
-      # the domain and AWS returned State=Active with an UpdateDate 11 days old
-      # -- it changed nothing, and the CLI reported no error. Sending a value
-      # AWS cannot regard as unchanged forces the update to be real, and removes
-      # any dependence on diagnosing which side was wrong.
-      #
-      # The generated password satisfies both AWS's complexity rule and the
-      # module's YAML-safety constraints (uppercase first character, specials
-      # limited to _ - . so it survives being embedded in openmetadata.yaml).
-      #
-      # NOTE: this diverges from Terraform state, which still holds the old
-      # random_password. The next `apply` reverts the SECRET to the state value
-      # (Terraform can read a Kubernetes secret) but NOT the domain (it cannot
-      # read the master password, so it sees no diff) -- which on its own would
-      # leave search broken again. deploy.yml's "Verify search credentials" step
-      # catches exactly that and bounces the domain back to the state value.
-      # Prefer reset-opensearch-password, which ends on Terraform's value and
-      # so creates no divergence at all.
-      - name: Rotate the OpenSearch password on both sides
-        if: ${{ github.event.inputs.action == 'rotate-opensearch-password' }}
-        run: |
-          set -euo pipefail
-          if [ -z "${OS_DOMAIN:-}" ]; then
-            echo "::error::This environment has no AWS OpenSearch domain"
-            exit 1
-          fi
-
-          NEWPW=$(python3 -c "
-          import secrets, string
-          body = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(20))
-          print('A' + body + '_a1')")
-          echo "::add-mask::$NEWPW"
-
-          OS_USER=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- \
-                      sh -c 'printf %s "${ELASTICSEARCH_USER:-admin}"' 2>/dev/null | tr -d '\r"')
-          OS_USER=${OS_USER:-admin}
-
-          BEFORE=$(aws opensearch describe-domain-config --domain-name "$OS_DOMAIN" \
-                     --region "${{ vars.AWS_REGION }}" \
-                     --query 'DomainConfig.AdvancedSecurityOptions.Status.UpdateVersion' --output text)
-          echo "master user '$OS_USER', AdvancedSecurityOptions UpdateVersion before: $BEFORE"
-
-          umask 077
-          CFG=$(mktemp); trap 'rm -f "$CFG"' EXIT
-          OS_DOMAIN="$OS_DOMAIN" OS_USER="$OS_USER" PW="$NEWPW" python3 - > "$CFG" <<'PY'
-          import json, os
-          print(json.dumps({
-              "DomainName": os.environ["OS_DOMAIN"],
-              "AdvancedSecurityOptions": {
-                  "Enabled": True,
-                  "InternalUserDatabaseEnabled": True,
-                  "MasterUserOptions": {
-                      "MasterUserName": os.environ["OS_USER"],
-                      "MasterUserPassword": os.environ["PW"],
-                  },
-              },
-          }))
-          PY
-          aws opensearch update-domain-config --region "${{ vars.AWS_REGION }}" \
-            --cli-input-json "file://$CFG" >/dev/null
-
-          # The whole point: prove the change was real. A no-op leaves
-          # UpdateVersion untouched, which is exactly how the previous attempt
-          # failed silently.
-          AFTER=$(aws opensearch describe-domain-config --domain-name "$OS_DOMAIN" \
-                    --region "${{ vars.AWS_REGION }}" \
-                    --query 'DomainConfig.AdvancedSecurityOptions.Status.UpdateVersion' --output text)
-          echo "UpdateVersion after: $AFTER"
-          if [ "$BEFORE" = "$AFTER" ]; then
-            echo "::error::AWS accepted the call but did not apply it (UpdateVersion unchanged at $BEFORE)."
-            echo "The AWS API path cannot set this domain's master password."
-            echo "Reset it from OpenSearch Dashboards instead:"
-            echo "  Security -> Internal users -> $OS_USER -> Edit -> reset password"
-            echo "then re-run this workflow with action=diagnose to confirm."
-            exit 1
-          fi
-
-          echo "Waiting for the domain to finish processing..."
-          for _ in $(seq 1 60); do
-            p=$(aws opensearch describe-domain --domain-name "$OS_DOMAIN" \
-                  --region "${{ vars.AWS_REGION }}" \
-                  --query 'DomainStatus.Processing' --output text)
-            [ "$p" = "False" ] && break
-            sleep 15
-          done
-
-          # Only update the secret once the domain has genuinely taken the new
-          # value, so a failed rotation cannot leave the secret ahead of it.
-          B64=$(printf %s "$NEWPW" | base64 | tr -d '\n')
-          kubectl patch secret opensearch-credentials -n "$NAMESPACE" \
-            --type merge -p "{\"data\":{\"password\":\"$B64\"}}"
-
-          # The chart reads the password at container start, so the running pod
-          # still holds the previous one until it is replaced.
-          kubectl rollout restart "deploy/$RELEASE" -n "$NAMESPACE"
-          kubectl rollout status  "deploy/$RELEASE" -n "$NAMESPACE" --timeout=10m
-
-          echo
-          echo "Rotated. Re-run with action=test-search-write; expect HTTP 200."
-          echo "Terraform state still holds the OLD password: the next apply reverts the"
-          echo "secret, and its post-apply check re-aligns the domain. See the note in this step."
 
       # Sets number_of_replicas = 0 on every non-system index.
       #

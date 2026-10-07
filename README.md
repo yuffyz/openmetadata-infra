@@ -17,6 +17,10 @@ Each has its own tfvars, state file, and approval gate.
 > 💸 This creates real, chargeable AWS infrastructure (EKS, RDS ×2, OpenSearch,
 > NAT gateway, EFS). Run **destroy** when you no longer need it.
 
+> 🚀 **[README_production.md](README_production.md)** is the step-by-step runbook
+> for deploying production: checks before the first deploy, plan, apply, what
+> the post-apply checks print, and verification.
+
 > 📖 **[README_full.md](README_full.md)** covers one-time setup (state bucket,
 > GitHub OIDC role, repository variables, approval gates), the destroy runbook,
 > configuration notes, and troubleshooting. Start there when setting this up in a
@@ -47,6 +51,8 @@ brings in about 5 more for the certificate and DNS record.
 | Teardown | `terraform destroy` just works | intentionally hard (protected) |
 | UI access | internet-facing ALB, IP-allowlisted; HTTPS at `dev.example-openmetadata.com` | same as dev; HTTPS at `example-openmetadata.com` |
 | EKS nodes | 2 × `t3.xlarge`, 20 GiB disk | 3 × `m7i.large` (one per AZ), 50 GiB disk |
+| Search auth | server's IAM role (SigV4); password for admin only | same as dev |
+| WAF / HTTPS redirect | on / on | on / on |
 
 The `-dev` naming lets a dev stack coexist with production **in the same
 account/region** without RDS/OpenSearch/EKS name collisions.

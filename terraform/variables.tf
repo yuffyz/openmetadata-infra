@@ -487,9 +487,9 @@ variable "app_display_name" {
 }
 
 variable "opensearch_iam_auth" {
-  description = "OpenMetadata authenticates to OpenSearch with its pod's IAM role (SigV4, via IRSA) instead of the master password, so password drift can no longer break search. See opensearch_iam.tf."
+  description = "OpenMetadata authenticates to OpenSearch with its pod's IAM role (SigV4, via IRSA) instead of the master password, so password drift cannot break search. On by default since 2026-10-07 (proven in dev). Turning it off returns the server to the password with no automatic restart on password change. See opensearch_iam.tf."
   type        = bool
-  default     = false
+  default     = true
 
   validation {
     condition     = !var.opensearch_iam_auth || try(var.opensearch.provisioner, "helm") == "aws"

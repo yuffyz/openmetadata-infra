@@ -50,6 +50,8 @@ association per extra AZ.
 | Teardown | `terraform destroy` just works | intentionally hard (protected) |
 | UI access | internet-facing ALB, IP-allowlisted; HTTPS at `dev.example-openmetadata.com` | same as dev; HTTPS at `example-openmetadata.com` |
 | EKS nodes | 2 × `t3.xlarge`, 20 GiB disk | 3 × `m7i.large` (one per AZ), 50 GiB disk |
+| Search auth | server's IAM role (SigV4); password for admin only | same as dev |
+| WAF / HTTPS redirect | on / on | on / on |
 
 The `-dev` naming lets a dev stack coexist with production **in the same
 account/region** without RDS/OpenSearch/EKS name collisions.
@@ -932,11 +934,10 @@ access-entry fight to run any of this.
 
 | Action | Mutates | What it answers |
 |---|---|---|
-| `diagnose` | no | Pod password vs secret (by hash), stored password *shape*, domain health, node/AZ availability, `MasterUserName`, `UpdateVersion`, recent server-side search errors |
+| `diagnose` | no | How the server authenticates to search (IAM role, or the password), stored admin password *shape*, domain health, node/AZ availability, `MasterUserName`, `UpdateVersion`, recent server-side search errors |
 | `test-search-write` | throwaway index | Can the credentials read **and write**? Cluster health, node list, index list with `docs.count`, FGAC roles in effect |
-| `restart-server` | rollout | For the stale-pod case: secret rolled, running pod still holds the old value |
-| `reset-opensearch-password` | domain, rollout if stale | Runs `scripts/opensearch-credentials.sh heal`: bounces the domain password (throwaway, then the secret's value), asserting `UpdateVersion` moves each time, and restarts a stale server. Ends on Terraform's value. **The one to use** |
-| `rotate-opensearch-password` | domain + secret + rollout | Sets a *new* password on both sides. Works, but diverges from Terraform state — prefer `reset` |
+| `restart-server` | rollout | A server pod that predates its ServiceAccount's IAM annotation, or, with `opensearch_iam_auth` off, one still holding an old password |
+| `reset-opensearch-password` | domain | Runs `scripts/opensearch-credentials.sh heal`: bounces the domain's **admin** password (throwaway, then the secret's value), asserting `UpdateVersion` moves each time. Ends on Terraform's value |
 | `reduce-replicas` | index settings, dev only | Drops `number_of_replicas` to 0 on non-system indices |
 | `set-shard-template` | index template | 1 primary shard (0 replicas in dev, 1 elsewhere) for indices created from now on. Refuses if it would overlap an existing template |
 
@@ -945,7 +946,7 @@ that matters is *rejected* versus *overwhelmed*:
 
 | Result | Meaning |
 |---|---|
-| `401` on everything | Credentials rejected. Password drift → `rotate-opensearch-password` |
+| `401` on everything | Admin credentials rejected. Password drift → `reset-opensearch-password` |
 | `403` on writes, `200` on reads | Authenticated, not authorised. Check `_plugins/_security/api/account`; the master user should show `all_access` |
 | `HTTP 000` / `504`, mixed with successes | **Timeouts, not refusals.** The cluster is overwhelmed — see *When the cluster is overwhelmed* |
 | `HTTP 000` on everything, instantly | Never connected. Malformed endpoint (the quoting trap below) or a security group |
@@ -961,11 +962,13 @@ password updates the secret while the running pod keeps the old one in memory.
 
 ### Runbook
 
-1. `diagnose` — read-only. May end it immediately: a stale pod needs only
-   `restart-server`.
+1. `diagnose` — read-only. Shows whether the server is on its IAM role. If it is,
+   the master password is not in its path: a search outage is then about the
+   role (run `scripts/opensearch-iam.sh check`; a `403` means it is unmapped,
+   which the next deploy or `opensearch-iam.sh map` fixes), not the password.
 2. `test-search-write` — classify the failure with the table above.
-3. Repair: `rotate-opensearch-password` for `401`; `reduce-replicas` plus
-   right-sizing for timeouts.
+3. Repair: `reset-opensearch-password` for an admin `401`; `reduce-replicas`
+   plus right-sizing for timeouts.
 4. `test-search-write` again — confirm `200`s and check `table_search_index`
    has a non-zero `docs.count`.
 5. Only once the cluster is **green**: **Settings → Applications → Search
@@ -990,28 +993,17 @@ last genuinely changed. There is no error, and the CLI exit code is 0. The only
 way to tell is to compare `AdvancedSecurityOptions.Status.UpdateVersion` before
 and after.
 
-`rotate-opensearch-password` exists because of this. It generates a **new**
-password — which AWS cannot treat as unchanged — asserts that `UpdateVersion`
-incremented, waits for `Processing=False`, patches the secret only after the
-domain has taken the value, and then restarts the server so it reloads. If
-`UpdateVersion` still does not move, the AWS API cannot set this domain's master
+`reset-opensearch-password` therefore no longer sends the value straight
+across: it sets a throwaway password first, which AWS cannot treat as
+unchanged, then the secret's value, and asserts that `UpdateVersion` moved both
+times. If it still does not move, the AWS API cannot set this domain's master
 password and the step tells you to reset it from OpenSearch Dashboards
 (*Security → Internal users → admin*).
-
-Its generated password satisfies AWS complexity **and** the module's YAML-safety
-constraints: uppercase first character, specials limited to `_ - .` so it
-survives being embedded in `openmetadata.yaml`.
 
 Two things that look wrong in the output but are not:
 
 - `MasterUserName: None` from `describe-domain-config` — AWS redacts it. It does
   not mean the master user is unset.
-- Rotation **diverges from Terraform state**, which still holds the old
-  `random_password`. The next `apply` reverts the **secret** to the state value
-  (Terraform can read a Kubernetes secret) but **not the domain** (it cannot
-  read the master password, so it sees no diff), which on its own breaks
-  search again. The deploy workflow's post-apply check now catches this and
-  bounces the domain back. `reset` avoids the round trip entirely.
 
 ### When the cluster is overwhelmed instead
 
@@ -1094,40 +1086,35 @@ or fix the shard defaults once the domain is right-sized.
 
 ### Worth fixing properly
 
-- **Password drift — fixed, in two halves.**
-  - *Stale pod:* `terraform/opensearch_password.tf` puts a SHA-256 of the
-    `opensearch-credentials` secret on the server Deployment's pod template, so
-    a secret change rolls the pods in the same apply. The first apply with it
-    restarts the server once to add the annotation.
-  - *Domain out of sync:* Terraform can never see this, so `deploy.yml` now
-    runs `scripts/opensearch-credentials.sh heal` after every apply. It logs in
-    to OpenSearch with the secret's password from a throwaway pod. On a 401 it
-    bounces the domain password (a throwaway value, then the secret's, checking
-    that `UpdateVersion` moves both times), restarts a stale server, re-checks,
-    and fails the job if search is still broken.
+- **Password drift — solved by taking the password out of the app's path.**
+  With `opensearch_iam_auth` (on in both environments, and the default), the
+  server signs search requests with its pod's IAM role (SigV4 via IRSA): this
+  is OpenMetadata 1.12's `elasticsearch.aws` setting
+  (`SEARCH_AWS_IAM_AUTH_ENABLED`). The domain and the secret can now disagree
+  without breaking search. `terraform/opensearch_iam.tf` creates the role,
+  annotates the chart's ServiceAccount and sets the environment variables.
+  After each apply, `deploy.yml`:
+  1. checks the **admin** password and bounces it back on a 401
+     (`scripts/opensearch-credentials.sh heal`). The server no longer needs it,
+     but the next step, the ops probes and Dashboards all log in as admin;
+  2. maps the server's role in OpenSearch (`scripts/opensearch-iam.sh map`,
+     adding it to the `all_access` role mapping);
+  3. proves the server is really signing (`check`): the image supports it, the
+     pod has the role, the server log shows the SigV4 transport (skipped with a
+     warning if the log has rotated past startup), and a request signed as the
+     server's ServiceAccount gets `all_access`.
 
-  - *Taking the password out of the app's path (dev, trial):*
-    `opensearch_iam_auth = true` makes the server sign search requests with
-    its pod's IAM role (SigV4 via IRSA) instead of sending the password. This
-    is OpenMetadata 1.12's `elasticsearch.aws` setting
-    (`SEARCH_AWS_IAM_AUTH_ENABLED`). `terraform/opensearch_iam.tf` creates the
-    role, annotates the chart's ServiceAccount and sets the environment
-    variables. After each apply, `deploy.yml` then:
-    - maps the role in OpenSearch (`scripts/opensearch-iam.sh map`, adding it to
-      the `all_access` role mapping);
-    - proves the server is really signing (`check`): the image supports it,
-      the pod has the role, the server log shows the SigV4 transport, and a
-      request signed as the server's ServiceAccount gets `all_access`.
+  Removed 2026-10-07 as no longer needed: `terraform/opensearch_password.tf`
+  (restarted the server when the password changed), the stale-pod logic in
+  `opensearch-credentials.sh`, and the `rotate-opensearch-password` action.
+  Turning `opensearch_iam_auth` off puts the server back on the password
+  without that safety net, so after any password change run `restart-server`.
 
-    The password still exists for the `admin` user and the ops tooling. **The
-    test before production:** in dev, change the domain password on purpose
-    (`rotate-opensearch-password`) and confirm Explore keeps working.
-
-  Why a bounce: AWS appears to compare a new master password against the last
-  value it was *sent*, not the one actually in force. So after the password is
-  changed elsewhere (OpenSearch Dashboards, a rotation), sending Terraform's
-  value is "unchanged" and silently ignored. A throwaway value first makes both
-  updates real.
+  Why the admin heal bounces: AWS appears to compare a new master password
+  against the last value it was *sent*, not the one actually in force. So after
+  the password is changed elsewhere (OpenSearch Dashboards, say), sending
+  Terraform's value is "unchanged" and silently ignored. A throwaway value
+  first makes both updates real.
 - **Shard defaults.** Amazon OpenSearch Service gives each index 5 primary
   shards, which is how ~45 small indices become ~757 shards. The
   `set-shard-template` action installs an index template with 1 primary per

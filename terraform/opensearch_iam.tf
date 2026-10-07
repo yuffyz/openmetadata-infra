@@ -32,11 +32,21 @@
 # ops tooling still uses it for administration (including the mapping above).
 # It just stops being something the application depends on.
 #
-# > ⚠️ The apply that turns this on restarts the server onto IAM before the
-# > mapping exists, so search returns 403 for the minute or two until the
-# > post-apply step maps the role. Dev only until that has been watched.
+# This replaced terraform/opensearch_password.tf, which put a checksum of the
+# password secret on the server's pod template so a password change restarted
+# it. With the server on IAM it never reads that password, so there is nothing
+# to keep in sync and that file is gone. Turning opensearch_iam_auth off puts
+# the server back on the password WITHOUT that safety net: after any password
+# change, run openmetadata-ops -> restart-server.
+#
+# > ⚠️ The apply that first turns this on restarts the server onto IAM before
+# > the mapping exists, so search returns 403 for a minute or two until the
+# > post-apply step maps the role (seen in dev, 2026-10-06).
 
 locals {
+  # Only an AWS-managed domain has IAM to sign against; an in-cluster
+  # OpenSearch (provisioner "helm") keeps the password.
+  opensearch_on_aws      = try(var.opensearch.provisioner, "helm") == "aws"
   opensearch_iam_enabled = var.opensearch_iam_auth && local.opensearch_on_aws
 
   openmetadata_service_account = "openmetadata"
