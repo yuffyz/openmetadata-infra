@@ -1125,6 +1125,15 @@ or fix the shard defaults once the domain is right-sized.
      concrete index names; `*_search_index` is only the alias) could match the same names as an
      existing template. Composable templates do not merge, so overlapping one
      OpenMetadata owns (its `di-data-assets-*` data streams) would replace it.
+
+     **Known blocker (dev, 2026-10-07):** recent OpenMetadata versions create
+     their own `om_<index>` template for every entity index
+     (`om_table_search_index` → `table_search_index*`, ~57 of them), so every
+     index already has a template and no pattern of ours can avoid replacing
+     one. The action refuses and prints each one's priority, `number_of_shards`
+     and `composed_of`. Use that output to choose between setting the shard count
+     in OpenMetadata itself and patching its `om_*` templates. Patching only
+     lasts if OpenMetadata doesn't rewrite them on reindex.
   2. With the cluster green: **Settings → Applications → Search Indexing →
      Configure**, *Recreate Index* = true, all entity types, **Run**.
   3. Run `set-shard-template` again. It is idempotent, and its index table

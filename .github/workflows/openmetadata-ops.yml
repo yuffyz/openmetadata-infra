@@ -709,7 +709,7 @@ jobs:
           B="$OS_SCHEME://$OS_HOST:$OS_PORT"
           A="-u $OS_USER:$OS_PASS"
           for part in "HEALTH _cluster/health" \
-                      "TEMPLATES _index_template?filter_path=index_templates.name,index_templates.index_template.index_patterns,index_templates.index_template.priority,index_templates.index_template.data_stream" \
+                      "TEMPLATES _index_template?filter_path=index_templates.name,index_templates.index_template.index_patterns,index_templates.index_template.priority,index_templates.index_template.data_stream,index_templates.index_template.composed_of,index_templates.index_template.template.settings" \
                       "INDICES _cat/indices?format=json&h=index,pri,rep,docs.count&expand_wildcards=open" \
                       "STREAMS _data_stream?filter_path=data_streams.name"; do
             set -- $part
@@ -776,16 +776,29 @@ jobs:
                      if fnmatch.fnmatchcase(tp, op) or fnmatch.fnmatchcase(op, tp)]
               why += [f"both match {n}" for n in live if matches(n, theirs) and matches(n, ours)]
               if why:
-                  conflicts.append((t["name"], theirs, why[:5]))
+                  conflicts.append((t, why[:5]))
           if conflicts:
               print("\nRefusing: these existing templates could match the same names, and only")
               print("one composable template applies per index -- ours would replace theirs.\n")
-              for n, pats, why in conflicts:
-                  print(f"  {n}  patterns={pats}")
-                  for w in why:
-                      print(f"      {w}")
+              # What each one would lose, and whether it already sets shards:
+              # the deciding facts for any fix (dev, 2026-10-07: OpenMetadata
+              # owns an om_<index> template for every entity index).
+              def idx_settings(t):
+                  st = t["index_template"].get("template", {}).get("settings", {})
+                  return st.get("index", st)
+              print(f"  {'template':<52} {'prio':>4} {'shards':>6} {'reps':>4}  composed_of / overlap")
+              for t, why in conflicts:
+                  it, st = t["index_template"], idx_settings(t)
+                  print(f"  {t['name']:<52} {str(it.get('priority', '-')):>4} "
+                        f"{str(st.get('number_of_shards', '-')):>6} {str(st.get('number_of_replicas', '-')):>4}  "
+                        f"{it.get('composed_of') or '-'} / {why[0]}")
+              shards = sorted({str(idx_settings(t).get("number_of_shards", "-")) for t, _ in conflicts})
+              prios = sorted({str(t["index_template"].get("priority", "-")) for t, _ in conflicts})
+              print(f"\n{len(conflicts)} overlapping templates; number_of_shards set to {shards}; priorities {prios}")
+              print("('-' = not set in the template itself)")
               print("\n::error::template patterns overlap an existing template; nothing was written. "
-                    "Narrow TEMPLATE_PATTERNS in this step to exclude those names.")
+                    "If the overlaps are OpenMetadata's own om_* templates, no pattern avoids them -- "
+                    "see the table above and README_full.md (Shard defaults).")
               sys.exit(1)
           print("no overlapping templates")
 
