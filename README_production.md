@@ -145,9 +145,9 @@ From an address on the allowlist:
       proper fix and is still open; see
       [README_full.md → Production exposure](README_full.md#production-exposure--whats-still-missing).
 - [ ] **Cut search shards before loading real metadata:**
-  1. openmetadata-ops → `production` → **`set-shard-template`**. It installs a
-     1-shard template and refuses, writing nothing, if it would overlap an
-     existing template.
+  1. openmetadata-ops → `production` → **`set-shard-template`**. It sets 1 shard
+     and 1 replica in OpenMetadata's own `om_*` index templates, leaving their
+     mappings alone.
   2. In OpenMetadata: **Settings → Applications → Search Indexing →
      Configure**, *Recreate Index* = true, all entity types, **Run**. Wait for
      the cluster to be green first.

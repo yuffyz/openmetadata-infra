@@ -939,7 +939,7 @@ access-entry fight to run any of this.
 | `restart-server` | rollout | A server pod that predates its ServiceAccount's IAM annotation, or, with `opensearch_iam_auth` off, one still holding an old password |
 | `reset-opensearch-password` | domain | Runs `scripts/opensearch-credentials.sh heal`: bounces the domain's **admin** password (throwaway, then the secret's value), asserting `UpdateVersion` moves each time. Ends on Terraform's value |
 | `reduce-replicas` | index settings, dev only | Drops `number_of_replicas` to 0 on non-system indices |
-| `set-shard-template` | index template | 1 primary shard (0 replicas in dev, 1 elsewhere) for indices created from now on. Refuses if it would overlap an existing template |
+| `set-shard-template` | OpenMetadata's `om_*` index templates | 1 primary shard (0 replicas in dev, 1 elsewhere) for indices created from now on. Patches only those two settings; mappings untouched |
 
 Read `test-search-write` by **which kind of failure** you get. The distinction
 that matters is *rejected* versus *overwhelmed*:
@@ -1116,24 +1116,24 @@ or fix the shard defaults once the domain is right-sized.
   Terraform's value is "unchanged" and silently ignored. A throwaway value
   first makes both updates real.
 - **Shard defaults.** Amazon OpenSearch Service gives each index 5 primary
-  shards, which is how ~45 small indices become ~757 shards. The
-  `set-shard-template` action installs an index template with 1 primary per
-  OpenMetadata index (0 replicas in dev, 1 elsewhere), cutting that to ~150, or
-  ~75 without replicas. Shard count is fixed when an index is created, so:
-  1. Run `set-shard-template`. It refuses, writing nothing, if its patterns
-     (`*_search_index_rebuild_*`, `*_report_data_index_rebuild_*` -- the
-     concrete index names; `*_search_index` is only the alias) could match the same names as an
-     existing template. Composable templates do not merge, so overlapping one
-     OpenMetadata owns (its `di-data-assets-*` data streams) would replace it.
+  shards, which is how ~57 small indices become ~757 shards. OpenMetadata owns
+  one composable template per index (`om_table_search_index` →
+  `table_search_index*`, priority 100), and those leave the shard count unset.
+  Composable templates do not merge (only one applies per index), so a
+  template of our own would replace OpenMetadata's, mappings and all. The
+  `set-shard-template` action therefore patches OpenMetadata's `om_*`
+  templates in place. It sends each body back as read, setting only
+  `number_of_shards: 1` and `number_of_replicas` (0 in dev, 1 elsewhere), then
+  simulates an index under every template to confirm both shards and mappings.
+  That cuts ~757 shards to ~115, or ~57 without replicas.
 
-     **Known blocker (dev, 2026-10-07):** recent OpenMetadata versions create
-     their own `om_<index>` template for every entity index
-     (`om_table_search_index` → `table_search_index*`, ~57 of them), so every
-     index already has a template and no pattern of ours can avoid replacing
-     one. The action refuses and prints each one's priority, `number_of_shards`
-     and `composed_of`. Use that output to choose between setting the shard count
-     in OpenMetadata itself and patching its `om_*` templates. Patching only
-     lasts if OpenMetadata doesn't rewrite them on reindex.
+  Evidence it works (dev, 2026-10-07): `om_pipeline_status_search_index` is
+  the one template that already set 1 shard, and `pipeline_status` was the one
+  index with `pri` = 1. OpenMetadata does not override the template when it
+  creates an index.
+
+  Shard count is fixed when an index is created, so:
+  1. Run `set-shard-template`.
   2. With the cluster green: **Settings → Applications → Search Indexing →
      Configure**, *Recreate Index* = true, all entity types, **Run**.
   3. Run `set-shard-template` again. It is idempotent, and its index table
@@ -1141,11 +1141,11 @@ or fix the shard defaults once the domain is right-sized.
      `reduce-replicas`, and production can come down from `r6g.large.search`
      to `m6g.large.search`.
 
-  If `pri` is still 5 after the rebuild, OpenMetadata is setting the shard
-  count in its create-index request, which takes precedence over any template.
-  The fallback is the `_shrink` API per index: block writes, move a copy of
-  every shard onto one node, shrink into a new index with 1 primary, then swap
-  names. It is far more involved, so treat it as a last resort.
+  If step 3 reports templates to patch again and `pri` is still 5,
+  OpenMetadata rewrote its templates on restart or during the rebuild,
+  undoing the patch before the indices were created. Not yet observed. If it
+  happens, the shard count has to come from OpenMetadata's own index mapping
+  files, or as a last resort the `_shrink` API per index.
 - **The quoting bug** belongs upstream — the module writes those values
   unquoted, so the chart is adding them.
 

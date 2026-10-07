@@ -42,7 +42,7 @@ on:
           - test-search-write        # probe WRITE auth: creates and deletes a throwaway index
           - reset-opensearch-password  # MUTATES: verified bounce of the domain's admin password back to the secret's
           - reduce-replicas          # MUTATES (dev only): number_of_replicas = 0 on non-system indices
-          - set-shard-template       # MUTATES: index template, 1 primary shard for OpenMetadata indices
+          - set-shard-template       # MUTATES: OpenMetadata's om_* index templates, 1 primary shard
           - show-exposure            # read-only: how the UI is published (LB, listeners, cert, DNS, SG)
         default: diagnose
 
@@ -592,50 +592,47 @@ jobs:
           echo "If it is still yellow, the missing data node is the remaining cause;"
           echo "check us-east-1b in the diagnose action's AWS domain health output."
 
-      # Installs a composable index template that gives OpenMetadata's indices
-      # 1 primary shard (and 0 replicas in dev, 1 elsewhere), instead of the 5
-      # primaries Amazon OpenSearch Service gives an index by default. ~757
-      # shards become ~150 with replicas, ~75 without.
+      # Gives OpenMetadata's indices 1 primary shard (and 0 replicas in dev, 1
+      # elsewhere) instead of the 5 primaries Amazon OpenSearch Service gives an
+      # index by default. ~757 shards become ~115 with replicas, ~57 without.
+      #
+      # How: OpenMetadata owns one composable template per index
+      # (om_table_search_index -> table_search_index*, priority 100), and
+      # composable templates do NOT merge -- only one applies per index. A
+      # template of our own would replace OpenMetadata's, mappings and all, so
+      # this patches OpenMetadata's templates in place instead: the same body
+      # read back from OpenSearch, with only number_of_shards and
+      # number_of_replicas set. Mappings, priority, _meta and version are kept.
+      #
+      # Evidence that this works (dev, 2026-10-07): om_* templates leave the
+      # shard count unset, except om_pipeline_status_search_index, which sets 1
+      # -- and pipeline_status is the one index with pri=1. OpenMetadata does
+      # not override the template in its create-index request.
       #
       # A template applies only when an index is CREATED -- shard count is
       # immutable afterwards. Nothing changes for existing indices until
       # OpenMetadata rebuilds them: Settings -> Applications -> Search Indexing
       # -> Recreate Index = true -> Run. Re-run this action afterwards; it is
-      # idempotent, and its index table should then show pri=1.
-      #
-      # If pri is still 5 after a rebuild, OpenMetadata is setting the shard
-      # count explicitly in its create-index request, which beats any template.
-      # The fallback is the _shrink API per index; see README_full.md.
-      #
-      # Composable templates do NOT merge: only the highest-priority match
-      # applies to an index. A template of ours that overlapped one OpenMetadata
-      # or OpenSearch already owns (data streams such as di-data-assets-* depend
-      # on theirs) would silently replace it. So this refuses, before writing
-      # anything, if any existing template could match the same names.
+      # idempotent, and its index table should then show pri=1. If it reports
+      # templates needing a patch again, OpenMetadata rewrote them (on restart
+      # or reindex): run it again before the next rebuild.
       #
       # Two pods rather than one: the curl image has no jq or python, so the
-      # pods only fetch and print, and every decision is made here on the
+      # pods only fetch, send and print, and every decision is made here on the
       # runner. Phase 1 is read-only; phase 2 writes only if phase 1 passed.
       - name: Set shard template
         if: ${{ github.event.inputs.action == 'set-shard-template' }}
         env:
-          TEMPLATE_NAME: openmetadata-shards
-          # The concrete indices OpenMetadata creates when it (re)indexes:
-          # <entity>_search_index_rebuild_<epoch>, with the plain
-          # <entity>_search_index name only an alias onto it -- and a template
-          # matches index names, never aliases. With or without its
-          # clusterAlias prefix. Not the bare "*_search_index": that also takes
-          # vector_search_index, which OpenMetadata creates from its own
-          # om_vector_search_index (knn) template, so the overlap check refuses
-          # it (dev, 2026-10-07). Dot-prefixed system indices never match.
-          TEMPLATE_PATTERNS: "*_search_index_rebuild_* *_report_data_index_rebuild_*"
+          # OpenMetadata's template naming. Data-stream templates are skipped
+          # whatever their name.
+          TEMPLATE_PREFIX: om_
         run: |
           set -uo pipefail
           ENV_NAME="${{ github.event.inputs.environment }}"
           # Dev runs without replicas (see reduce-replicas); anywhere else
           # search has to survive a node loss.
           if [ "$ENV_NAME" = "dev" ]; then REPLICAS=0; else REPLICAS=1; fi
-          export TEMPLATE_NAME TEMPLATE_PATTERNS REPLICAS
+          export TEMPLATE_PREFIX REPLICAS
 
           dump=$(kubectl exec -n "$NAMESPACE" "deploy/$RELEASE" -- sh -c '
             echo "H=${ELASTICSEARCH_HOST:-}"
@@ -650,34 +647,34 @@ jobs:
           OS_USER=$(strip "$(printf %s "$dump" | sed -n 's/^U=//p')")
           [ -n "$OS_HOST" ] || { echo "::error::ELASTICSEARCH_HOST empty in the server pod"; exit 1; }
           echo "target: $OS_SCHEME://$OS_HOST:$OS_PORT as $OS_USER"
-          echo "template: $TEMPLATE_NAME  patterns: $TEMPLATE_PATTERNS  shards: 1  replicas: $REPLICAS"
+          echo "templates: ${TEMPLATE_PREFIX}*  ->  shards: 1  replicas: $REPLICAS"
           export OS_HOST OS_PORT OS_SCHEME OS_USER
 
           # Runs SCRIPT in a throwaway curl pod: same nodes, so the same node
           # security group faces the VPC-only domain, with the password from
           # the secret by secretKeyRef so it never lands in a pod spec or log.
-          # Extra env vars named in $3 are passed through.
+          # Extra env vars named in $3 are passed through; a ConfigMap named in
+          # $4 is mounted read-only at /t.
           os_pod() {
-            local name="$1" script="$2" extra="${3:-}"
+            local name="$1" script="$2" extra="${3:-}" cm="${4:-}"
             local overrides
-            overrides=$(SCRIPT="$script" POD_NAME="$name" EXTRA="$extra" python3 - <<'PY'
+            overrides=$(SCRIPT="$script" POD_NAME="$name" EXTRA="$extra" CM="$cm" python3 - <<'PY'
           import json, os
           env = lambda k: {"name": k, "value": os.environ[k]}
           names = ["OS_HOST", "OS_PORT", "OS_SCHEME", "OS_USER"] + os.environ["EXTRA"].split()
-          print(json.dumps({
-              "apiVersion": "v1",
-              "spec": {
-                  "restartPolicy": "Never",
-                  "containers": [{
-                      "name": os.environ["POD_NAME"],
-                      "image": "curlimages/curl:8.11.1",
-                      "command": ["sh", "-c", os.environ["SCRIPT"]],
-                      "env": [env(k) for k in names] + [
-                          {"name": "OS_PASS", "valueFrom": {"secretKeyRef": {
-                              "name": "opensearch-credentials", "key": "password"}}}],
-                  }],
-              },
-          }))
+          container = {
+              "name": os.environ["POD_NAME"],
+              "image": "curlimages/curl:8.11.1",
+              "command": ["sh", "-c", os.environ["SCRIPT"]],
+              "env": [env(k) for k in names] + [
+                  {"name": "OS_PASS", "valueFrom": {"secretKeyRef": {
+                      "name": "opensearch-credentials", "key": "password"}}}],
+          }
+          spec = {"restartPolicy": "Never", "containers": [container]}
+          if os.environ["CM"]:
+              container["volumeMounts"] = [{"name": "t", "mountPath": "/t", "readOnly": True}]
+              spec["volumes"] = [{"name": "t", "configMap": {"name": os.environ["CM"]}}]
+          print(json.dumps({"apiVersion": "v1", "spec": spec}))
           PY
             )
             # Detached, then logs -- never `kubectl run -i --rm`. The attach form
@@ -704,14 +701,15 @@ jobs:
           }
 
           # --- phase 1: read-only --------------------------------------------
+          # Full template bodies this time: the PUT has to send each one back
+          # whole, since a composable template cannot be partially updated.
           read -r -d '' READ_SCRIPT <<'READ' || true
-          set -u
+          set -uf
           B="$OS_SCHEME://$OS_HOST:$OS_PORT"
           A="-u $OS_USER:$OS_PASS"
           for part in "HEALTH _cluster/health" \
-                      "TEMPLATES _index_template?filter_path=index_templates.name,index_templates.index_template.index_patterns,index_templates.index_template.priority,index_templates.index_template.data_stream,index_templates.index_template.composed_of,index_templates.index_template.template.settings" \
-                      "INDICES _cat/indices?format=json&h=index,pri,rep,docs.count&expand_wildcards=open" \
-                      "STREAMS _data_stream?filter_path=data_streams.name"; do
+                      "TEMPLATES _index_template/${TEMPLATE_PREFIX}*" \
+                      "INDICES _cat/indices?format=json&h=index,pri,rep,docs.count&expand_wildcards=open"; do
             set -- $part
             echo "@@$1@@"
             curl -s --max-time 120 $A "$B/$2"
@@ -720,12 +718,13 @@ jobs:
           done
           READ
 
-          os_pod "om-os-shards-read-${GITHUB_RUN_ID}" "$READ_SCRIPT" > phase1.txt
+          os_pod "om-os-shards-read-${GITHUB_RUN_ID}" "$READ_SCRIPT" "TEMPLATE_PREFIX" > phase1.txt
           rc=$?
           [ $rc -eq 0 ] || { cat phase1.txt; echo "::error::read phase failed (exit $rc)"; exit 1; }
 
+          rm -rf bodies && mkdir bodies
           python3 - <<'PY' || exit 1
-          import fnmatch, json, os, re, sys
+          import copy, fnmatch, gzip, json, os, re, sys
 
           raw = open("phase1.txt").read()
           parts = dict(re.findall(r"@@(\w+)@@\n(.*?)\n@@END@@", raw, re.S))
@@ -747,140 +746,178 @@ jobs:
                   print(f"::error::could not read {k} from OpenSearch -- details above")
                   sys.exit(1)
 
-          health, templates, indices, streams = (load(k) for k in ("HEALTH", "TEMPLATES", "INDICES", "STREAMS"))
+          health, templates, indices = (load(k) for k in ("HEALTH", "TEMPLATES", "INDICES"))
+          prefix = os.environ["TEMPLATE_PREFIX"]
           if "error" in templates or isinstance(indices, dict):
               print(json.dumps(templates)[:1500], json.dumps(indices)[:1500])
-              print("::error::OpenSearch refused a read -- run test-search-write to classify it")
+              print(f"::error::could not list {prefix}* templates -- none exist yet (has OpenMetadata "
+                    "started against this domain?) or the read was refused; run test-search-write")
               sys.exit(1)
-
-          name = os.environ["TEMPLATE_NAME"]
-          ours = os.environ["TEMPLATE_PATTERNS"].split()
           replicas = int(os.environ["REPLICAS"])
           print(f"cluster status: {health.get('status')}  active shards: {health.get('active_shards')}  "
                 f"unassigned: {health.get('unassigned_shards')}")
 
-          # Names that exist now: open indices plus data streams.
-          live = [i["index"] for i in indices] + [s["name"] for s in streams.get("data_streams", [])]
+          def idx_settings(it):
+              st = it.get("template", {}).get("settings", {})
+              return st.get("index", {})
+          want = {"number_of_shards": "1", "number_of_replicas": str(replicas)}
+          def current(it):
+              st = idx_settings(it)
+              return {k: str(st[k]) if k in st else None for k in want}
+
+          targets, skipped = [], []
+          for t in templates.get("index_templates", []):
+              it = t["index_template"]
+              if it.get("data_stream") is not None:
+                  skipped.append(f"{t['name']} (data stream)")
+              else:
+                  targets.append(t)
+          if not targets:
+              print(f"::error::no {prefix}* index templates to patch")
+              sys.exit(1)
+
           def matches(n, pats):
               return any(fnmatch.fnmatchcase(n, p) for p in pats)
 
-          # Overlap with any template we do not own. Pattern against pattern is
-          # checked both ways (a literal reading of one against the other
-          # catches "*" and prefix catch-alls); real names catch the rest.
-          conflicts = []
-          for t in templates.get("index_templates", []):
-              if t["name"] == name:
+          todo, sims, total = [], [], 0
+          print(f"\n{'template':<52} {'shards':>6} {'reps':>4}  action")
+          for t in sorted(targets, key=lambda t: t["name"]):
+              it, cur = t["index_template"], current(t["index_template"])
+              ok = cur == want
+              print(f"{t['name']:<52} {cur['number_of_shards'] or '-':>6} "
+                    f"{cur['number_of_replicas'] or '-':>4}  {'ok' if ok else 'patch'}")
+              # A name inside the first pattern, for _simulate_index in phase 2.
+              # Run for every template, so the check covers unpatched ones too.
+              sims.append((t["name"], it["index_patterns"][0].replace("*", "zz_shardcheck")))
+              if ok:
                   continue
-              theirs = t["index_template"].get("index_patterns", [])
-              why = [f"{tp} ~ {op}" for tp in theirs for op in ours
-                     if fnmatch.fnmatchcase(tp, op) or fnmatch.fnmatchcase(op, tp)]
-              why += [f"both match {n}" for n in live if matches(n, theirs) and matches(n, ours)]
-              if why:
-                  conflicts.append((t, why[:5]))
-          if conflicts:
-              print("\nRefusing: these existing templates could match the same names, and only")
-              print("one composable template applies per index -- ours would replace theirs.\n")
-              # What each one would lose, and whether it already sets shards:
-              # the deciding facts for any fix (dev, 2026-10-07: OpenMetadata
-              # owns an om_<index> template for every entity index).
-              def idx_settings(t):
-                  st = t["index_template"].get("template", {}).get("settings", {})
-                  return st.get("index", st)
-              print(f"  {'template':<52} {'prio':>4} {'shards':>6} {'reps':>4}  composed_of / overlap")
-              for t, why in conflicts:
-                  it, st = t["index_template"], idx_settings(t)
-                  print(f"  {t['name']:<52} {str(it.get('priority', '-')):>4} "
-                        f"{str(st.get('number_of_shards', '-')):>6} {str(st.get('number_of_replicas', '-')):>4}  "
-                        f"{it.get('composed_of') or '-'} / {why[0]}")
-              shards = sorted({str(idx_settings(t).get("number_of_shards", "-")) for t, _ in conflicts})
-              prios = sorted({str(t["index_template"].get("priority", "-")) for t, _ in conflicts})
-              print(f"\n{len(conflicts)} overlapping templates; number_of_shards set to {shards}; priorities {prios}")
-              print("('-' = not set in the template itself)")
-              print("\n::error::template patterns overlap an existing template; nothing was written. "
-                    "If the overlaps are OpenMetadata's own om_* templates, no pattern avoids them -- "
-                    "see the table above and README_full.md (Shard defaults).")
-              sys.exit(1)
-          print("no overlapping templates")
+              body = copy.deepcopy(it)
+              st = body.setdefault("template", {}).setdefault("settings", {})
+              # Dotted keys would sit beside the nested form; keep one spelling.
+              for k in list(st):
+                  if k.startswith("index."):
+                      st.setdefault("index", {})[k[len("index."):]] = st.pop(k)
+              st.setdefault("index", {}).update(want)
+              data = gzip.compress(json.dumps(body).encode())
+              total += len(data)
+              open(f"bodies/{t['name']}.json.gz", "wb").write(data)
+              todo.append(t["name"])
+          open("bodies/sims.txt", "w").write("".join(f"{n} {i}\n" for n, i in sims))
+          json.dump({"todo": todo, "sims": dict(sims),
+                     "mapped": {t["name"]: bool(t["index_template"].get("template", {}).get("mappings"))
+                                for t in targets}}, open("plan.json", "w"))
+          for s in skipped:
+              print(f"skipped: {s}")
 
-          # What the template will cover, and what the rebuild should save.
+          # What the templates cover, and what the rebuild should save.
+          pats = [p for t in targets for p in t["index_template"]["index_patterns"]]
           user = [i for i in indices if not i["index"].startswith(".")]
-          covered = [i for i in user if matches(i["index"], ours)]
-          missed = [i for i in user if not matches(i["index"], ours)]
+          covered = [i for i in user if matches(i["index"], pats)]
+          missed = [i for i in user if not matches(i["index"], pats)]
           now = sum(int(i["pri"]) * (1 + int(i["rep"])) for i in covered)
           after = len(covered) * (1 + replicas)
           print(f"\n{len(covered)} OpenMetadata indices covered: {now} shards now, {after} after a rebuild")
-          print(f"{'index':<55} {'pri':>4} {'rep':>4} {'docs':>10}")
+          print(f"{'index':<70} {'pri':>4} {'rep':>4} {'docs':>10}")
           for i in sorted(covered, key=lambda i: i["index"]):
-              print(f"{i['index']:<55} {i['pri']:>4} {i['rep']:>4} {i['docs.count'] or 0:>10}")
+              print(f"{i['index']:<70} {i['pri']:>4} {i['rep']:>4} {i['docs.count'] or 0:>10}")
           if missed:
-              print("\nNOT covered by the patterns (left as they are):")
+              print("\nNOT covered by any template (left as they are):")
               for i in missed:
                   print(f"  {i['index']}  pri={i['pri']} rep={i['rep']}")
 
-          body = {"index_patterns": ours, "priority": 10,
-                  "template": {"settings": {"number_of_shards": 1, "number_of_replicas": replicas}},
-                  "_meta": {"managed_by": "openmetadata-ops set-shard-template"}}
-          open("template.json", "w").write(json.dumps(body))
+          print(f"\n{len(todo)} of {len(targets)} templates need the patch "
+                f"({total} bytes gzipped)")
+          # A ConfigMap holds at most 1 MiB; leave room for the object itself.
+          if total > 900_000:
+              print("::error::template bodies too large for one ConfigMap; nothing was written")
+              sys.exit(1)
           PY
 
           # --- phase 2: write, then prove what a new index would get ----------
-          export TEMPLATE_BODY="$(cat template.json)"
+          # The bodies travel as a ConfigMap of gzipped files, mounted into the
+          # pod: whole templates with mappings are far over the 128 KiB a single
+          # env var may hold.
+          CM="om-os-shards-${GITHUB_RUN_ID}"
+          trap 'kubectl delete configmap -n "$NAMESPACE" "$CM" --ignore-not-found >/dev/null 2>&1 || true' EXIT
+          kubectl create configmap "$CM" -n "$NAMESPACE" --from-file=bodies/ >/dev/null \
+            || { echo "::error::could not create ConfigMap $CM"; exit 1; }
+
           read -r -d '' WRITE_SCRIPT <<'WRITE' || true
           set -u
           B="$OS_SCHEME://$OS_HOST:$OS_PORT"
           A="-u $OS_USER:$OS_PASS"
-          echo "@@PUT@@"
-          curl -s --max-time 120 -X PUT $A -H 'Content-Type: application/json' \
-            --data-binary "$TEMPLATE_BODY" "$B/_index_template/$TEMPLATE_NAME"
-          echo
-          echo "@@END@@"
-          # Simulated names that match each pattern, so this checks the
-          # template as OpenSearch resolves it without creating anything.
-          for n in zz_shardcheck_search_index_rebuild_1 zz_shardcheck_report_data_index_rebuild_1; do
-            echo "@@SIM@@"
-            curl -s --max-time 120 -X POST $A "$B/_index_template/_simulate_index/$n"
+          for f in /t/*.json.gz; do
+            [ -e "$f" ] || continue
+            n=$(basename "$f" .json.gz)
+            echo "@@PUT $n@@"
+            gunzip -c "$f" | curl -s --max-time 120 -X PUT $A -H 'Content-Type: application/json' \
+              --data-binary @- "$B/_index_template/$n"
             echo
             echo "@@END@@"
           done
+          # Resolves a name inside each template's pattern without creating
+          # anything, so this checks what OpenSearch would actually apply.
+          while read -r n idx; do
+            echo "@@SIM $n@@"
+            curl -s --max-time 120 -X POST $A "$B/_index_template/_simulate_index/$idx"
+            echo
+            echo "@@END@@"
+          done < /t/sims.txt
           WRITE
 
-          os_pod "om-os-shards-write-${GITHUB_RUN_ID}" "$WRITE_SCRIPT" "TEMPLATE_BODY TEMPLATE_NAME" > phase2.txt
+          os_pod "om-os-shards-write-${GITHUB_RUN_ID}" "$WRITE_SCRIPT" "" "$CM" > phase2.txt
           rc=$?
           [ $rc -eq 0 ] || { cat phase2.txt; echo "::error::write phase failed (exit $rc)"; exit 1; }
 
           python3 - <<'PY' || exit 1
           import json, os, re, sys
           raw = open("phase2.txt").read()
-          blocks = re.findall(r"@@(\w+)@@\n(.*?)\n@@END@@", raw, re.S)
-          put = json.loads(dict(blocks)["PUT"])
-          if not put.get("acknowledged"):
-              print(json.dumps(put, indent=2)[:3000])
-              print("::error::OpenSearch did not accept the template")
-              sys.exit(1)
-          print(f"template {os.environ['TEMPLATE_NAME']} accepted")
+          plan = json.load(open("plan.json"))
+          blocks = re.findall(r"@@(PUT|SIM) (\S+)@@\n(.*?)\n@@END@@", raw, re.S)
+          puts = {n: b for k, n, b in blocks if k == "PUT"}
+          sims = {n: b for k, n, b in blocks if k == "SIM"}
+          bad = []
+          for n in plan["todo"]:
+              try:
+                  ack = json.loads(puts[n]).get("acknowledged")
+              except Exception:
+                  ack = False
+              if not ack:
+                  print(f"{n}: PUT not acknowledged: {puts.get(n, '<missing>')[:600]}")
+                  bad.append(n)
+          print(f"{len(plan['todo']) - len(bad)} of {len(plan['todo'])} templates patched")
+
           want = ("1", os.environ["REPLICAS"])
-          ok = True
-          for kind, body in blocks:
-              if kind != "SIM":
+          wrong = []
+          for n, idx in plan["sims"].items():
+              try:
+                  sim = json.loads(sims[n])
+              except Exception:
+                  wrong.append(f"{n}: no simulate result")
                   continue
-              sim = json.loads(body)
-              idx = sim.get("template", {}).get("settings", {}).get("index", {})
-              got = (str(idx.get("number_of_shards")), str(idx.get("number_of_replicas")))
-              applied = [o.get("name") for o in sim.get("overlapping", [])]
-              print(f"  a new matching index would get shards={got[0]} replicas={got[1]}"
-                    + (f"  (overlapping, not applied: {applied})" if applied else ""))
-              ok &= got == want
-          if not ok:
-              print("::error::the simulated settings do not match the template -- another template wins")
+              tpl = sim.get("template", {})
+              st = tpl.get("settings", {}).get("index", {})
+              got = (str(st.get("number_of_shards")), str(st.get("number_of_replicas")))
+              if got != want:
+                  wrong.append(f"{n}: {idx} would get shards={got[0]} replicas={got[1]}")
+              # The patch must not cost a template its mappings.
+              if plan["mapped"].get(n) and not tpl.get("mappings"):
+                  wrong.append(f"{n}: {idx} would get NO mappings")
+          if bad or wrong:
+              for w in wrong:
+                  print(f"  {w}")
+              print("::error::a patched template did not check out (shards, replicas or mappings) -- see above")
               sys.exit(1)
+          print(f"simulated: a new index under each of {len(plan['sims'])} templates gets "
+                f"shards={want[0]} replicas={want[1]}, mappings intact")
           PY
 
           echo
           echo "Done. Existing indices are unchanged until OpenMetadata rebuilds them:"
           echo "  Settings -> Applications -> Search Indexing -> Configure -> Recreate Index = true -> Run"
           echo "Wait for the cluster to be green first. Then re-run this action: the index"
-          echo "table should show pri=1. If it still shows 5, OpenMetadata sets the shard"
-          echo "count itself and the template cannot override it -- see README_full.md."
+          echo "table should show pri=1. If it reports templates to patch again, OpenMetadata"
+          echo "rewrote them -- see README_full.md (Shard defaults)."
 
       # Everything about how the UI is published, in one read-only run: the
       # Service the controller reconciles, the load balancer it produced, the
