@@ -99,6 +99,39 @@ server_password_sha() {
   | tr -d '\r' | sed -e 's/^"\(.*\)"$/\1/' | sha
 }
 
+# Runs a one-shot pod to completion and prints its output on stdout.
+#
+# Deliberately NOT `kubectl run --rm -i`: that attaches to the container while
+# it runs, and a request that finishes in under a second can exit before the
+# attach lands -- the output is lost, and with kubectl's stderr discarded the
+# caller just sees nothing ("unexpected HTTP : "). Instead: create the pod,
+# poll until it has finished, read its logs, delete it. Each step reports its
+# own failure on stderr (so it reaches the job log without polluting the
+# captured output), including why a pod never started (image pull, etc.).
+#   $1 pod name, $2 image, $3 overrides JSON
+pod_output() {
+  local name="$1" image="$2" overrides="$3" err phase="" state
+  if ! err=$(kubectl run "$name" -n "$NAMESPACE" --image="$image" --restart=Never \
+               --overrides="$overrides" 2>&1 >/dev/null); then
+    printf '::error::could not create pod %s: %s\n' "$name" "$err" >&2
+    return 1
+  fi
+  for _ in $(seq 1 90); do                       # up to ~3 minutes
+    phase=$(kubectl get pod "$name" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null)
+    case "$phase" in Succeeded|Failed) break ;; esac
+    sleep 2
+  done
+  kubectl logs "$name" -n "$NAMESPACE" 2>/dev/null
+  if [ "$phase" != Succeeded ]; then
+    state=$(kubectl get pod "$name" -n "$NAMESPACE" \
+              -o jsonpath='{.status.containerStatuses[0].state}' 2>/dev/null)
+    printf '::error::pod %s ended in phase %s; container state: %s\n' \
+      "$name" "${phase:-unknown}" "${state:-none}" >&2
+  fi
+  kubectl delete pod "$name" -n "$NAMESPACE" --wait=false >/dev/null 2>&1
+  [ "$phase" = Succeeded ]
+}
+
 # HTTP status from authenticating to OpenSearch with the SECRET's password,
 # from a throwaway pod on the cluster's nodes (the domain is VPC-only). The
 # password is injected by secretKeyRef, so it never appears in a pod spec or
@@ -126,9 +159,7 @@ print(json.dumps({"apiVersion": "v1", "spec": {"restartPolicy": "Never", "contai
                 "name": os.environ["SECRET"], "key": "password"}}}]}]}}))
 PY
   )
-  kubectl run "$pod" -n "$NAMESPACE" --image=curlimages/curl:8.11.1 --restart=Never \
-    --rm -i --quiet --pod-running-timeout=3m --overrides="$overrides" 2>/dev/null \
-    | tr -dc '0-9' | tail -c 3
+  pod_output "$pod" curlimages/curl:8.11.1 "$overrides" | tr -dc '0-9' | tail -c 3
 }
 
 update_version() {

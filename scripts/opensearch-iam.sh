@@ -82,6 +82,39 @@ OS_HOST=$(field H); OS_PORT=$(field P); OS_USER=$(field U)
 [ -n "$OS_HOST" ] || { err "ELASTICSEARCH_HOST is empty in the server pod"; exit 1; }
 export OS_HOST OS_PORT OS_USER
 
+# Runs a one-shot pod to completion and prints its output on stdout.
+#
+# Deliberately NOT `kubectl run --rm -i`: that attaches to the container while
+# it runs, and a request that finishes in under a second can exit before the
+# attach lands -- the output is lost, and with kubectl's stderr discarded the
+# caller just sees nothing ("unexpected HTTP : "). Instead: create the pod,
+# poll until it has finished, read its logs, delete it. Each step reports its
+# own failure on stderr (so it reaches the job log without polluting the
+# captured output), including why a pod never started (image pull, etc.).
+#   $1 pod name, $2 image, $3 overrides JSON
+pod_output() {
+  local name="$1" image="$2" overrides="$3" err phase="" state
+  if ! err=$(kubectl run "$name" -n "$NAMESPACE" --image="$image" --restart=Never \
+               --overrides="$overrides" 2>&1 >/dev/null); then
+    printf '::error::could not create pod %s: %s\n' "$name" "$err" >&2
+    return 1
+  fi
+  for _ in $(seq 1 90); do                       # up to ~3 minutes
+    phase=$(kubectl get pod "$name" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null)
+    case "$phase" in Succeeded|Failed) break ;; esac
+    sleep 2
+  done
+  kubectl logs "$name" -n "$NAMESPACE" 2>/dev/null
+  if [ "$phase" != Succeeded ]; then
+    state=$(kubectl get pod "$name" -n "$NAMESPACE" \
+              -o jsonpath='{.status.containerStatuses[0].state}' 2>/dev/null)
+    printf '::error::pod %s ended in phase %s; container state: %s\n' \
+      "$name" "${phase:-unknown}" "${state:-none}" >&2
+  fi
+  kubectl delete pod "$name" -n "$NAMESPACE" --wait=false >/dev/null 2>&1
+  [ "$phase" = Succeeded ]
+}
+
 # Runs a script in a throwaway pod and prints its output.
 #   $1 pod name, $2 image, $3 script, $4 "master" to inject the master
 #   password by secretKeyRef, or "server-sa" to run as the server's
@@ -104,8 +137,7 @@ else:
 print(json.dumps({"apiVersion": "v1", "spec": spec}))
 PY
   )
-  kubectl run "$name" -n "$NAMESPACE" --image="$image" --restart=Never --rm -i --quiet \
-    --pod-running-timeout=3m --overrides="$overrides" 2>/dev/null
+  pod_output "$name" "$image" "$overrides"
 }
 
 # ------------------------------------------------------------------- map ---
@@ -115,7 +147,7 @@ if [ "$MODE" = map ]; then
 curl -s --max-time 60 -u "$OS_USER:$OS_PASS" -w '\n@@HTTP:%{http_code}' \
   "https://$OS_HOST:$OS_PORT/_plugins/_security/api/rolesmapping/all_access"
 SH
-  current=$(run_pod "om-os-iam-get-$RUN_ID" curlimages/curl:8.11.1 "$GET" master)
+  current=$(run_pod "om-os-iam-get-$RUN_ID-$RANDOM" curlimages/curl:8.11.1 "$GET" master)
   body=$(BODY="$current" ROLE_ARN="$ROLE_ARN" python3 - <<'PY'
 import json, os, sys
 raw = os.environ["BODY"]
@@ -145,7 +177,7 @@ curl -s --max-time 60 -u "$OS_USER:$OS_PASS" -X PUT -H 'Content-Type: applicatio
   --data-binary "$MAPPING" -w '\n@@HTTP:%{http_code}' \
   "https://$OS_HOST:$OS_PORT/_plugins/_security/api/rolesmapping/all_access"
 SH
-  out=$(run_pod "om-os-iam-put-$RUN_ID" curlimages/curl:8.11.1 "$PUT" master MAPPING)
+  out=$(run_pod "om-os-iam-put-$RUN_ID-$RANDOM" curlimages/curl:8.11.1 "$PUT" master MAPPING)
   code=$(printf %s "$out" | sed -n 's/^@@HTTP://p')
   if [ "$code" = 200 ] || [ "$code" = 201 ]; then
     log "mapped (HTTP $code)"; exit 0
@@ -196,7 +228,7 @@ curl -s --max-time 60 --aws-sigv4 "aws:amz:$REGION:es" \
   "https://$OS_HOST:$OS_PORT/_plugins/_security/authinfo"
 SH
 export REGION="$AWS_REGION"
-out=$(run_pod "om-os-iam-chk-$RUN_ID" amazon/aws-cli:latest "$SIGNED" server-sa REGION)
+out=$(run_pod "om-os-iam-chk-$RUN_ID-$RANDOM" amazon/aws-cli:latest "$SIGNED" server-sa REGION)
 verdict=$(OUT="$out" ROLE_ARN="$ROLE_ARN" python3 - <<'PY'
 import json, os
 raw = os.environ["OUT"]
